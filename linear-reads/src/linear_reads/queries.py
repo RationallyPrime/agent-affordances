@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 class UnknownFieldError(ValueError):
     def __init__(self, name: str, allowed: Sequence[str]) -> None:
-        super().__init__(f"unknown field {name!r}; valid fields: {", ".join(sorted(allowed))}")
+        super().__init__(f"unknown field {name!r}; valid fields: {', '.join(sorted(allowed))}")
 
 
 @dataclass(frozen=True)

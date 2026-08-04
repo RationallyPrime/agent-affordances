@@ -8,11 +8,11 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 
-class OutputFormat(str, Enum):
+class OutputFormat(StrEnum):
     table = "table"
     jsonl = "jsonl"
     json = "json"
@@ -88,7 +88,7 @@ def render_issue_detail(flat: dict[str, Any]) -> str:
 def render_comments_text(comments: Sequence[dict[str, Any]]) -> str:
     lines: list[str] = []
     for comment in comments:
-        lines.append(f"{_cell(comment.get("created"))}  {_cell(comment.get("author"))}:")
+        lines.append(f"{_cell(comment.get('created'))}  {_cell(comment.get('author'))}:")
         lines.append(str(comment.get("body") or ""))
         lines.append("")
     return "\n".join(lines).rstrip()
