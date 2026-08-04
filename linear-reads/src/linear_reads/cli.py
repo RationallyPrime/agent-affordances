@@ -94,7 +94,7 @@ def issues(
     project: Annotated[str | None, typer.Option(help="Project name (substring)")] = None,
     query: Annotated[str | None, typer.Option(help="Match in title or description")] = None,
     updated_since: Annotated[str | None, typer.Option(help="30m, 12h, 7d, 2w, or ISO date")] = None,
-    limit: Annotated[int, typer.Option(help="Max issues to return")] = 50,
+    limit: Annotated[int, typer.Option(min=1, help="Max issues to return")] = 50,
     fields: Annotated[str, typer.Option(help=FieldsHelp)] = DEFAULT_LIST_FIELDS,
     format: FormatOpt = None,
 ) -> None:
@@ -102,7 +102,7 @@ def issues(
     field_list = _split_fields(fields)
     try:
         document = queries.issues_query(field_list)
-    except queries.UnknownFieldError as exc:
+    except queries.FieldSelectionError as exc:
         raise _fail(str(exc)) from exc
 
     filter_: dict[str, Any] = {}
@@ -152,10 +152,12 @@ def issue(
 ) -> None:
     """Show one issue: terse header, title, raw markdown body."""
     default = DEFAULT_ISSUE_FIELDS if no_body else DEFAULT_ISSUE_FIELDS + ",body"
-    field_list = _split_fields(fields or default)
+    field_list = _split_fields(fields if fields is not None else default)
+    if no_body and "body" in field_list:
+        raise _fail("--no-body conflicts with 'body' in --fields")
     try:
         document = queries.issue_query(field_list)
-    except queries.UnknownFieldError as exc:
+    except queries.FieldSelectionError as exc:
         raise _fail(str(exc)) from exc
 
     try:
@@ -168,7 +170,7 @@ def issue(
             comment_nodes: list[dict[str, Any]] = []
             if comments:
                 comment_nodes = client.paginate(
-                    queries.comments_query(), {"id": identifier}, "issue.comments", 100
+                    queries.comments_query(), {"id": identifier}, "issue.comments", None
                 )
         finally:
             client.close()
@@ -193,7 +195,7 @@ def issue(
 @app.command()
 def comments(
     identifier: Annotated[str, typer.Argument(help="Issue id, e.g. KRA-123")],
-    limit: Annotated[int, typer.Option(help="Max comments to return")] = 50,
+    limit: Annotated[int, typer.Option(min=1, help="Max comments to return")] = 50,
     format: FormatOpt = None,
 ) -> None:
     """List an issue's comments, oldest first."""
@@ -230,13 +232,12 @@ def _run_meta(
     try:
         client = _make_client()
         try:
-            data = client.query(document, variables)
+            nodes = client.paginate(document, variables, connection, None)
         finally:
             client.close()
     except LinearError as exc:
         raise _fail(str(exc)) from exc
 
-    nodes: list[dict[str, Any]] = data[connection]["nodes"]
     rows = [{key: _pluck(node, path) for key, path in columns.items()} for node in nodes]
     _echo(render_rows(rows, _resolve_format(fmt), footer=f"{len(rows)} {noun}"))
 

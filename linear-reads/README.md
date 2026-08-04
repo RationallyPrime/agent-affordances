@@ -36,6 +36,8 @@ linear-reads teams / states / labels / projects / users   # metadata lookups
 
 Filters combine with AND. `--assignee me` uses the API key's identity.
 `--updated-since` accepts `30m`, `12h`, `7d`, `2w`, or an ISO date.
+`issue --comments` follows the complete comment connection; the standalone
+`comments` command uses its explicit `--limit` (default 50).
 
 ## Output
 

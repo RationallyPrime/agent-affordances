@@ -10,7 +10,16 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 
-class UnknownFieldError(ValueError):
+class FieldSelectionError(ValueError):
+    """Base class for invalid ``--fields`` selections."""
+
+
+class EmptyFieldSelectionError(FieldSelectionError):
+    def __init__(self) -> None:
+        super().__init__("at least one field is required")
+
+
+class UnknownFieldError(FieldSelectionError):
     def __init__(self, name: str, allowed: Sequence[str]) -> None:
         super().__init__(f"unknown field {name!r}; valid fields: {', '.join(sorted(allowed))}")
 
@@ -40,20 +49,34 @@ ISSUE_FIELDS: dict[str, FieldSpec] = {
 COMMENT_SELECTION = "createdAt user { displayName } body"
 PAGE_INFO = "pageInfo { hasNextPage endCursor }"
 
-TEAMS_QUERY = "query { teams { nodes { key name } } }"
+TEAMS_QUERY = (
+    "query($first: Int!, $after: String) "
+    f"{{ teams(first: $first, after: $after) {{ nodes {{ key name }} {PAGE_INFO} }} }}"
+)
 STATES_QUERY = (
-    "query($filter: WorkflowStateFilter) "
-    "{ workflowStates(filter: $filter) { nodes { name type team { key } } } }"
+    "query($filter: WorkflowStateFilter, $first: Int!, $after: String) "
+    "{ workflowStates(filter: $filter, first: $first, after: $after) "
+    f"{{ nodes {{ name type team {{ key }} }} {PAGE_INFO} }} }}"
 )
 LABELS_QUERY = (
-    "query($filter: IssueLabelFilter) "
-    "{ issueLabels(filter: $filter) { nodes { name team { key } } } }"
+    "query($filter: IssueLabelFilter, $first: Int!, $after: String) "
+    "{ issueLabels(filter: $filter, first: $first, after: $after) "
+    f"{{ nodes {{ name team {{ key }} }} {PAGE_INFO} }} }}"
 )
-PROJECTS_QUERY = "query { projects { nodes { name state } } }"
-USERS_QUERY = "query { users { nodes { displayName name active } } }"
+PROJECTS_QUERY = (
+    "query($first: Int!, $after: String) "
+    f"{{ projects(first: $first, after: $after) {{ nodes {{ name state }} {PAGE_INFO} }} }}"
+)
+USERS_QUERY = (
+    "query($first: Int!, $after: String) "
+    "{ users(first: $first, after: $after) "
+    f"{{ nodes {{ displayName name active }} {PAGE_INFO} }} }}"
+)
 
 
 def build_selection(fields: Sequence[str], allowed: dict[str, FieldSpec]) -> str:
+    if not fields:
+        raise EmptyFieldSelectionError
     parts: list[str] = []
     for name in fields:
         spec = allowed.get(name)

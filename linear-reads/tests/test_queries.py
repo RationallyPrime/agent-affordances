@@ -17,6 +17,11 @@ def test_build_selection_rejects_unknown_field() -> None:
     assert "title" in str(excinfo.value)
 
 
+def test_build_selection_rejects_an_empty_field_list() -> None:
+    with pytest.raises(queries.EmptyFieldSelectionError, match="at least one field"):
+        queries.build_selection([], queries.ISSUE_FIELDS)
+
+
 def test_issue_query_selects_only_requested_fields() -> None:
     document = queries.issue_query(["id", "body"])
     assert "issue(id: $id)" in document
@@ -36,3 +41,20 @@ def test_comments_query_shape() -> None:
     assert "issue(id: $id)" in document
     assert "comments(first: $first, after: $after)" in document
     assert "user { displayName }" in document
+
+
+@pytest.mark.parametrize(
+    "document,connection",
+    [
+        (queries.TEAMS_QUERY, "teams"),
+        (queries.STATES_QUERY, "workflowStates"),
+        (queries.LABELS_QUERY, "issueLabels"),
+        (queries.PROJECTS_QUERY, "projects"),
+        (queries.USERS_QUERY, "users"),
+    ],
+)
+def test_metadata_queries_are_cursor_paginated(document: str, connection: str) -> None:
+    assert "$first: Int!" in document
+    assert "$after: String" in document
+    assert f"{connection}(" in document
+    assert "pageInfo { hasNextPage endCursor }" in document

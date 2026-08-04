@@ -4,9 +4,12 @@ import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import httpx
 import pytest
 
+from linear_reads import cli
 from linear_reads.cli import app, parse_since
+from linear_reads.client import LinearClient
 
 NODE_A = {
     "identifier": "KRA-1",
@@ -46,13 +49,13 @@ def issues_page(nodes: list[dict[str, Any]], cursor: str | None = None) -> dict[
     }
 
 
-def comments_page(nodes: list[dict[str, Any]]) -> dict[str, Any]:
+def comments_page(nodes: list[dict[str, Any]], cursor: str | None = None) -> dict[str, Any]:
     return {
         "data": {
             "issue": {
                 "comments": {
                     "nodes": nodes,
-                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    "pageInfo": {"hasNextPage": cursor is not None, "endCursor": cursor},
                 }
             }
         }
@@ -163,6 +166,14 @@ def test_issues_unknown_field_fails_before_any_request(runner, fake_linear) -> N
     assert fake.requests == []
 
 
+def test_issues_empty_fields_fail_before_any_request(runner, fake_linear) -> None:
+    fake = fake_linear(lambda payload: issues_page([]))
+    result = runner.invoke(app, ["issues", "--fields", " , "])
+    assert result.exit_code == 2
+    assert "at least one field is required" in result.stderr
+    assert fake.requests == []
+
+
 def test_missing_api_key_is_a_one_line_error(runner) -> None:
     result = runner.invoke(app, ["issues"])
     assert result.exit_code == 2
@@ -174,6 +185,26 @@ def test_graphql_errors_surface(runner, fake_linear) -> None:
     result = runner.invoke(app, ["issues"])
     assert result.exit_code == 2
     assert "boom" in result.stderr
+
+
+def test_transport_errors_are_one_line_cli_errors(runner, monkeypatch) -> None:
+    def offline(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("network unavailable", request=request)
+
+    client = LinearClient(api_key="test-key", transport=httpx.MockTransport(offline))
+    monkeypatch.setattr(cli, "_make_client", lambda: client)
+    result = runner.invoke(app, ["issues"])
+    assert result.exit_code == 2
+    assert "request to Linear failed" in result.stderr
+    assert "Traceback" not in result.output
+
+
+def test_non_object_json_is_a_one_line_cli_error(runner, fake_linear) -> None:
+    fake_linear(lambda payload: [])
+    result = runner.invoke(app, ["issues"])
+    assert result.exit_code == 2
+    assert "non-object JSON response" in result.stderr
+    assert "Traceback" not in result.output
 
 
 # --- issue ---
@@ -196,6 +227,25 @@ def test_issue_no_body_skips_description_in_query(runner, fake_linear) -> None:
     assert result.exit_code == 0
     assert "description" not in fake.requests[0]["query"]
     assert "wake twice" not in result.output
+
+
+def test_issue_no_body_rejects_explicit_body_field(runner, fake_linear) -> None:
+    fake = fake_linear(lambda payload: {"data": {"issue": ISSUE_NODE}})
+    result = runner.invoke(
+        app,
+        ["issue", "KRA-9", "--no-body", "--fields", "id,body"],
+    )
+    assert result.exit_code == 2
+    assert "--no-body conflicts" in result.stderr
+    assert fake.requests == []
+
+
+def test_issue_empty_explicit_fields_fail_before_any_request(runner, fake_linear) -> None:
+    fake = fake_linear(lambda payload: {"data": {"issue": ISSUE_NODE}})
+    result = runner.invoke(app, ["issue", "KRA-9", "--fields", " , "])
+    assert result.exit_code == 2
+    assert "at least one field is required" in result.stderr
+    assert fake.requests == []
 
 
 def test_issue_jsonl_is_one_object(runner, fake_linear) -> None:
@@ -230,6 +280,26 @@ def test_issue_with_comments_appends_thread(runner, fake_linear) -> None:
     assert len(fake.requests) == 2
 
 
+def test_issue_with_comments_follows_the_complete_connection(runner, fake_linear) -> None:
+    first_page = [dict(COMMENT_NODE, body=f"comment-{index}") for index in range(100)]
+    last_comment = dict(COMMENT_NODE, body="final-comment")
+
+    def responder(payload: dict[str, Any]) -> dict[str, Any]:
+        if "comments(" not in payload["query"]:
+            return {"data": {"issue": ISSUE_NODE}}
+        if payload["variables"].get("after") is None:
+            return comments_page(first_page, cursor="comments-c1")
+        return comments_page([last_comment])
+
+    fake = fake_linear(responder)
+    result = runner.invoke(app, ["issue", "KRA-9", "--comments"])
+    assert result.exit_code == 0
+    assert json.loads(result.output)["comments"][-1]["body"] == "final-comment"
+    comment_requests = [request for request in fake.requests if "comments(" in request["query"]]
+    assert len(comment_requests) == 2
+    assert comment_requests[1]["variables"]["after"] == "comments-c1"
+
+
 # --- comments ---
 
 
@@ -249,7 +319,16 @@ def test_comments_jsonl(runner, fake_linear) -> None:
 
 def test_teams_table(runner, fake_linear) -> None:
     nodes = [{"key": "KRA", "name": "Krakkar"}]
-    fake_linear(lambda payload: {"data": {"teams": {"nodes": nodes}}})
+    fake_linear(
+        lambda payload: {
+            "data": {
+                "teams": {
+                    "nodes": nodes,
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                }
+            }
+        }
+    )
     result = runner.invoke(app, ["teams", "--format", "table"])
     assert result.exit_code == 0
     assert result.output.splitlines() == ["KRA  Krakkar", "1 teams"]
@@ -257,7 +336,16 @@ def test_teams_table(runner, fake_linear) -> None:
 
 def test_states_team_defaults_from_env(runner, fake_linear) -> None:
     nodes = [{"name": "In Progress", "type": "started", "team": {"key": "KRA"}}]
-    fake = fake_linear(lambda payload: {"data": {"workflowStates": {"nodes": nodes}}})
+    fake = fake_linear(
+        lambda payload: {
+            "data": {
+                "workflowStates": {
+                    "nodes": nodes,
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                }
+            }
+        }
+    )
     result = runner.invoke(app, ["states"], env={"LINEAR_TEAM": "KRA"})
     assert result.exit_code == 0
     assert fake.requests[0]["variables"]["filter"] == {"team": {"key": {"eq": "KRA"}}}
@@ -270,10 +358,38 @@ def test_states_team_defaults_from_env(runner, fake_linear) -> None:
 
 def test_labels_jsonl(runner, fake_linear) -> None:
     nodes = [{"name": "bug", "team": None}]
-    fake_linear(lambda payload: {"data": {"issueLabels": {"nodes": nodes}}})
+    fake_linear(
+        lambda payload: {
+            "data": {
+                "issueLabels": {
+                    "nodes": nodes,
+                    "pageInfo": {"hasNextPage": False, "endCursor": None},
+                }
+            }
+        }
+    )
     result = runner.invoke(app, ["labels"])
     assert result.exit_code == 0
     assert json.loads(result.output.splitlines()[0]) == {"name": "bug", "team": None}
+
+
+def test_metadata_commands_follow_connection_pagination(runner, fake_linear) -> None:
+    def responder(payload: dict[str, Any]) -> dict[str, Any]:
+        after = payload["variables"].get("after")
+        if after is None:
+            nodes = [{"key": "KRA", "name": "Krakkar"}]
+            page_info = {"hasNextPage": True, "endCursor": "teams-c1"}
+        else:
+            nodes = [{"key": "OPS", "name": "Operations"}]
+            page_info = {"hasNextPage": False, "endCursor": None}
+        return {"data": {"teams": {"nodes": nodes, "pageInfo": page_info}}}
+
+    fake = fake_linear(responder)
+    result = runner.invoke(app, ["teams", "--format", "table"])
+    assert result.exit_code == 0
+    assert result.output.splitlines() == ["KRA  Krakkar", "OPS  Operations", "2 teams"]
+    assert len(fake.requests) == 2
+    assert fake.requests[1]["variables"]["after"] == "teams-c1"
 
 
 # --- parse_since ---
