@@ -26,12 +26,16 @@ repos:
         language: system
         types_or: [python, pyi]
         stages: [pre-commit]
-      - id: uv-lock
-        name: uv lock check
-        entry: uv lock --check
+      # Per-project: each tool in this repo is an independent uv project, and
+      # prek launches system hooks from the repo root — an unscoped
+      # `uv lock --check` here would check nothing (no root pyproject).
+      # New tool directory ⇒ add a matching hook entry (Codex finding, PR #2).
+      - id: uv-lock-linear-reads
+        name: uv lock check (linear-reads)
+        entry: uv lock --check --project linear-reads
         language: system
         pass_filenames: false
-        files: 'pyproject\.toml$|^uv\.lock$'
+        files: '^linear-reads/(pyproject\.toml|uv\.(lock|toml))$'
       - id: ty
         name: ty type check
         entry: ty check
