@@ -17,7 +17,10 @@ jobs:
         with:
           enable-cache: false
       - run: uv sync
-      - run: uv run ruff format --check .
-      - run: uv run ruff check .
-      - run: uv run ty check
+      # TRANSITIONAL PINS — authority is weave-doctrine's mise.toml (private,
+      # unreadable from GitHub-hosted runners); delete at the cx53
+      # self-hosted-runner migration, where mise provides the bare binaries.
+      - run: uvx ruff@0.16.1 format --check .
+      - run: uvx ruff@0.16.1 check .
+      - run: uvx ty@0.0.63 check
       - run: uv run pytest -q
