@@ -15,10 +15,10 @@ dependencies = [
 linear-reads = "linear_reads.cli:app"
 
 [dependency-groups]
+# ruff/ty are deliberately not dev deps: the Weave-wide version authority is
+# weave-doctrine's mise.toml (bare binaries on PATH via mise shims).
 dev = [
     "pytest>=8.3",
-    "ruff>=0.9",
-    "ty>=0.0.1a6",
 ]
 
 [build-system]
