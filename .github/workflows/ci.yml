@@ -7,7 +7,7 @@ on:
 
 jobs:
   linear-reads:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, cx53]
     defaults:
       run:
         working-directory: linear-reads
