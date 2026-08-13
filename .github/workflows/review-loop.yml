@@ -1,0 +1,71 @@
+# Weave review-loop hook. Adopt this workflow together with
+# .github/scripts/review_loop.py and set HIVE_BOT_TOKEN.
+name: review-loop
+
+on:
+  pull_request_review:
+    types: [submitted]
+  issue_comment:
+    types: [created]
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+env:
+  HIVE_CHANNEL: C0BGBEQQQHH
+  CODEX_LOGIN: chatgpt-codex-connector[bot]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  wake-on-codex-result:
+    if: >-
+      (github.event_name == 'pull_request_review' && github.event.review.user.login == 'chatgpt-codex-connector[bot]') ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request && github.event.comment.user.login == 'chatgpt-codex-connector[bot]')
+    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","cx53"]' || '["ubuntu-latest"]') }}
+    steps:
+      # The helper executes with a Slack credential. Always load it from the
+      # trusted default branch, never from the reviewed PR head.
+      - name: Checkout trusted review-loop helper
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Route Codex verdict to Hive
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HIVE_BOT_TOKEN: ${{ secrets.HIVE_BOT_TOKEN }}
+        run: python3 .github/scripts/review_loop.py route
+
+  review-loop-canary:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","cx53"]' || '["ubuntu-latest"]') }}
+    steps:
+      - name: Checkout trusted review-loop helper
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Wake Talos with a read-only canary
+        env:
+          HIVE_BOT_TOKEN: ${{ secrets.HIVE_BOT_TOKEN }}
+        run: python3 .github/scripts/review_loop.py canary
+
+  nudge-stalled-reviews:
+    if: github.event_name == 'schedule'
+    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","cx53"]' || '["ubuntu-latest"]') }}
+    steps:
+      - name: Checkout trusted review-loop helper
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Bare @codex review on stalled agent PRs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/review_loop.py nudge
