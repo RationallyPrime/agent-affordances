@@ -53,6 +53,7 @@ WAKE_REDELIVERY_SECONDS = 60 * 60
 DIGEST_CHUNK_BUDGET = 12000
 ROUND_LOCATION_LINE_BUDGET = 8000
 EXHAUSTED_MARKER_PREFIX = "<!-- weave-review-loop:exhausted:"
+EXHAUSTION_DELIVERED_MARKER_PREFIX = "<!-- weave-review-loop:exhaustion-delivered:"
 NUDGE_MARKER_PREFIX = "<!-- weave-review-loop:nudge:"
 REDELIVERY_MARKER_PREFIX = "<!-- weave-review-loop:redelivered:"
 UNRESOLVED_CLEAN_PREFIX = "unresolved-clean:"
@@ -679,6 +680,26 @@ def exhaustion_marker(head_sha: str) -> str:
     return f"{EXHAUSTED_MARKER_PREFIX}{head_sha} -->"
 
 
+def exhaustion_delivered_marker(head_sha: str) -> str:
+    return f"{EXHAUSTION_DELIVERED_MARKER_PREFIX}{head_sha} -->"
+
+
+def exhaustion_delivered_comment_body(head_sha: str) -> str:
+    """The once-per-head record that both exhaustion wakes were delivered.
+
+    Distinct from the gate: that comment stops the automatic loop even when
+    Slack fails. This one is written only after both wakes succeed, so a
+    later scheduled scan can skip Slack while a partial failure still retries.
+    """
+    return (
+        "Review-loop: exhaustion wakes for this head were delivered to #hive "
+        "(authoring-seat human gate + Theoros retrospective). One delivery per "
+        "head — a later scheduled scan must not re-wake. A push starts a fresh "
+        "review cycle.\n"
+        f"{exhaustion_delivered_marker(head_sha)}"
+    )
+
+
 def nudge_marker(head_sha: str) -> str:
     return f"{NUDGE_MARKER_PREFIX}{head_sha} -->"
 
@@ -1079,8 +1100,10 @@ def notify_exhausted_loop(
     Event-driven and scheduled exhaustion share this path so a clock-driven
     gate cannot omit the notifications the review path already sends. The
     gate comment is posted first: a later Slack failure cannot leave the
-    loop unstopped, and a retry still wakes because an existing marker is
-    not a reason to skip Slack.
+    loop unstopped. Slack then runs, and only after both wakes succeed is
+    the delivery marker persisted. An existing gate without that marker
+    still retries Slack. An existing delivery marker skips Slack so the
+    15-minute nudge scan cannot re-wake an unchanged exhausted head.
     """
     gate = exhaustion_gate(
         pr_url=pr_url,
@@ -1100,6 +1123,12 @@ def notify_exhausted_loop(
     if comment_state == "stale":
         print(
             f"ignored stale exhaustion gate for "
+            f"{repository}#{pr_number} (head={head_sha})"
+        )
+        return
+    if marker_comment_exists(comments, exhaustion_delivered_marker(head_sha)):
+        print(
+            f"exhaustion already delivered for "
             f"{repository}#{pr_number} (head={head_sha})"
         )
         return
@@ -1164,6 +1193,14 @@ def notify_exhausted_loop(
     print(
         f"woke theoros for {repository}#{pr_number} retrospective "
         f"(rounds={len(history)})"
+    )
+    # Slack first, then the marker. A Slack failure leaves no marker, so the
+    # next scan retries — duplicate delivery is the safe direction. A marker
+    # failure after a successful post raises out of the scan rather than
+    # being swallowed.
+    github.post(
+        f"issues/{pr_number}/comments",
+        {"body": exhaustion_delivered_comment_body(head_sha)},
     )
 
 
