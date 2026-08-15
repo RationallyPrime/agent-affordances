@@ -18,7 +18,9 @@ Commands:
     Add one ``@codex review`` comment (with an exact-head marker) per stalled,
     unreviewed head until the bounded automatic loop is exhausted, and
     re-deliver a standing verdict once per *reviewed* head whose seat never
-    acted.  A wake fires exactly once from an event-driven path; a consumed
+    acted.  Exhaustion detected on this clock-driven path publishes the same
+    authoring-seat wake and Theoros retrospective as the event-driven gate.
+    A wake fires exactly once from an event-driven path; a consumed
     wake with no new GitHub event is otherwise silence forever.
 ``canary``
     Post a harmless Talos liveness wake for end-to-end verification.
@@ -343,6 +345,23 @@ def _opening_sentence(statement: str) -> str:
     return normalized[: match.end()]
 
 
+def _normalize_verdict_statement(line: str) -> str:
+    """Peel repeated Markdown marker-and-whitespace prefixes.
+
+    A single ``lstrip("*_->#")`` stops at the space in ``- **No blocking
+    findings.**``, leaving the bold markers. Real task-channel verdicts
+    arrive as lists or quotes, so each marker run must be stripped on its
+    own rather than as one contiguous character set.
+    """
+    statement = line.strip()
+    while statement:
+        peeled = statement.lstrip("*_->#").strip()
+        if peeled == statement:
+            break
+        statement = peeled
+    return statement.lower()
+
+
 def task_verdict_is_clean(body: str) -> bool:
     """True only when the opening *sentence* is the clean assertion.
 
@@ -357,7 +376,7 @@ def task_verdict_is_clean(body: str) -> bool:
     """
     _, _, remainder = body.partition(CODEX_RESULT_HEADING)
     for line in remainder.splitlines():
-        statement = line.strip().lstrip("*_->#").strip().lower()
+        statement = _normalize_verdict_statement(line)
         if not statement:
             continue
         asserted = _opening_sentence(statement).rstrip(".*_! ").strip()
@@ -1035,6 +1054,119 @@ def build_retrospective_messages(
     return chunk_digest(header, blocks, label="retrospective evidence")
 
 
+def notify_exhausted_loop(
+    github: GitHubApi,
+    *,
+    pr_number: int,
+    head_sha: str,
+    repository: str,
+    pr_url: str,
+    branch: str,
+    author: str,
+    author_actor: str,
+    review_round: int,
+    reason: str,
+    findings: Sequence[Mapping[str, Any]],
+    reviewed_heads: Sequence[str],
+    reviews: Sequence[Mapping[str, Any]],
+    review_comments: Sequence[Mapping[str, Any]],
+    comments: Sequence[Mapping[str, Any]],
+    codex_login: str,
+    result_events: Sequence[tuple[datetime, int, str, str]] | None = None,
+) -> None:
+    """Publish the PR gate, authoring-seat wake, and Theoros retrospective.
+
+    Event-driven and scheduled exhaustion share this path so a clock-driven
+    gate cannot omit the notifications the review path already sends. The
+    gate comment is posted first: a later Slack failure cannot leave the
+    loop unstopped, and a retry still wakes because an existing marker is
+    not a reason to skip Slack.
+    """
+    gate = exhaustion_gate(
+        pr_url=pr_url,
+        head_sha=head_sha,
+        reviewed_heads=review_round,
+        reason=reason,
+    )
+    comment_state = ensure_comment_at_head(
+        github,
+        pr_number,
+        exhaustion_marker(head_sha),
+        gate,
+        expected_head=head_sha,
+        repository=repository,
+        action="exhaustion gate",
+    )
+    if comment_state == "stale":
+        print(
+            f"ignored stale exhaustion gate for "
+            f"{repository}#{pr_number} (head={head_sha})"
+        )
+        return
+    if comment_state == "existing":
+        print(
+            f"exhaustion gate already present for "
+            f"{repository}#{pr_number} (head={head_sha}); retrying wake"
+        )
+    if not author_actor:
+        print(
+            f"review loop exhausted for {repository}#{pr_number} "
+            f"(head={head_sha}); no seat author to wake"
+        )
+        return
+    if (
+        refresh_pr_at_head(
+            github,
+            pr_number,
+            head_sha,
+            repository,
+            action="exhaustion wake",
+        )
+        is None
+    ):
+        return
+    slack = SlackApi(required_env("HIVE_BOT_TOKEN"), required_env("HIVE_CHANNEL"))
+    slack.post_message(
+        f"WAKE: {author_actor}\n\n"
+        f"Review-loop hook: automatic repair/re-review exhausted at round "
+        f"{review_round}/{MAX_REVIEW_ROUNDS}. Do not burn or merge "
+        "automatically.\n\n"
+        f"{gate}"
+    )
+    print(
+        f"review loop exhausted for {repository}#{pr_number} "
+        f"(head={head_sha}, findings={len(findings)})"
+    )
+    events = result_events or codex_result_events(
+        github, reviews, comments, codex_login
+    )
+    history = round_history(
+        reviewed_heads,
+        reviews,
+        review_comments,
+        codex_login,
+        latest_kind_by_head=latest_result_kind_by_head(events),
+    )
+    post_threaded_messages(
+        slack,
+        build_retrospective_messages(
+            findings=findings,
+            history=history,
+            pr_url=pr_url,
+            branch=branch,
+            head_sha=head_sha,
+            repository=repository,
+            author=author,
+            author_actor=author_actor,
+            review_round=review_round,
+        ),
+    )
+    print(
+        f"woke theoros for {repository}#{pr_number} retrospective "
+        f"(rounds={len(history)})"
+    )
+
+
 def clean_wake_message(
     *,
     author_actor: str,
@@ -1148,87 +1280,28 @@ def route_review(event: Mapping[str, Any] | None = None) -> None:
         )
         if len(findings) > 10:
             locations += f", and {len(findings) - 10} more"
-        reason = (
-            f"Codex still reports {counts['total']} finding(s) on the exact "
-            f"current head ({counts['p1']} P1 / {counts['p2']} P2 / "
-            f"{counts['p3']} P3). Locations: {locations}."
-        )
-        gate = exhaustion_gate(
-            pr_url=pr_url,
-            head_sha=head_sha,
-            reviewed_heads=review_round,
-            reason=reason,
-        )
-        marker = exhaustion_marker(head_sha)
-        comment_state = ensure_comment_at_head(
+        notify_exhausted_loop(
             github,
-            pr_number,
-            marker,
-            gate,
-            expected_head=head_sha,
+            pr_number=pr_number,
+            head_sha=head_sha,
             repository=repository,
-            action="exhaustion gate",
-        )
-        if comment_state == "stale":
-            print(
-                f"ignored stale exhaustion gate for "
-                f"{repository}#{pr_number} (head={head_sha})"
-            )
-            return
-        if comment_state == "existing":
-            print(
-                f"exhaustion gate already present for "
-                f"{repository}#{pr_number} (head={head_sha}); retrying wake"
-            )
-        if (
-            refresh_pr_at_head(
-                github,
-                pr_number,
-                head_sha,
-                repository,
-                action="exhaustion wake",
-            )
-            is None
-        ):
-            return
-        slack.post_message(
-            f"WAKE: {author_actor}\n\n"
-            f"Review-loop hook: automatic repair/re-review exhausted at round "
-            f"{review_round}/{MAX_REVIEW_ROUNDS}. Do not burn or merge "
-            "automatically.\n\n"
-            f"{gate}"
-        )
-        print(
-            f"review loop exhausted for {repository}#{pr_number} "
-            f"(head={head_sha}, findings={len(findings)})"
-        )
-        # The gate comment and the authoring-seat wake are already published:
-        # the retrospective is a third message that never gates or delays them,
-        # and a failure here terminalizes visibly instead of being swallowed.
-        history = round_history(
-            reviewed_heads,
-            [*reviews, review],
-            review_comments,
-            codex_login,
-            latest_kind_by_head=latest_result_kind_by_head(result_events),
-        )
-        post_threaded_messages(
-            slack,
-            build_retrospective_messages(
-                findings=findings,
-                history=history,
-                pr_url=pr_url,
-                branch=branch,
-                head_sha=head_sha,
-                repository=repository,
-                author=author,
-                author_actor=author_actor,
-                review_round=review_round,
+            pr_url=pr_url,
+            branch=branch,
+            author=author,
+            author_actor=author_actor,
+            review_round=review_round,
+            reason=(
+                f"Codex still reports {counts['total']} finding(s) on the exact "
+                f"current head ({counts['p1']} P1 / {counts['p2']} P2 / "
+                f"{counts['p3']} P3). Locations: {locations}."
             ),
-        )
-        print(
-            f"woke theoros for {repository}#{pr_number} retrospective "
-            f"(rounds={len(history)})"
+            findings=findings,
+            reviewed_heads=reviewed_heads,
+            reviews=[*reviews, review],
+            review_comments=review_comments,
+            comments=conversation_comments,
+            codex_login=codex_login,
+            result_events=result_events,
         )
         return
 
@@ -1515,25 +1588,45 @@ def standing_findings(
     github: GitHubApi,
     pr_number: int,
     reviews: Sequence[Mapping[str, Any]],
+    comments: Sequence[Mapping[str, Any]],
+    head_sha: str,
     codex_login: str,
 ) -> list[dict[str, Any]]:
-    """Every inline finding still standing on one unchanged head.
+    """Findings belonging to the latest verdict on this unchanged head.
 
-    Reading only the newest review undercounts: a re-review of unchanged bytes
-    emits a second review whose inline set can be disjoint from the first.  On a
-    head that has not moved, nothing has resolved either set — only a push
-    resolves a finding, and a push changes the head — so the standing set is the
-    union.  Each inline comment belongs to exactly one review, so the union is a
-    concatenation with no deduplication to do.  The comment list is fetched once
-    and filtered per review, matching ``review_findings``'s contract.
+    A later clean comment or a later review supersedes earlier inline
+    comments on the same SHA. Unioning every exact-head review would
+    re-arm Talos for findings the latest verdict already closed.
     """
+    wanted = head_sha.lower()
+    latest_kind: str | None = None
+    latest_rank: tuple[datetime, int] | None = None
+    for at, order, head, kind in codex_result_events(
+        github, reviews, comments, codex_login
+    ):
+        if head.lower() != wanted:
+            continue
+        rank = (at, order)
+        if latest_rank is None or rank >= latest_rank:
+            latest_rank = rank
+            latest_kind = kind
+    if latest_kind != "findings":
+        return []
+    latest_review: Mapping[str, Any] | None = None
+    latest_review_rank: tuple[datetime, int] | None = None
+    for index, review in enumerate(
+        exact_head_codex_reviews(reviews, head_sha, codex_login)
+    ):
+        rank = (result_event_time(review.get("submitted_at")), index)
+        if latest_review_rank is None or rank >= latest_review_rank:
+            latest_review_rank = rank
+            latest_review = review
+    if latest_review is None:
+        return []
     review_comments = list(github.paginate(f"pulls/{pr_number}/comments"))
-    findings: list[dict[str, Any]] = []
-    for review in reviews:
-        findings.extend(
-            review_findings(review_comments, int(review["id"]), codex_login)
-        )
-    return findings
+    return review_findings(
+        review_comments, int(latest_review["id"]), codex_login
+    )
 
 
 def redeliver_standing_wake(
@@ -1582,12 +1675,8 @@ def redeliver_standing_wake(
     verdict_stamp = verdict_at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     exact_reviews = exact_head_codex_reviews(reviews, head_sha, codex_login)
-    # No exact-head review means the verdict came from a clean comment, which
-    # carries no inline findings by construction — so this costs no API call.
-    findings = (
-        standing_findings(github, pr_number, exact_reviews, codex_login)
-        if exact_reviews
-        else []
+    findings = standing_findings(
+        github, pr_number, reviews, comments, head_sha, codex_login
     )
     listed_labels = {
         str(label.get("name"))
@@ -1673,8 +1762,7 @@ def redeliver_standing_wake(
     messages[0] = f"{redelivery_notice(verdict_stamp)}\n\n{messages[0]}"
 
     slack = SlackApi(required_env("HIVE_BOT_TOKEN"), required_env("HIVE_CHANNEL"))
-    for message in messages:
-        slack.post_message(message)
+    post_threaded_messages(slack, messages)
     # Slack first, then the marker. A Slack failure leaves no marker, so the next
     # tick retries — duplicate delivery is the safe direction. A marker failure
     # after a successful post raises out of the scan rather than being swallowed.
@@ -1740,31 +1828,33 @@ def nudge_stalled_reviews() -> None:
                 redelivered += 1
             continue
         if len(reviewed_heads) >= MAX_REVIEW_ROUNDS:
-            marker = exhaustion_marker(head_sha)
-            pr_url = str(pull_request.get("html_url") or f"{repository}#{pr_number}")
-            gate = exhaustion_gate(
-                pr_url=pr_url,
+            resolved = author_for_pr(github, pr_number, head_sha)
+            author, author_actor = resolved if resolved else ("", "")
+            notify_exhausted_loop(
+                github,
+                pr_number=pr_number,
                 head_sha=head_sha,
-                reviewed_heads=len(reviewed_heads),
+                repository=repository,
+                pr_url=str(
+                    pull_request.get("html_url") or f"{repository}#{pr_number}"
+                ),
+                branch=str(head.get("ref") or ""),
+                author=author,
+                author_actor=author_actor,
+                review_round=len(reviewed_heads),
                 reason=(
                     "The current head has no exact-head Codex review after the "
                     "bounded automatic review cycle."
                 ),
+                findings=[],
+                reviewed_heads=reviewed_heads,
+                reviews=reviews,
+                review_comments=list(
+                    github.paginate(f"pulls/{pr_number}/comments")
+                ),
+                comments=comments,
+                codex_login=codex_login,
             )
-            if not marker_comment_exists(comments, marker):
-                if (
-                    refresh_pr_at_head(
-                        github,
-                        pr_number,
-                        head_sha,
-                        repository,
-                        action="exhaustion gate",
-                    )
-                    is None
-                ):
-                    continue
-                github.post(f"issues/{pr_number}/comments", {"body": gate})
-                print(f"exhausted PR #{pr_number}")
             continue
         if bare_nudge_covers_head(comments, head_sha):
             continue
