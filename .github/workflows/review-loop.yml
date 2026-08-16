@@ -1,5 +1,11 @@
 # Weave review-loop hook. Adopt this workflow together with
 # .github/scripts/review_loop.py and set HIVE_BOT_TOKEN plus CODEX_REVIEW_PAT.
+#
+# This workflow ROUTES Codex verdicts. It runs no tests and asserts nothing
+# about the code. Its own success is not evidence that a head is good — a PR
+# whose only green check came from here was misread as tested during the
+# 2026-08-15 merge sweep (KRA-1082). Every job below says so in its display
+# name, so the checks list cannot repeat that misread.
 name: review-loop
 
 on:
@@ -11,10 +17,25 @@ on:
     - cron: "*/15 * * * *"
   workflow_dispatch:
 
+# One run at a time, never cancelled: the helper's idempotency is
+# check-then-post over comment markers, so two overlapping runs can both
+# observe a marker as absent and both act. Serializing is cheap (the jobs are
+# small); duplicate wakes and duplicate gates are not.
+concurrency:
+  group: weave-review-loop
+  cancel-in-progress: false
+
 env:
   HIVE_CHANNEL: C0BGBEQQQHH
   CODEX_LOGIN: chatgpt-codex-connector[bot]
   CODEX_REVIEW_AUTHOR: RationallyPrime
+  # Reviewer-router meter (all optional; absent => pre-router behavior, Codex
+  # always). URL/pool/threshold are repository variables, the read token a
+  # secret. The meter is advisory: any failure routes to Codex as before.
+  AI_USAGE_URL: ${{ vars.AI_USAGE_URL }}
+  AI_USAGE_CODEX_POOL: ${{ vars.AI_USAGE_CODEX_POOL }}
+  AI_USAGE_CODEX_THRESHOLD: ${{ vars.AI_USAGE_CODEX_THRESHOLD }}
+  REVIEW_SUBSTITUTE_ACTOR: ${{ vars.REVIEW_SUBSTITUTE_ACTOR }}
 
 permissions:
   contents: read
@@ -22,15 +43,21 @@ permissions:
 
 jobs:
   wake-on-codex-result:
+    name: Route Codex verdict to Hive (routing only — not a test gate)
+    # The third arm fires on a substitute reviewer's verdict comment. The
+    # author literal mirrors CODEX_REVIEW_AUTHOR (env context is unavailable
+    # in job-level if); the helper re-verifies trust server-side either way,
+    # so this filter is cost control, not the trust boundary.
     if: >-
       (github.event_name == 'pull_request_review' && github.event.review.user.login == 'chatgpt-codex-connector[bot]') ||
-      (github.event_name == 'issue_comment' && github.event.issue.pull_request && github.event.comment.user.login == 'chatgpt-codex-connector[bot]')
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request && github.event.comment.user.login == 'chatgpt-codex-connector[bot]') ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request && github.event.comment.user.login == 'RationallyPrime' && contains(github.event.comment.body, 'weave-review-loop:substitute-verdict:'))
     runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","cx53"]' || '["ubuntu-latest"]') }}
     steps:
       # The helper executes with a Slack credential. Always load it from the
       # trusted default branch, never from the reviewed PR head.
       - name: Checkout trusted review-loop helper
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
@@ -42,11 +69,12 @@ jobs:
         run: python3 .github/scripts/review_loop.py route
 
   review-loop-canary:
+    name: Hive canary (routing only — not a test gate)
     if: github.event_name == 'workflow_dispatch'
     runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","cx53"]' || '["ubuntu-latest"]') }}
     steps:
       - name: Checkout trusted review-loop helper
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
@@ -57,11 +85,12 @@ jobs:
         run: python3 .github/scripts/review_loop.py canary
 
   nudge-stalled-reviews:
+    name: Nudge stalled reviews (routing only — not a test gate)
     if: github.event_name == 'schedule'
     runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","cx53"]' || '["ubuntu-latest"]') }}
     steps:
       - name: Checkout trusted review-loop helper
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
@@ -74,4 +103,6 @@ jobs:
           # The scheduled leg also re-delivers standing verdicts, so it needs a
           # Slack credential. Without it this job cannot reach Hive at all.
           HIVE_BOT_TOKEN: ${{ secrets.HIVE_BOT_TOKEN }}
+          # Optional reviewer-router meter credential; absent => Codex always.
+          AI_USAGE_READ_TOKEN: ${{ secrets.AI_USAGE_READ_TOKEN }}
         run: python3 .github/scripts/review_loop.py nudge
