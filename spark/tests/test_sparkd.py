@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -85,6 +86,20 @@ def _stop(proc: subprocess.Popen[str]) -> None:
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait(timeout=3)
+
+
+def _descendant_pids(pid: int) -> list[int]:
+    kids: list[int] = []
+    path = Path(f"/proc/{pid}/task/{pid}/children")
+    try:
+        raw = path.read_text().split()
+    except FileNotFoundError:
+        return kids
+    for item in raw:
+        child = int(item)
+        kids.append(child)
+        kids.extend(_descendant_pids(child))
+    return kids
 
 
 def _read_telemetry() -> list[dict]:
@@ -184,6 +199,19 @@ def test_per_request_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
         assert rec["status"] == "timeout"
     finally:
         _stop(proc)
+
+
+def test_dead_appserver_exits_daemon(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    proc, _ = _start_daemon(tmp_path, monkeypatch)
+    try:
+        children = _descendant_pids(proc.pid)
+        assert children, "daemon spawned no app-server child"
+        os.kill(children[0], signal.SIGKILL)
+        code = proc.wait(timeout=5)
+        assert code != 0
+    finally:
+        if proc.poll() is None:
+            _stop(proc)
 
 
 def test_timeout_does_not_poison_subsequent_requests(

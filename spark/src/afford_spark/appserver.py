@@ -52,6 +52,7 @@ class CodexAppServer:
         self._events: queue.Queue[dict[str, Any]] = queue.Queue()
         self._write_lock = threading.Lock()
         self._dead: str | None = None
+        self._closed = False
         self._auth_method: str | bool | None = None  # None=unknown, False=none
         self._reader = threading.Thread(target=self._read_loop, name="sparkd-rpc", daemon=True)
         self._reader.start()
@@ -201,6 +202,7 @@ class CodexAppServer:
             self._drop(thread_id)
 
     def close(self) -> None:
+        self._closed = True
         self._dead = self._dead or "closed"
         if self._proc.poll() is None:
             self._proc.terminate()
@@ -349,6 +351,13 @@ class CodexAppServer:
                 "error": {"code": -32601, "message": f"afford-sparkd does not handle {method}"},
             }
         )
+
+    def wait_child(self) -> int:
+        return int(self._proc.wait())
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
 
     def _raise_if_dead(self) -> None:
         if self._dead is not None:

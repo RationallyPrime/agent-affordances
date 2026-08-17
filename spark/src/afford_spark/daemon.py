@@ -58,6 +58,12 @@ def serve(*, socket_file: Path | None, systemd: bool, codex: str) -> None:
     try:
         app_server.handshake()
         app_server.check_auth()
+        threading.Thread(
+            target=_watch_child,
+            args=(app_server,),
+            name="sparkd-child",
+            daemon=True,
+        ).start()
         lock = threading.Lock()
         while True:
             try:
@@ -72,7 +78,18 @@ def serve(*, socket_file: Path | None, systemd: bool, codex: str) -> None:
             ).start()
     finally:
         app_server.close()
-        listener.close()
+        try:
+            listener.close()
+        except OSError:
+            pass
+
+
+def _watch_child(app_server: CodexAppServer) -> None:
+    """Child death is terminal. systemd ``Restart=on-failure`` replaces us."""
+    app_server.wait_child()
+    if app_server.closed:
+        return
+    os._exit(1)
 
 
 def _handle_conn(conn: socket.socket, app_server: CodexAppServer, lock: threading.Lock) -> None:
