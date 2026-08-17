@@ -131,10 +131,13 @@ Spark never touches a seat's live checkout.
 - No output without evidence coordinates or a patch.
 - No direct multi-file mass rewrite when a deterministic codemod can be emitted.
 - No final architectural, review, or acceptance verdicts.
-- Telemetry on every invocation: caller, operation, base SHA, allowed paths,
-  input hash, model, pool, latency, output hash, changed files, result state,
-  subsequent verification outcome. A few hundred calls tell us empirically
-  which verbs Spark deserves.
+- Telemetry on every invocation, including pool refusals, protocol errors, and
+  timeouts (written in a `finally`, classified as the state). v1 record:
+  caller (`AFFORD_SPARK_CALLER` or null), operation, base SHA, allowed paths,
+  input hash, model, pool (`spark`), latency, output hash, changed files
+  (wrapper-audited on `transform`; null otherwise), result state, subsequent
+  verification outcome (always null this slice — a later correlator fills it).
+  A few hundred calls tell us empirically which verbs Spark deserves.
 
 ## Later: the quota scavenger (NOT in the first slice)
 

@@ -36,6 +36,12 @@ repos:
         language: system
         pass_filenames: false
         files: '^linear-reads/(pyproject\.toml|uv\.(lock|toml))$'
+      - id: uv-lock-spark
+        name: uv lock check (spark)
+        entry: uv lock --check --project spark
+        language: system
+        pass_filenames: false
+        files: '^spark/(pyproject\.toml|uv\.(lock|toml))$'
       - id: ty
         name: ty type check
         entry: ty check
