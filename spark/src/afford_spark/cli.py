@@ -77,10 +77,22 @@ def _git_paths(wt: Path, *args: str) -> list[str]:
 
 
 def _expand_dir(absolute: Path, root: Path) -> list[str]:
-    """Tracked files under ``absolute``; ``rglob`` only outside a work tree."""
+    """Tracked + untracked-but-not-ignored files under ``absolute``; ``rglob``
+    only outside a work tree. ``--exclude-standard`` is what keeps ``.venv``
+    and caches out — dropping ``--others`` would also drop the file an agent
+    just wrote, and an empty ``complete`` would read as evidence of absence."""
     if _git(root, "rev-parse", "--is-inside-work-tree").strip() == "true":
         rel = absolute.relative_to(root).as_posix()
-        return _git_paths(root, "ls-files", "-z", "--", rel if rel != "." else ".")
+        return _git_paths(
+            root,
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            rel if rel != "." else ".",
+        )
     return [
         str(f.relative_to(root))
         for f in sorted(absolute.rglob("*"))
@@ -212,8 +224,11 @@ def transform(
     allow = [str(_under_root(p, root).relative_to(root)) for p in paths]
     if not allow:
         _usage("the resolved path set is empty")
+    # --verify --quiet: a bare rev-parse echoes an unresolvable rev to stdout
+    # and signals failure only in the return code, so an emptiness guard never
+    # fires and the typo flows into telemetry as a fake base_sha.
     base_sha = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", base],
+        ["git", "-C", str(root), "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}"],
         capture_output=True,
         text=True,
         check=False,

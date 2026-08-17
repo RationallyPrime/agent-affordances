@@ -684,3 +684,73 @@ def test_locate_directory_outside_repo_still_rglobs(fake_codex, tmp_path: Path) 
     result = runner.invoke(app, ["spark", "locate", "q", "sub", "--root", str(tmp_path)])
     assert result.exit_code == 0
     assert "sub/b.py" in captured.read_text()
+
+
+def test_transform_unresolvable_base_is_a_usage_error_not_an_engine_failure(
+    fake_codex, tmp_path: Path
+) -> None:
+    """A bare ``rev-parse`` echoes the typo to stdout and fails only in its
+    return code, so the emptiness guard never fired: ``--base mian`` exited 1
+    (engine) and landed the literal string ``mian`` in telemetry's base_sha."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_repo(repo)
+    invoked = tmp_path / "invoked"
+    fake_codex(f'printf invoked > "{invoked}"\n' + _emit_last_message(_complete_payload()))
+    result = runner.invoke(
+        app, ["spark", "transform", "rule", "a.py", "--root", str(repo), "--base", "mian"]
+    )
+    assert result.exit_code == 2
+    assert "cannot resolve base rev 'mian'" in result.output
+    assert not invoked.exists()
+
+
+def test_transform_empty_repo_head_is_a_usage_error(fake_codex, tmp_path: Path) -> None:
+    """An empty repository resolves ``HEAD`` to nothing; the guard must refuse
+    with usage semantics instead of handing ``HEAD`` to ``worktree add``."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    (repo / "a.py").write_text("x = 1\n")
+    invoked = tmp_path / "invoked"
+    fake_codex(f'printf invoked > "{invoked}"\n' + _emit_last_message(_complete_payload()))
+    result = runner.invoke(app, ["spark", "transform", "rule", "a.py", "--root", str(repo)])
+    assert result.exit_code == 2
+    assert "cannot resolve base rev" in result.output
+    assert not invoked.exists()
+
+
+def test_locate_directory_includes_untracked_files_but_not_ignored_ones(
+    fake_codex, tmp_path: Path
+) -> None:
+    """Tracked-only expansion made a just-written file invisible, and an empty
+    ``complete`` read as evidence of absence. ``--others --exclude-standard``
+    keeps the untracked file while still excluding the ignored noise."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_repo(repo)
+    (repo / ".gitignore").write_text(".venv/\n")
+    venv_file = repo / ".venv" / "noise.py"
+    venv_file.parent.mkdir(parents=True)
+    venv_file.write_text("noise\n")
+    (repo / "brand_new.py").write_text("answer = 42\n")
+    subprocess.run(["git", "add", ".gitignore"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "ignore"], cwd=repo, check=True)
+    captured = tmp_path / "prompt.txt"
+    fake_codex(
+        f'cat > "{captured}"\n'
+        + _emit_last_message(
+            {
+                "status": "complete",
+                "matches": [],
+                "searched_paths": 1,
+                "uncertainty": [],
+                "reason": None,
+            }
+        )
+    )
+    result = runner.invoke(app, ["spark", "locate", "q", ".", "--root", str(repo)])
+    assert result.exit_code == 0
+    prompt = captured.read_text()
+    assert "brand_new.py" in prompt
+    assert ".venv" not in prompt
