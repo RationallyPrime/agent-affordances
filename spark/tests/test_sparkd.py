@@ -214,9 +214,7 @@ def test_auth_classification_uses_structured_code() -> None:
     assert isinstance(unstructured_401, SparkUnavailableError)
 
 
-def test_oneshot_status_401_is_unavailable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_oneshot_status_401_is_unavailable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # Oneshot has no structured RPC code. ``401`` in stderr must stay an
     # entitlement refusal (status=unavailable), as it is on main.
     bin_dir = tmp_path / "bin"
@@ -236,9 +234,7 @@ def test_oneshot_status_401_is_unavailable(
     assert rec["transport"] == "oneshot"
 
 
-def test_oneshot_error403_path_is_not_auth(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_oneshot_error403_path_is_not_auth(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     stub = bin_dir / "codex"
@@ -374,16 +370,12 @@ def test_notification_without_identity_is_not_this_turn() -> None:
         "method": "turn/completed",
         "params": {"turn": {"status": "completed"}},
     }
-    assert (
-        _notification_belongs(anonymous, turn_id="turn-9", thread_id="thread-9") is False
-    )
+    assert _notification_belongs(anonymous, turn_id="turn-9", thread_id="thread-9") is False
     identified = {
         "method": "turn/completed",
         "params": {"threadId": "thread-9", "turn": {"id": "turn-9", "status": "completed"}},
     }
-    assert (
-        _notification_belongs(identified, turn_id="turn-9", thread_id="thread-9") is True
-    )
+    assert _notification_belongs(identified, turn_id="turn-9", thread_id="thread-9") is True
 
 
 def test_unidentified_completion_does_not_leak_predecessor(

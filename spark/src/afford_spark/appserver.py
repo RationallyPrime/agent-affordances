@@ -454,9 +454,7 @@ def _notification_belongs(
         return False
     if turn_id and got_turn and got_turn != turn_id:
         return False
-    if thread_id and got_thread and got_thread != thread_id:
-        return False
-    return True
+    return not (thread_id and got_thread and got_thread != thread_id)
 
 
 def _agent_text(turn: dict[str, Any]) -> str | None:
