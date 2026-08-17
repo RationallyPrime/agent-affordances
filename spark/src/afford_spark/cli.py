@@ -61,17 +61,40 @@ def _under_root(path: Path, root: Path) -> Path:
     return absolute
 
 
+def _git(wt: Path, *args: str) -> str:
+    """Git in ``wt``. Path listings must pass ``-z``; ``quotePath`` is not enough."""
+    return subprocess.run(
+        ["git", "-C", str(wt), "-c", "core.quotePath=false", *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout
+
+
+def _git_paths(wt: Path, *args: str) -> list[str]:
+    """Split a ``-z`` git path listing. ``args`` must include ``-z``."""
+    return [p for p in _git(wt, *args).split("\0") if p]
+
+
+def _expand_dir(absolute: Path, root: Path) -> list[str]:
+    """Tracked files under ``absolute``; ``rglob`` only outside a work tree."""
+    if _git(root, "rev-parse", "--is-inside-work-tree").strip() == "true":
+        rel = absolute.relative_to(root).as_posix()
+        return _git_paths(root, "ls-files", "-z", "--", rel if rel != "." else ".")
+    return [
+        str(f.relative_to(root))
+        for f in sorted(absolute.rglob("*"))
+        if f.is_file() and ".git" not in f.parts
+    ]
+
+
 def _resolve_paths(paths: list[Path], root: Path) -> list[str]:
     """Expand the caller's path set to concrete files, refusing escapes."""
     files: list[str] = []
     for p in paths:
         absolute = _under_root(p, root)
         if absolute.is_dir():
-            files.extend(
-                str(f.relative_to(root))
-                for f in sorted(absolute.rglob("*"))
-                if f.is_file() and ".git" not in f.parts
-            )
+            files.extend(_expand_dir(absolute, root))
         elif absolute.is_file():
             files.append(str(absolute.relative_to(root)))
         else:
@@ -81,28 +104,20 @@ def _resolve_paths(paths: list[Path], root: Path) -> list[str]:
     return files
 
 
-def _git(wt: Path, *args: str) -> str:
-    """Git in ``wt`` with pathnames left unquoted so they match pathlib."""
-    return subprocess.run(
-        ["git", "-C", str(wt), "-c", "core.quotePath=false", *args],
-        capture_output=True,
-        text=True,
-        check=False,
-    ).stdout
-
-
 def _worktree_changes(wt: Path, base_sha: str) -> tuple[str, list[str]]:
     """Working-tree changes vs ``base_sha``, including staged, committed, untracked, ignored."""
     diff = _git(wt, "diff", "--patch", base_sha)
-    touched = [
-        line.split("\t", 2)[2]
-        for line in _git(wt, "diff", "--numstat", base_sha).splitlines()
-        if "\t" in line
-    ]
-    extra = _git(wt, "ls-files", "--others", "--exclude-standard")
-    ignored = _git(wt, "ls-files", "--others", "--ignored", "--exclude-standard")
-    for path in (*extra.splitlines(), *ignored.splitlines()):
+    touched: list[str] = []
+    for rec in _git_paths(wt, "diff", "--numstat", "-z", base_sha):
+        parts = rec.split("\t", 2)
+        path = parts[2] if len(parts) == 3 else rec
         if path and path not in touched:
+            touched.append(path)
+    for path in (
+        *_git_paths(wt, "ls-files", "-z", "--others", "--exclude-standard"),
+        *_git_paths(wt, "ls-files", "-z", "--others", "--ignored", "--exclude-standard"),
+    ):
+        if path not in touched:
             touched.append(path)
     return diff, touched
 
@@ -274,12 +289,15 @@ def transform(
                     check=False,
                 )
             finally:
+                inflight = sys.exc_info()[0]
                 try:
                     emit_invocation(
                         record, started=started, status=status, raw=raw, changed_files=changed
                     )
                 except OSError as exc:
-                    _die(f"telemetry write failed: {exc}")
+                    typer.echo(f"afford spark: telemetry write failed: {exc}", err=True)
+                    if inflight is None:
+                        raise typer.Exit(1) from exc
     if result is None:
         _die("transform produced no result")
     _emit(result)

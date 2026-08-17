@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 from datetime import UTC, datetime
@@ -258,10 +259,16 @@ def run_spark[M: BaseModel](
         return result
     finally:
         if emit_telemetry:
-            emit_invocation(
-                record,
-                started=started,
-                status=status,
-                raw=raw,
-                changed_files=changed_files,
-            )
+            inflight = sys.exc_info()[0]
+            try:
+                emit_invocation(
+                    record,
+                    started=started,
+                    status=status,
+                    raw=raw,
+                    changed_files=changed_files,
+                )
+            except OSError as exc:
+                print(f"afford spark: telemetry write failed: {exc}", file=sys.stderr)
+                if inflight is None:
+                    raise

@@ -8,6 +8,7 @@ enforcement, empty-diff honesty, and the live checkout staying untouched.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import stat
@@ -482,3 +483,204 @@ def test_transform_telemetry_failure_still_removes_worktree(
     ).stdout
     assert "afford-spark-wt" not in listed
     assert (repo / "a.py").read_text() == "x = 1\n"
+
+
+def _b64(rel: str) -> str:
+    return base64.b64encode(rel.encode()).decode()
+
+
+def _append_rel(rel: str) -> str:
+    """Bash snippet: append ``z = 3`` to ``$workdir/<rel>`` (any bytes in the name)."""
+    return f'python3 -c {APPEND_REL!r} "$workdir" {_b64(rel)}\n'
+
+
+APPEND_REL = (
+    "from pathlib import Path; import sys, base64; "
+    "p = Path(sys.argv[1]) / base64.b64decode(sys.argv[2]).decode(); "
+    "p.write_text(p.read_text() + 'z = 3\\n')"
+)
+
+
+def _init_named_repo(repo: Path, name: str) -> str:
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    (repo / name).write_text("x = 1\n")
+    subprocess.run(["git", "add", "-f", "--", name], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=repo, check=True)
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
+def test_transform_accepts_cquoted_allowlisted_path(fake_codex, tmp_path: Path) -> None:
+    """quotePath=false still C-quotes `\"` `\\` and controls; -z is what keeps the real name."""
+    repo = tmp_path / "repo"
+    named = 'say"hi.py'
+    sha = _init_named_repo(repo, named)
+    fake_codex(
+        _workdir_prelude()
+        + _append_rel(named)
+        + _emit_last_message(
+            {
+                "status": "complete",
+                "base_sha": None,
+                "touched_paths": [named],
+                "patch": None,
+                "claims": [f"only {named} changed"],
+                "reason": None,
+                "decision_required": None,
+            }
+        )
+    )
+    result = runner.invoke(app, ["spark", "transform", "append z", named, "--root", str(repo)])
+    payload = json.loads(result.output)
+    assert payload["status"] == "complete"
+    assert payload["base_sha"] == sha
+    assert named in payload["touched_paths"]
+    assert result.exit_code == 0
+
+
+def test_transform_accepts_newline_allowlisted_path(fake_codex, tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    named = "foo\nbar.py"
+    sha = _init_named_repo(repo, named)
+    fake_codex(
+        _workdir_prelude()
+        + _append_rel(named)
+        + _emit_last_message(
+            {
+                "status": "complete",
+                "base_sha": None,
+                "touched_paths": [named],
+                "patch": None,
+                "claims": ["only newline-named file changed"],
+                "reason": None,
+                "decision_required": None,
+            }
+        )
+    )
+    result = runner.invoke(app, ["spark", "transform", "append z", named, "--root", str(repo)])
+    payload = json.loads(result.output)
+    assert payload["status"] == "complete"
+    assert payload["base_sha"] == sha
+    assert named in payload["touched_paths"]
+    assert result.exit_code == 0
+
+
+def test_transform_refuses_cquoted_untracked_by_real_name(fake_codex, tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_repo(repo)
+    evil = 'evil"file.py'
+    fake_codex(
+        _workdir_prelude()
+        + 'echo "z = 3" >> "$workdir/a.py"\n'
+        + f'python3 -c {CREATE_REL!r} "$workdir" {_b64(evil)}\n'
+        + _emit_last_message(_complete_payload())
+    )
+    result = runner.invoke(app, ["spark", "transform", "append z", "a.py", "--root", str(repo)])
+    payload = json.loads(result.output)
+    assert payload["status"] == "refused"
+    assert evil in payload["reason"]
+    assert result.exit_code == 5
+
+
+CREATE_REL = (
+    "from pathlib import Path; import sys, base64; "
+    "Path(sys.argv[1], base64.b64decode(sys.argv[2]).decode()).write_text('evil\\n')"
+)
+
+
+def test_transform_usage_exit_survives_telemetry_failure(
+    fake_codex, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_repo(repo)
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x")
+    monkeypatch.setenv("AFFORD_SPARK_TELEMETRY", str(blocker / "telemetry.jsonl"))
+    invoked = tmp_path / "invoked"
+    fake_codex(f'printf invoked > "{invoked}"\n' + _emit_last_message(_complete_payload()))
+    result = runner.invoke(app, ["spark", "transform", "rule", "missing.py", "--root", str(repo)])
+    assert result.exit_code == 2
+    assert "allowlisted paths absent" in result.output
+    assert "telemetry write failed" in result.output
+    assert not invoked.exists()
+    listed = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "afford-spark-wt" not in listed
+
+
+def test_locate_pool_refusal_survives_telemetry_failure(
+    fake_codex, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "a.py").write_text("x = 1\n")
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x")
+    monkeypatch.setenv("AFFORD_SPARK_TELEMETRY", str(blocker / "telemetry.jsonl"))
+    fake_codex('cat > /dev/null; echo "429 usage limit reached" >&2; exit 1\n')
+    result = runner.invoke(app, ["spark", "locate", "q", "a.py", "--root", str(tmp_path)])
+    assert result.exit_code == 1
+    assert "refused the call" in result.output
+    assert "locate failed:" not in result.output
+
+
+def test_locate_directory_expands_tracked_files_not_venv(fake_codex, tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_repo(repo)
+    (repo / ".gitignore").write_text(".venv/\n")
+    venv_file = repo / ".venv" / "lib" / "site-packages" / "noise.py"
+    venv_file.parent.mkdir(parents=True)
+    venv_file.write_text("noise\n")
+    subprocess.run(["git", "add", ".gitignore"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "ignore"], cwd=repo, check=True)
+    captured = tmp_path / "prompt.txt"
+    fake_codex(
+        f'cat > "{captured}"\n'
+        + _emit_last_message(
+            {
+                "status": "complete",
+                "matches": [],
+                "searched_paths": 1,
+                "uncertainty": [],
+                "reason": None,
+            }
+        )
+    )
+    result = runner.invoke(app, ["spark", "locate", "q", ".", "--root", str(repo)])
+    assert result.exit_code == 0
+    prompt = captured.read_text()
+    assert "a.py" in prompt
+    assert ".venv" not in prompt
+    rec = _read_telemetry()[-1]
+    assert "a.py" in rec["allowed_paths"]
+    assert not any(".venv" in p for p in rec["allowed_paths"])
+
+
+def test_locate_directory_outside_repo_still_rglobs(fake_codex, tmp_path: Path) -> None:
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "b.py").write_text("y = 2\n")
+    captured = tmp_path / "prompt.txt"
+    fake_codex(
+        f'cat > "{captured}"\n'
+        + _emit_last_message(
+            {
+                "status": "complete",
+                "matches": [],
+                "searched_paths": 1,
+                "uncertainty": [],
+                "reason": None,
+            }
+        )
+    )
+    result = runner.invoke(app, ["spark", "locate", "q", "sub", "--root", str(tmp_path)])
+    assert result.exit_code == 0
+    assert "sub/b.py" in captured.read_text()
