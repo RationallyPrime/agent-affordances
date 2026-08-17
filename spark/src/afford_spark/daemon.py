@@ -56,13 +56,15 @@ def main(argv: list[str] | None = None) -> None:
 
 def serve(*, socket_file: Path | None, systemd: bool, codex: str) -> None:
     listener = _listen(socket_file, systemd=systemd)
+    # systemd owns the inherited socket file; we only unlink a path we bound.
+    owned_socket = None if systemd else (socket_file or socket_path())
     app_server = CodexAppServer.spawn(codex=codex)
     try:
         app_server.handshake()
         app_server.check_auth()
         threading.Thread(
             target=_watch_child,
-            args=(app_server,),
+            args=(app_server, owned_socket),
             name="sparkd-child",
             daemon=True,
         ).start()
@@ -82,13 +84,19 @@ def serve(*, socket_file: Path | None, systemd: bool, codex: str) -> None:
         app_server.close()
         with contextlib.suppress(OSError):
             listener.close()
+        if owned_socket is not None:
+            with contextlib.suppress(OSError):
+                owned_socket.unlink(missing_ok=True)
 
 
-def _watch_child(app_server: CodexAppServer) -> None:
+def _watch_child(app_server: CodexAppServer, owned_socket: Path | None) -> None:
     """Child death is terminal. systemd ``Restart=on-failure`` replaces us."""
     app_server.wait_child()
     if app_server.closed:
         return
+    if owned_socket is not None:
+        with contextlib.suppress(OSError):
+            owned_socket.unlink(missing_ok=True)
     os._exit(1)
 
 

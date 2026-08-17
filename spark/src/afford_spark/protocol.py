@@ -8,6 +8,7 @@ in the conversation layer (fresh thread per request), not in this envelope.
 from __future__ import annotations
 
 import os
+import socket
 from pathlib import Path
 from typing import Any, Literal
 
@@ -62,11 +63,30 @@ def transport_mode() -> TransportMode:
     return raw  # type: ignore[return-value]
 
 
+def socket_is_connectable(path: Path) -> bool:
+    """True only when a live process is accepting on the unix socket."""
+    if not path.exists():
+        return False
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    except OSError:
+        return False
+    try:
+        sock.settimeout(0.25)
+        sock.connect(str(path))
+    except OSError:
+        return False
+    else:
+        return True
+    finally:
+        sock.close()
+
+
 def resolve_transport() -> Transport:
-    """``auto`` uses the daemon only when its socket already exists."""
+    """``auto`` uses the daemon only when its socket is connectable."""
     mode = transport_mode()
     if mode == "oneshot":
         return "oneshot"
     if mode == "daemon":
         return "daemon"
-    return "daemon" if socket_path().exists() else "oneshot"
+    return "daemon" if socket_is_connectable(socket_path()) else "oneshot"

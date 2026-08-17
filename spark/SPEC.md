@@ -150,7 +150,8 @@ second slice keeps the wrapper contract and amortizes boot:
 - `afford` is a thin unix-socket client when the socket is present
   (`$AFFORD_SPARK_SOCKET`, else `$XDG_RUNTIME_DIR/afford-sparkd/sparkd.sock`).
   `AFFORD_SPARK_TRANSPORT=oneshot|daemon|auto` (default `auto`: socket if
-  present, otherwise oneshot `codex exec`).
+  connectable, otherwise oneshot `codex exec`). A leftover socket file
+  with no listener is oneshot, not a hard-down.
 - **Fresh conversation per request, dropped after delivery.** Isolation is the
   conversation layer, not process recycling. Consecutive calls must not share
   a thread.

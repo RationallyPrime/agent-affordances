@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import socket as socklib
 import stat
 import subprocess
 import sys
@@ -24,7 +25,13 @@ from afford_spark.engine import (
     run_spark,
 )
 from afford_spark.models import LocateResult
-from afford_spark.protocol import DAEMON_PROTOCOL, DaemonRequest, DaemonResponse, socket_path
+from afford_spark.protocol import (
+    DAEMON_PROTOCOL,
+    DaemonRequest,
+    DaemonResponse,
+    resolve_transport,
+    socket_path,
+)
 
 
 def _install_fake_codex(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -264,16 +271,38 @@ def test_per_request_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
 
 
 def test_dead_appserver_exits_daemon(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    proc, _ = _start_daemon(tmp_path, monkeypatch)
+    proc, sock = _start_daemon(tmp_path, monkeypatch)
     try:
         children = _descendant_pids(proc.pid)
         assert children, "daemon spawned no app-server child"
         os.kill(children[0], signal.SIGKILL)
         code = proc.wait(timeout=5)
         assert code != 0
+        assert not sock.exists()
     finally:
         if proc.poll() is None:
             _stop(proc)
+
+
+def test_auto_treats_unconnectable_socket_as_oneshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stale = tmp_path / "stale.sock"
+    leftover = socklib.socket(socklib.AF_UNIX, socklib.SOCK_STREAM)
+    leftover.bind(str(stale))
+    leftover.close()
+    assert stale.exists()
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    monkeypatch.setenv("AFFORD_SPARK_SOCKET", str(stale))
+    monkeypatch.setenv("AFFORD_SPARK_TRANSPORT", "auto")
+    assert resolve_transport() == "oneshot"
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    (tmp_path / "empty").mkdir()
+    with pytest.raises(SparkUnavailableError, match="codex CLI not found"):
+        run_spark("q", verb="locate", workdir=tmp_path, schema=LocateResult)
+    rec = _read_telemetry()[-1]
+    assert rec["transport"] == "oneshot"
 
 
 def test_queued_request_times_out_within_own_budget(

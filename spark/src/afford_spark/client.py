@@ -9,7 +9,12 @@ from afford_spark.protocol import DAEMON_PROTOCOL, DaemonRequest, DaemonResponse
 
 
 class DaemonConnectError(OSError):
-    """Socket missing, refused, or not a socket — caller may fall back."""
+    """Socket missing, refused, or not a socket.
+
+    Forced ``daemon`` transport fails loud as ``SparkUnavailableError``.
+    ``auto`` must not reach this: ``resolve_transport`` treats an
+    unconnectable socket as oneshot.
+    """
 
 
 def request_daemon(req: DaemonRequest, path: Path) -> DaemonResponse:
