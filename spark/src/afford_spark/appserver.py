@@ -26,12 +26,13 @@ AUTH_MARKERS = (
     "not authenticated",
     "auth expired",
     "token expired",
-    "401",
-    "403",
     "login required",
     "re-authenticate",
     "not logged in",
 )
+# Structured JSON-RPC / HTTP auth codes. Never match these as substrings of a
+# rendered error — a code of -32403 or a path like error403.py is not auth.
+AUTH_CODES = {401, 403}
 # Methods tried in order; a method-not-found is not an auth failure.
 AUTH_METHODS = ("account/read", "account/rateLimits/read")
 # App-server protocol we speak. A server that *states* a different version is
@@ -456,14 +457,23 @@ def _rpc_error(method: str, error: object) -> SparkProtocolError | SparkUnavaila
         message = str(error.get("message", error))
         code = error.get("code")
         text = f"codex {method} error {code}: {message}"
-    else:
-        text = f"codex {method} error: {error}"
+        if _is_auth_code(code) or _is_auth_text(message):
+            return SparkUnavailableError(
+                "Spark auth expired or missing — re-authenticate the "
+                "Codex CLI (`codex login`). The warm daemon will not retry."
+            )
+        return SparkProtocolError(text)
+    text = f"codex {method} error: {error}"
     if _is_auth_text(text):
         return SparkUnavailableError(
             "Spark auth expired or missing — re-authenticate the "
             "Codex CLI (`codex login`). The warm daemon will not retry."
         )
     return SparkProtocolError(text)
+
+
+def _is_auth_code(code: object) -> bool:
+    return isinstance(code, int) and code in AUTH_CODES
 
 
 def _is_auth_text(text: str) -> bool:

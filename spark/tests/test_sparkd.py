@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from afford_spark.appserver import _rpc_error
 from afford_spark.engine import (
     SparkProtocolError,
     SparkUnavailableError,
@@ -166,6 +167,28 @@ def test_protocol_pin_rejects_v2_request(tmp_path: Path, monkeypatch: pytest.Mon
         assert response.v == DAEMON_PROTOCOL
     finally:
         _stop(proc)
+
+
+def test_auth_classification_uses_structured_code() -> None:
+    misclassified = _rpc_error(
+        "thread/start", {"code": -32403, "message": "cwd is not a directory"}
+    )
+    assert isinstance(misclassified, SparkProtocolError)
+    assert not isinstance(misclassified, SparkUnavailableError)
+
+    path_lookalike = _rpc_error(
+        "turn/start", {"code": -32000, "message": "see src/http/error403.py"}
+    )
+    assert isinstance(path_lookalike, SparkProtocolError)
+    assert not isinstance(path_lookalike, SparkUnavailableError)
+
+    by_code = _rpc_error("account/read", {"code": 401, "message": "nope"})
+    assert isinstance(by_code, SparkUnavailableError)
+
+    by_message = _rpc_error(
+        "account/read", {"code": -32000, "message": "unauthorized: token expired"}
+    )
+    assert isinstance(by_message, SparkUnavailableError)
 
 
 def test_auth_expiry_fails_loud_and_does_not_retry(
