@@ -141,6 +141,9 @@ class CodexAppServer:
     ) -> str:
         """Fresh ephemeral thread → one turn → drop. Returns the last agent text."""
         self.check_auth(timeout_s=min(10.0, timeout_s))
+        # Stale notifications from an abandoned predecessor must not be
+        # visible to this turn — the queue is process-global.
+        self._drain_events()
         deadline = time.monotonic() + timeout_s
         thread = self.request(
             "thread/start",
@@ -155,6 +158,7 @@ class CodexAppServer:
         thread_id = _thread_id(thread)
         if not thread_id:
             raise SparkProtocolError("thread/start returned no thread id")
+        turn_id: str | None = None
         try:
             started = self.request(
                 "turn/start",
@@ -167,7 +171,12 @@ class CodexAppServer:
                 timeout_s=_remaining(deadline),
             )
             turn_id = _turn_id(started)
-            completed = self.wait_notification("turn/completed", timeout_s=_remaining(deadline))
+            completed = self.wait_notification(
+                "turn/completed",
+                timeout_s=_remaining(deadline),
+                turn_id=turn_id,
+                thread_id=thread_id,
+            )
             params = completed.get("params")
             if not isinstance(params, dict):
                 raise SparkProtocolError("turn/completed carried no params")
@@ -185,6 +194,9 @@ class CodexAppServer:
             if text is None:
                 raise SparkProtocolError("codex turn completed with no agent message")
             return text
+        except Exception:
+            self._interrupt_turn(thread_id, turn_id)
+            raise
         finally:
             self._drop(thread_id)
 
@@ -220,7 +232,14 @@ class CodexAppServer:
             payload["params"] = params
         self._send(payload)
 
-    def wait_notification(self, method: str, timeout_s: float) -> dict[str, Any]:
+    def wait_notification(
+        self,
+        method: str,
+        timeout_s: float,
+        *,
+        turn_id: str | None = None,
+        thread_id: str | None = None,
+    ) -> dict[str, Any]:
         deadline = time.monotonic() + timeout_s
         while True:
             self._raise_if_dead()
@@ -231,18 +250,39 @@ class CodexAppServer:
                 message = self._events.get(timeout=remaining)
             except queue.Empty as exc:
                 raise SparkProtocolError(f"timed out waiting for {method}") from exc
-            if message.get("method") == method:
-                return message
+            if message.get("method") != method:
+                continue
+            if not _notification_belongs(message, turn_id=turn_id, thread_id=thread_id):
+                continue
+            return message
+
+    def _drain_events(self) -> None:
+        try:
+            while True:
+                self._events.get_nowait()
+        except queue.Empty:
+            return
+
+    def _interrupt_turn(self, thread_id: str, turn_id: str | None) -> None:
+        if not turn_id:
+            return
+        try:
+            self.request(
+                "turn/interrupt",
+                {"threadId": thread_id, "turnId": turn_id},
+                timeout_s=2.0,
+            )
+        except SparkProtocolError:
+            return
 
     def _drop(self, thread_id: str) -> None:
+        # Archive and unsubscribe are not a fallback chain: archive may succeed
+        # while the connection is still subscribed and still emitting.
         for method in ("thread/archive", "thread/unsubscribe"):
             try:
                 self.request(method, {"threadId": thread_id}, timeout_s=5.0)
-                return
-            except SparkProtocolError as exc:
-                if _is_missing_method(str(exc)):
-                    continue
-                return
+            except SparkProtocolError:
+                continue
 
     def _send(self, payload: dict[str, Any]) -> None:
         stdin = self._proc.stdin
@@ -337,11 +377,55 @@ def _thread_id(result: dict[str, Any]) -> str | None:
 
 def _turn_id(result: dict[str, Any]) -> str | None:
     turn = result.get("turn")
-    if isinstance(turn, dict) and isinstance(turn.get("id"), str):
-        return turn["id"]
+    if isinstance(turn, dict):
+        if isinstance(turn.get("id"), str):
+            return turn["id"]
+        if isinstance(turn.get("turnId"), str):
+            return turn["turnId"]
     if isinstance(result.get("turnId"), str):
         return result["turnId"]
+    if isinstance(result.get("id"), str):
+        return result["id"]
     return None
+
+
+def _event_turn_id(message: dict[str, Any]) -> str | None:
+    params = message.get("params")
+    if not isinstance(params, dict):
+        return None
+    turn = params.get("turn")
+    if isinstance(turn, dict) and isinstance(turn.get("id"), str):
+        return turn["id"]
+    if isinstance(params.get("turnId"), str):
+        return params["turnId"]
+    return None
+
+
+def _event_thread_id(message: dict[str, Any]) -> str | None:
+    params = message.get("params")
+    if not isinstance(params, dict):
+        return None
+    if isinstance(params.get("threadId"), str):
+        return params["threadId"]
+    turn = params.get("turn")
+    if isinstance(turn, dict) and isinstance(turn.get("threadId"), str):
+        return turn["threadId"]
+    return None
+
+
+def _notification_belongs(
+    message: dict[str, Any],
+    *,
+    turn_id: str | None,
+    thread_id: str | None,
+) -> bool:
+    got_turn = _event_turn_id(message)
+    if turn_id and got_turn and got_turn != turn_id:
+        return False
+    got_thread = _event_thread_id(message)
+    if thread_id and got_thread and got_thread != thread_id:
+        return False
+    return True
 
 
 def _agent_text(turn: dict[str, Any]) -> str | None:

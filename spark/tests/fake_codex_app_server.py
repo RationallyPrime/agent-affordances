@@ -15,13 +15,17 @@ from __future__ import annotations
 import json
 import os
 import sys
-import time
+import threading
 from typing import Any
+
+_send_lock = threading.Lock()
 
 
 def _send(payload: dict[str, Any]) -> None:
-    sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
-    sys.stdout.flush()
+    line = json.dumps(payload, separators=(",", ":")) + "\n"
+    with _send_lock:
+        sys.stdout.write(line)
+        sys.stdout.flush()
 
 
 def main() -> None:
@@ -32,6 +36,7 @@ def main() -> None:
     sleep_s = float(os.environ.get("AFFORD_FAKE_TURN_SLEEP", "0"))
     history_path = os.environ.get("AFFORD_FAKE_HISTORY")
     threads: dict[str, list[str]] = {}
+    pending_turns: dict[str, threading.Event] = {}
     next_thread = 1
     next_turn = 1
 
@@ -95,33 +100,51 @@ def main() -> None:
             turn_id = f"turn-{next_turn}"
             next_turn += 1
             _send({"id": ident, "result": {"turn": {"id": turn_id, "status": "inProgress"}}})
-            if sleep_s > 0:
-                time.sleep(sleep_s)
-            # Isolation tell: the payload lists every prompt this thread has seen.
-            body = json.dumps(
-                {
-                    "status": "complete",
-                    "matches": [],
-                    "searched_paths": 1,
-                    "uncertainty": [],
-                    "reason": None,
-                }
-            )
-            if history_path:
-                with open(history_path, "a") as fh:
-                    fh.write(json.dumps({"thread": thread_id, "prompts": prompts}) + "\n")
-            _send(
-                {
-                    "method": "turn/completed",
-                    "params": {
-                        "turn": {
-                            "id": turn_id,
-                            "status": "completed",
-                            "items": [{"type": "agentMessage", "text": body}],
-                        }
-                    },
-                }
-            )
+            cancel = threading.Event()
+            pending_turns[turn_id] = cancel
+
+            def _finish(
+                tid: str = turn_id,
+                th: str = thread_id,
+                seen: list[str] = list(prompts),
+                ev: threading.Event = cancel,
+            ) -> None:
+                interrupted = ev.wait(sleep_s) if sleep_s > 0 else ev.is_set()
+                status = "interrupted" if interrupted else "completed"
+                body = json.dumps(
+                    {
+                        "status": "complete",
+                        "matches": [],
+                        "searched_paths": 1,
+                        "uncertainty": [],
+                        "reason": None,
+                    }
+                )
+                if history_path and not interrupted:
+                    with open(history_path, "a") as fh:
+                        fh.write(json.dumps({"thread": th, "prompts": seen}) + "\n")
+                _send(
+                    {
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": th,
+                            "turn": {
+                                "id": tid,
+                                "status": status,
+                                "items": [{"type": "agentMessage", "text": body}],
+                            },
+                        },
+                    }
+                )
+
+            threading.Thread(target=_finish, name=f"fake-turn-{turn_id}", daemon=True).start()
+            continue
+        if method == "turn/interrupt":
+            turn_id = str(params.get("turnId") or "")
+            ev = pending_turns.get(turn_id)
+            if ev is not None:
+                ev.set()
+            _send({"id": ident, "result": {}})
             continue
         if method in {"thread/archive", "thread/unsubscribe"}:
             thread_id = str(params.get("threadId") or "")

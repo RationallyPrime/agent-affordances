@@ -178,10 +178,28 @@ def test_per_request_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
         with pytest.raises(SparkProtocolError, match="timed out"):
             run_spark(
                 "q", verb="locate", workdir=tmp_path, schema=LocateResult, timeout_s=1
-            )  # fake sleeps 3s; per-request budget is 1s
+            )  # fake sleeps 1.2s; per-request budget is 1s
         rec = _read_telemetry()[-1]
         assert rec["transport"] == "daemon"
         assert rec["status"] == "timeout"
+    finally:
+        _stop(proc)
+
+
+def test_timeout_does_not_poison_subsequent_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A timed-out turn still emits turn/completed afterwards. The next
+    # healthy call must not consume that stale notification.
+    proc, _ = _start_daemon(tmp_path, monkeypatch, extra_env={"AFFORD_FAKE_TURN_SLEEP": "1.2"})
+    try:
+        with pytest.raises(SparkProtocolError, match="timed out"):
+            run_spark("q", verb="locate", workdir=tmp_path, schema=LocateResult, timeout_s=1)
+        for _ in range(4):
+            result = run_spark(
+                "q", verb="locate", workdir=tmp_path, schema=LocateResult, timeout_s=30
+            )
+            assert result.status == "complete"
     finally:
         _stop(proc)
 
