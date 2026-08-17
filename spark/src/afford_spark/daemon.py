@@ -8,6 +8,7 @@ and a protocol other than v1 fail loud.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import socket
 import sys
@@ -79,10 +80,8 @@ def serve(*, socket_file: Path | None, systemd: bool, codex: str) -> None:
             ).start()
     finally:
         app_server.close()
-        try:
+        with contextlib.suppress(OSError):
             listener.close()
-        except OSError:
-            pass
 
 
 def _watch_child(app_server: CodexAppServer) -> None:

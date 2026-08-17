@@ -6,6 +6,7 @@ Exit codes: 0 complete · 3 incomplete · 4 ambiguous · 5 refused ·
 
 from __future__ import annotations
 
+import contextlib
 import subprocess
 import sys
 import tempfile
@@ -252,10 +253,8 @@ def transform(
             repo=root,
             transport=None,
         )
-        try:
+        with contextlib.suppress(OSError):
             emit_invocation(record, started=started, status="protocol_error")
-        except OSError:
-            pass
         _die(str(exc))
     record = invocation_record(
         verb="transform",

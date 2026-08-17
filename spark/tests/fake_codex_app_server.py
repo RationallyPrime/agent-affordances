@@ -106,9 +106,10 @@ def main() -> None:
             def _finish(
                 tid: str = turn_id,
                 th: str = thread_id,
-                seen: list[str] = list(prompts),
+                seen: list[str] | None = None,
                 ev: threading.Event = cancel,
             ) -> None:
+                snapshot = [] if seen is None else list(seen)
                 interrupted = ev.wait(sleep_s) if sleep_s > 0 else ev.is_set()
                 status = "interrupted" if interrupted else "completed"
                 body = json.dumps(
@@ -122,7 +123,7 @@ def main() -> None:
                 )
                 if history_path and not interrupted:
                     with open(history_path, "a") as fh:
-                        fh.write(json.dumps({"thread": th, "prompts": seen}) + "\n")
+                        fh.write(json.dumps({"thread": th, "prompts": snapshot}) + "\n")
                 _send(
                     {
                         "method": "turn/completed",
@@ -137,7 +138,12 @@ def main() -> None:
                     }
                 )
 
-            threading.Thread(target=_finish, name=f"fake-turn-{turn_id}", daemon=True).start()
+            threading.Thread(
+                target=_finish,
+                kwargs={"seen": list(prompts)},
+                name=f"fake-turn-{turn_id}",
+                daemon=True,
+            ).start()
             continue
         if method == "turn/interrupt":
             turn_id = str(params.get("turnId") or "")
