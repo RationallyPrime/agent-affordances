@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -102,7 +103,8 @@ class CodexAppServer:
 
     def check_auth(self, timeout_s: float = 10.0) -> None:
         """Fail loud on expiry. A missing auth method is not a pass — we still
-        classify 401/unauthorized on the turn itself."""
+        classify structured 401/403 and unauthorized-class text (including a
+        token ``401``/``403``) on the turn itself."""
         if self._auth_method is False:
             return
         methods: Iterator[str]
@@ -495,9 +497,16 @@ def _is_auth_code(code: object) -> bool:
     return isinstance(code, int) and code in AUTH_CODES
 
 
+# Token 401/403 on unstructured text (oneshot stderr, non-dict RPC, child
+# death). Word-bounded so -32403 and error403.py stay non-auth.
+_AUTH_STATUS_RE = re.compile(r"(?<![A-Za-z0-9_])40[13](?![A-Za-z0-9_])")
+
+
 def _is_auth_text(text: str) -> bool:
     lowered = text.lower()
-    return any(marker in lowered for marker in AUTH_MARKERS)
+    if any(marker in lowered for marker in AUTH_MARKERS):
+        return True
+    return _AUTH_STATUS_RE.search(lowered) is not None
 
 
 def _is_missing_method(text: str) -> bool:

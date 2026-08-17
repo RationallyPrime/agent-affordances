@@ -203,6 +203,31 @@ def test_auth_classification_uses_structured_code() -> None:
     )
     assert isinstance(by_message, SparkUnavailableError)
 
+    unstructured_401 = _rpc_error("turn/start", "Error: request failed with status 401")
+    assert isinstance(unstructured_401, SparkUnavailableError)
+
+
+def test_oneshot_status_401_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Oneshot has no structured RPC code. ``401`` in stderr must stay an
+    # entitlement refusal (status=unavailable), as it is on main.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stub = bin_dir / "codex"
+    stub.write_text("#!/bin/bash\necho 'Error: request failed with status 401' >&2\nexit 1\n")
+    stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    monkeypatch.setenv("AFFORD_SPARK_TRANSPORT", "oneshot")
+    monkeypatch.setenv("AFFORD_SPARK_SOCKET", str(tmp_path / "no.sock"))
+    with pytest.raises(SparkUnavailableError, match="refused the call"):
+        run_spark("q", verb="locate", workdir=tmp_path, schema=LocateResult)
+    rec = _read_telemetry()[-1]
+    assert rec["status"] == "unavailable"
+    assert rec["transport"] == "oneshot"
+
 
 def test_auth_expiry_fails_loud_and_does_not_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

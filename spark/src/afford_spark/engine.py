@@ -376,6 +376,8 @@ def _run_via_exec(
                     "rate limit",
                     "unauthorized",
                     "429",
+                    "401",
+                    "403",
                 )
             ):
                 raise SparkUnavailableError(
