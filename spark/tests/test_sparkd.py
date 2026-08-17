@@ -10,6 +10,7 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -212,6 +213,51 @@ def test_dead_appserver_exits_daemon(tmp_path: Path, monkeypatch: pytest.MonkeyP
     finally:
         if proc.poll() is None:
             _stop(proc)
+
+
+def test_queued_request_times_out_within_own_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Two concurrent callers, each with a 4s budget, against a 3.5s turn.
+    # The predecessor must not stall the queued caller past its own budget
+    # (the client's blind deadline is budget+2 ≈ 6s).
+    proc, _ = _start_daemon(tmp_path, monkeypatch, extra_env={"AFFORD_FAKE_TURN_SLEEP": "3.5"})
+    try:
+        outcomes: list[tuple[float, BaseException | None]] = []
+        barrier = threading.Barrier(2)
+
+        def call() -> None:
+            barrier.wait()
+            started = time.monotonic()
+            try:
+                run_spark(
+                    "q",
+                    verb="locate",
+                    workdir=tmp_path,
+                    schema=LocateResult,
+                    timeout_s=4,
+                )
+                outcomes.append((time.monotonic() - started, None))
+            except BaseException as exc:
+                outcomes.append((time.monotonic() - started, exc))
+
+        threads = [threading.Thread(target=call) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=12)
+        assert all(not thread.is_alive() for thread in threads)
+        oks = [item for item in outcomes if item[1] is None]
+        timeouts = [
+            item
+            for item in outcomes
+            if isinstance(item[1], SparkProtocolError) and "timed out" in str(item[1])
+        ]
+        assert len(oks) == 1
+        assert len(timeouts) == 1
+        assert timeouts[0][0] < 5.5
+    finally:
+        _stop(proc)
 
 
 def test_timeout_does_not_poison_subsequent_requests(

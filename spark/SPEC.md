@@ -158,8 +158,11 @@ second slice keeps the wrapper contract and amortizes boot:
   silent fallback to oneshot.
 - Auth expiry fails loud (`SparkUnavailableError`); the daemon does not retry
   and does not fall through to the metered Codex pool.
-- Each request has its own timeout (default 300s). A hung turn cannot stall
-  the next caller past that budget.
+- Each request has its own timeout (default 300s). The daemon is strictly
+  serial (one app-server turn at a time). The budget starts when the request
+  is received and includes time queued behind a predecessor; a hung turn
+  cannot stall the next caller past that budget — the queued caller receives
+  a typed timeout instead of waiting on the client's blind deadline.
 
 Units live in `spark/systemd/user/`. Enable with
 `systemctl --user enable --now afford-sparkd.socket`.

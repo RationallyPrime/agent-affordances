@@ -12,6 +12,7 @@ import os
 import socket
 import sys
 import threading
+import time
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -127,15 +128,24 @@ def _dispatch(line: str, app_server: CodexAppServer, lock: threading.Lock) -> Da
             error="protocol",
             message=f"request protocol {req.v} is not pinned v{DAEMON_PROTOCOL}",
         )
+    deadline = time.monotonic() + req.timeout_s
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or not lock.acquire(timeout=remaining):
+        return DaemonResponse(
+            v=DAEMON_PROTOCOL,
+            id=ident,
+            ok=False,
+            error="timeout",
+            message=f"spark {req.verb} timed out after {req.timeout_s}s",
+        )
     try:
-        with lock:
-            raw = app_server.invoke(
-                prompt=req.prompt,
-                workdir=Path(req.workdir),
-                writable=req.writable,
-                schema=req.output_schema,
-                timeout_s=req.timeout_s,
-            )
+        raw = app_server.invoke(
+            prompt=req.prompt,
+            workdir=Path(req.workdir),
+            writable=req.writable,
+            schema=req.output_schema,
+            timeout_s=max(0.05, deadline - time.monotonic()),
+        )
     except TimeoutError as exc:
         return DaemonResponse(
             v=DAEMON_PROTOCOL, id=ident, ok=False, error="timeout", message=str(exc)
@@ -151,7 +161,10 @@ def _dispatch(line: str, app_server: CodexAppServer, lock: threading.Lock) -> Da
         return DaemonResponse(
             v=DAEMON_PROTOCOL, id=ident, ok=False, error="protocol", message=str(exc)
         )
-    return DaemonResponse(v=DAEMON_PROTOCOL, id=ident, ok=True, raw=raw, model=SPARK_MODEL)
+    else:
+        return DaemonResponse(v=DAEMON_PROTOCOL, id=ident, ok=True, raw=raw, model=SPARK_MODEL)
+    finally:
+        lock.release()
 
 
 def _listen(socket_file: Path | None, *, systemd: bool) -> socket.socket:
