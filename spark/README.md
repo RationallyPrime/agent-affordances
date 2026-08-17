@@ -26,5 +26,9 @@ Exit codes: `0` complete · `3` incomplete · `4` ambiguous · `5` refused ·
 fallback to the metered Codex pool) · `2` usage.
 
 Requires an authenticated `codex` CLI whose account carries the Spark
-research-preview entitlement. Telemetry (hashes, latency, result state — never
-content) appends to `~/.local/state/afford-spark/telemetry.jsonl`.
+research-preview entitlement. Telemetry (caller, operation, base SHA, allowed
+paths, hashes, model, pool, latency, changed files, result state — never
+content) appends to `~/.local/state/afford-spark/telemetry.jsonl` on every
+invocation, including failures. `AFFORD_SPARK_TELEMETRY` overrides the path;
+`AFFORD_SPARK_CALLER` stamps the caller field. Subsequent verification is
+null in this slice.

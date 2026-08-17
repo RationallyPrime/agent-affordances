@@ -22,6 +22,7 @@ from afford_spark.engine import (
     SparkProtocolError,
     SparkUnavailableError,
     _strictify,
+    _telemetry_path,
     run_spark,
 )
 from afford_spark.models import LocateResult
@@ -189,3 +190,184 @@ def test_triage_requires_stdin(fake_codex) -> None:
     result = runner.invoke(app, ["spark", "triage", "--kind", "pytest"], input="")
     assert result.exit_code == 1
     assert "nothing on stdin" in result.output
+
+
+def _workdir_prelude() -> str:
+    return (
+        'workdir=""\nprev=""\nfor arg in "$@"; do\n'
+        '  if [ "$prev" = "-C" ]; then workdir="$arg"; fi\n  prev="$arg"\ndone\n'
+    )
+
+
+def _complete_payload() -> dict:
+    return {
+        "status": "complete",
+        "base_sha": None,
+        "touched_paths": ["a.py"],
+        "patch": None,
+        "claims": ["only a.py changed"],
+        "reason": None,
+        "decision_required": None,
+    }
+
+
+def _read_telemetry() -> list[dict]:
+    path = _telemetry_path()
+    if not path.is_file():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def test_transform_refuses_a_path_escaping_the_root(fake_codex, tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_repo(repo)
+    outside = tmp_path / "outside.py"
+    outside.write_text("secret = 1\n")
+    invoked = tmp_path / "invoked"
+    fake_codex(f'printf invoked > "{invoked}"\n' + _emit_last_message(_complete_payload()))
+    result = runner.invoke(app, ["spark", "transform", "rule", str(outside), "--root", str(repo)])
+    assert result.exit_code == 1
+    assert "escapes the working root" in result.output
+    assert not invoked.exists()
+
+
+def test_transform_refuses_untracked_file_outside_the_allowlist(fake_codex, tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_repo(repo)
+    fake_codex(
+        _workdir_prelude()
+        + 'echo "z = 3" >> "$workdir/a.py"\n'
+        + 'echo "evil" > "$workdir/evil.py"\n'
+        + _emit_last_message(_complete_payload())
+    )
+    result = runner.invoke(app, ["spark", "transform", "append z", "a.py", "--root", str(repo)])
+    payload = json.loads(result.output)
+    assert payload["status"] == "refused"
+    assert "evil.py" in payload["reason"]
+    assert result.exit_code == 5
+    assert (repo / "a.py").read_text() == "x = 1\n"
+
+
+def test_transform_staged_edit_is_captured_not_downgraded(fake_codex, tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sha = _git_repo(repo)
+    fake_codex(
+        _workdir_prelude()
+        + 'echo "z = 3" >> "$workdir/a.py"\n'
+        + 'git -C "$workdir" add a.py\n'
+        + _emit_last_message(_complete_payload())
+    )
+    result = runner.invoke(app, ["spark", "transform", "append z", "a.py", "--root", str(repo)])
+    payload = json.loads(result.output)
+    assert payload["status"] == "complete"
+    assert payload["base_sha"] == sha
+    assert "a.py" in payload["touched_paths"]
+    assert payload["patch"] and "z = 3" in payload["patch"]
+    assert result.exit_code == 0
+
+
+def test_transform_committed_edit_is_captured_not_downgraded(fake_codex, tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sha = _git_repo(repo)
+    fake_codex(
+        _workdir_prelude()
+        + 'echo "z = 3" >> "$workdir/a.py"\n'
+        + 'git -C "$workdir" add a.py\n'
+        + 'git -C "$workdir" -c user.email=t@t -c user.name=t commit -qm x\n'
+        + _emit_last_message(_complete_payload())
+    )
+    result = runner.invoke(app, ["spark", "transform", "append z", "a.py", "--root", str(repo)])
+    payload = json.loads(result.output)
+    assert payload["status"] == "complete"
+    assert payload["base_sha"] == sha
+    assert "a.py" in payload["touched_paths"]
+    assert payload["patch"] and "z = 3" in payload["patch"]
+    assert result.exit_code == 0
+
+
+def test_transform_rebuilds_non_complete_result(fake_codex, tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sha = _git_repo(repo)
+    fake_codex(
+        _workdir_prelude()
+        + 'echo "z = 3" >> "$workdir/a.py"\n'
+        + _emit_last_message(
+            {
+                "status": "ambiguous",
+                "base_sha": "not-the-real-one",
+                "touched_paths": [],
+                "patch": "FABRICATED PATCH TEXT",
+                "claims": [],
+                "reason": None,
+                "decision_required": "pick one",
+            }
+        )
+    )
+    result = runner.invoke(app, ["spark", "transform", "append z", "a.py", "--root", str(repo)])
+    payload = json.loads(result.output)
+    assert payload["status"] == "ambiguous"
+    assert payload["base_sha"] == sha
+    assert "a.py" in payload["touched_paths"]
+    assert payload["patch"] != "FABRICATED PATCH TEXT"
+    assert payload["patch"] and "z = 3" in payload["patch"]
+    assert payload["decision_required"] == "pick one"
+    assert result.exit_code == 4
+
+
+def test_telemetry_lands_under_throwaway_home(fake_codex, tmp_path: Path) -> None:
+    fake_codex(
+        _emit_last_message(
+            {
+                "status": "complete",
+                "matches": [],
+                "searched_paths": 1,
+                "uncertainty": [],
+                "reason": None,
+            }
+        )
+    )
+    run_spark("q", verb="locate", workdir=tmp_path, schema=LocateResult)
+    records = _read_telemetry()
+    assert records
+    rec = records[-1]
+    assert rec["operation"] == "locate"
+    assert rec["pool"] == "spark"
+    assert rec["status"] == "complete"
+    assert rec["verification"] is None
+    assert rec["input_hash"]
+    assert rec["output_hash"]
+    assert str(tmp_path / "home") in str(_telemetry_path())
+
+
+def test_telemetry_records_pool_refusal(fake_codex, tmp_path: Path) -> None:
+    fake_codex('cat > /dev/null; echo "429 usage limit reached" >&2; exit 1\n')
+    with pytest.raises(SparkUnavailableError, match="refused the call"):
+        run_spark("q", verb="locate", workdir=tmp_path, schema=LocateResult)
+    rec = _read_telemetry()[-1]
+    assert rec["status"] == "unavailable"
+    assert rec["output_hash"] is None
+
+
+def test_transform_telemetry_uses_wrapper_audit(fake_codex, tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sha = _git_repo(repo)
+    fake_codex(
+        _workdir_prelude()
+        + 'echo "z = 3" >> "$workdir/a.py"\n'
+        + _emit_last_message(_complete_payload())
+    )
+    result = runner.invoke(app, ["spark", "transform", "append z", "a.py", "--root", str(repo)])
+    assert result.exit_code == 0
+    rec = _read_telemetry()[-1]
+    assert rec["operation"] == "transform"
+    assert rec["base_sha"] == sha
+    assert rec["allowed_paths"] == ["a.py"]
+    assert rec["changed_files"] == ["a.py"]
+    assert rec["status"] == "complete"
+    assert rec["workdir"] == str(repo)

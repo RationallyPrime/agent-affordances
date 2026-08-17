@@ -9,15 +9,23 @@ from __future__ import annotations
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Annotated
 
 import typer
 
-from afford_spark.engine import SparkUnavailableError, run_spark
+from afford_spark.engine import (
+    SparkProtocolError,
+    SparkUnavailableError,
+    emit_invocation,
+    invocation_record,
+    run_spark,
+)
 from afford_spark.models import (
     EXIT_CODES,
     LocateResult,
+    ResultStatus,
     TransformResult,
     TriageResult,
 )
@@ -40,13 +48,19 @@ def _die(message: str) -> None:
     raise typer.Exit(1)
 
 
+def _under_root(path: Path, root: Path) -> Path:
+    """Resolve ``path`` against ``root`` and refuse anything that escapes it."""
+    absolute = (root / path).resolve() if not path.is_absolute() else path.resolve()
+    if not absolute.is_relative_to(root):
+        _die(f"path escapes the working root: {path}")
+    return absolute
+
+
 def _resolve_paths(paths: list[Path], root: Path) -> list[str]:
     """Expand the caller's path set to concrete files, refusing escapes."""
     files: list[str] = []
     for p in paths:
-        absolute = (root / p).resolve() if not p.is_absolute() else p.resolve()
-        if not absolute.is_relative_to(root):
-            _die(f"path escapes the working root: {p}")
+        absolute = _under_root(p, root)
         if absolute.is_dir():
             files.extend(
                 str(f.relative_to(root))
@@ -60,6 +74,84 @@ def _resolve_paths(paths: list[Path], root: Path) -> list[str]:
     if not files:
         _die("the resolved path set is empty")
     return files
+
+
+def _worktree_changes(wt: Path, base_sha: str) -> tuple[str, list[str]]:
+    """Working-tree changes vs ``base_sha``, including staged, committed, untracked."""
+    diff = subprocess.run(
+        ["git", "-C", str(wt), "diff", "--patch", base_sha],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout
+    touched = [
+        line.split("\t", 2)[2]
+        for line in subprocess.run(
+            ["git", "-C", str(wt), "diff", "--numstat", base_sha],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout.splitlines()
+        if "\t" in line
+    ]
+    porcelain = subprocess.run(
+        ["git", "-C", str(wt), "status", "--porcelain", "-uall"],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout
+    for line in porcelain.splitlines():
+        if line.startswith("?? "):
+            path = line[3:]
+            if path not in touched:
+                touched.append(path)
+    return diff, touched
+
+
+def _owned_transform(
+    model: TransformResult,
+    *,
+    base_sha: str,
+    allow: list[str],
+    diff: str,
+    touched: list[str],
+) -> TransformResult:
+    """Rebuild every branch so the wrapper, not the model, owns structural fields."""
+    out_of_scope = sorted(set(touched) - set(allow))
+    patch = diff if diff.strip() else None
+    if out_of_scope:
+        return TransformResult(
+            status="refused",
+            base_sha=base_sha,
+            touched_paths=tuple(touched),
+            patch=patch,
+            reason=f"edited outside the allowlist: {', '.join(out_of_scope)}",
+        )
+    if model.status == "complete" and patch is None:
+        return TransformResult(
+            status="incomplete",
+            base_sha=base_sha,
+            touched_paths=tuple(touched),
+            reason="model claimed completion but the worktree diff is empty",
+        )
+    if model.status == "complete":
+        return TransformResult(
+            status="complete",
+            base_sha=base_sha,
+            touched_paths=tuple(touched),
+            patch=diff,
+            claims=model.claims,
+        )
+    status: ResultStatus = model.status
+    return TransformResult(
+        status=status,
+        base_sha=base_sha,
+        touched_paths=tuple(touched),
+        patch=patch,
+        claims=model.claims,
+        reason=model.reason,
+        decision_required=model.decision_required,
+    )
 
 
 @spark.command()
@@ -79,6 +171,8 @@ def locate(
             verb="locate",
             workdir=root,
             schema=LocateResult,
+            allowed_paths=files,
+            repo=root,
         )
     except SparkUnavailableError as exc:
         _die(str(exc))
@@ -100,6 +194,10 @@ def transform(
     root = (root or Path.cwd()).resolve()
     if not (root / ".git").exists():
         _die(f"--root must be a git repository: {root}")
+    # Refuse escapes against the live root before any worktree or model call.
+    allow = [str(_under_root(p, root).relative_to(root)) for p in paths]
+    if not allow:
+        _die("the resolved path set is empty")
     base_sha = subprocess.run(
         ["git", "-C", str(root), "rev-parse", base],
         capture_output=True,
@@ -109,81 +207,75 @@ def transform(
     if not base_sha:
         _die(f"cannot resolve base rev {base!r} in {root}")
 
-    # Normalize so "./a.py" and "a.py" compare equal against git's numstat paths.
-    allow = [str(Path(p)) for p in paths]
+    prompt = transform_prompt(rule, allow, base_sha)
+    started = time.monotonic()
+    record = invocation_record(
+        verb="transform",
+        prompt=prompt,
+        workdir=root,
+        writable=True,
+        base_sha=base_sha,
+        allowed_paths=allow,
+        repo=root,
+    )
+    status: str | None = None
+    raw: str | None = None
+    changed: list[str] | None = None
+    result: TransformResult | None = None
     with tempfile.TemporaryDirectory(prefix="afford-spark-wt-") as tmp:
         wt = Path(tmp) / "wt"
-        add = subprocess.run(
-            ["git", "-C", str(root), "worktree", "add", "--detach", str(wt), base_sha],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if add.returncode != 0:
-            _die(f"worktree creation failed: {add.stderr.strip()}")
         try:
+            add = subprocess.run(
+                ["git", "-C", str(root), "worktree", "add", "--detach", str(wt), base_sha],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if add.returncode != 0:
+                status = "error"
+                _die(f"worktree creation failed: {add.stderr.strip()}")
             missing = [p for p in allow if not (wt / p).is_file()]
             if missing:
+                status = "error"
                 _die(f"allowlisted paths absent at {base_sha[:8]}: {', '.join(missing)}")
             try:
-                result = run_spark(
-                    transform_prompt(rule, allow, base_sha),
+                model = run_spark(
+                    prompt,
                     verb="transform",
                     workdir=wt,
                     schema=TransformResult,
                     writable=True,
+                    base_sha=base_sha,
+                    allowed_paths=allow,
+                    repo=root,
+                    emit_telemetry=False,
                 )
             except SparkUnavailableError as exc:
+                status = "unavailable"
                 _die(str(exc))
+            except SparkProtocolError as exc:
+                status = "protocol_error"
+                _die(f"transform failed: {exc}")
             except Exception as exc:
+                status = "error"
                 _die(f"transform failed: {exc}")
 
-            diff = subprocess.run(
-                ["git", "-C", str(wt), "diff", "--patch"],
-                capture_output=True,
-                text=True,
-                check=False,
-            ).stdout
-            touched = [
-                line.split("\t", 2)[2]
-                for line in subprocess.run(
-                    ["git", "-C", str(wt), "diff", "--numstat"],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                ).stdout.splitlines()
-                if "\t" in line
-            ]
-            out_of_scope = sorted(set(touched) - set(allow))
-            if out_of_scope:
-                # Structural allowlist enforcement: an edit outside the set is
-                # a refusal regardless of what the model claimed.
-                result = TransformResult(
-                    status="refused",
-                    base_sha=base_sha,
-                    touched_paths=tuple(touched),
-                    reason=f"edited outside the allowlist: {', '.join(out_of_scope)}",
-                )
-            elif result.status == "complete" and not diff.strip():
-                result = TransformResult(
-                    status="incomplete",
-                    base_sha=base_sha,
-                    reason="model claimed completion but the worktree diff is empty",
-                )
-            elif result.status == "complete":
-                result = TransformResult(
-                    status="complete",
-                    base_sha=base_sha,
-                    touched_paths=tuple(touched),
-                    patch=diff,
-                    claims=result.claims,
-                )
+            diff, touched = _worktree_changes(wt, base_sha)
+            result = _owned_transform(
+                model, base_sha=base_sha, allow=allow, diff=diff, touched=touched
+            )
+            status = result.status
+            changed = list(result.touched_paths)
+            raw = result.model_dump_json()
         finally:
+            emit_invocation(record, started=started, status=status, raw=raw, changed_files=changed)
             subprocess.run(
                 ["git", "-C", str(root), "worktree", "remove", "--force", str(wt)],
                 capture_output=True,
                 check=False,
             )
+    if result is None:
+        _die("transform produced no result")
     _emit(result)
 
 
