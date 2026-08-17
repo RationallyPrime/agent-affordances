@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from afford_spark.appserver import _rpc_error
+from afford_spark.appserver import _notification_belongs, _rpc_error
 from afford_spark.engine import (
     SparkProtocolError,
     SparkUnavailableError,
@@ -292,6 +292,65 @@ def test_queued_request_times_out_within_own_budget(
         assert len(oks) == 1
         assert len(timeouts) == 1
         assert timeouts[0][0] < 5.5
+    finally:
+        _stop(proc)
+
+
+def test_notification_without_identity_is_not_this_turn() -> None:
+    anonymous = {
+        "method": "turn/completed",
+        "params": {"turn": {"status": "completed"}},
+    }
+    assert (
+        _notification_belongs(anonymous, turn_id="turn-9", thread_id="thread-9") is False
+    )
+    identified = {
+        "method": "turn/completed",
+        "params": {"threadId": "thread-9", "turn": {"id": "turn-9", "status": "completed"}},
+    }
+    assert (
+        _notification_belongs(identified, turn_id="turn-9", thread_id="thread-9") is True
+    )
+
+
+def test_unidentified_completion_does_not_leak_predecessor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Interrupt is missing and the abandoned completion carries no ids —
+    # the identity filter is the only remaining boundary. It must not
+    # return the predecessor's payload as a successful answer.
+    proc, _ = _start_daemon(
+        tmp_path,
+        monkeypatch,
+        extra_env={
+            "AFFORD_FAKE_TURN_SLEEP": "3",
+            "AFFORD_FAKE_INTERRUPT": "missing",
+            "AFFORD_FAKE_STRIP_IDS_ON_INTERRUPT": "1",
+            "AFFORD_FAKE_ECHO_PROMPTS": "1",
+        },
+    )
+    try:
+        with pytest.raises(SparkProtocolError, match="timed out"):
+            run_spark(
+                "SECRET-FIRST",
+                verb="locate",
+                workdir=tmp_path,
+                schema=LocateResult,
+                timeout_s=1,
+            )
+        try:
+            result = run_spark(
+                "SECRET-SECOND",
+                verb="locate",
+                workdir=tmp_path,
+                schema=LocateResult,
+                timeout_s=10,
+            )
+        except SparkProtocolError as exc:
+            assert "SECRET-FIRST" not in str(exc)
+            assert "no turn or thread id" in str(exc)
+        else:
+            assert "SECRET-FIRST" not in (result.reason or "")
     finally:
         _stop(proc)
 

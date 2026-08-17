@@ -8,6 +8,10 @@ Env knobs (all optional):
 * ``AFFORD_FAKE_TURN_SLEEP`` — seconds to wait before ``turn/completed``
 * ``AFFORD_FAKE_HISTORY`` — path of a JSONL file; each turn appends
   ``{thread, prompts}`` so tests can assert isolation
+* ``AFFORD_FAKE_INTERRUPT`` — ``ok`` (default) or ``missing`` (``-32601``)
+* ``AFFORD_FAKE_STRIP_IDS_ON_INTERRUPT`` — if set, a turn whose interrupt
+  was attempted emits ``turn/completed`` with no turn/thread ids
+* ``AFFORD_FAKE_ECHO_PROMPTS`` — if set, ``reason`` is the thread's prompt list
 """
 
 from __future__ import annotations
@@ -35,8 +39,12 @@ def main() -> None:
     remaining_ok = int(auth_after) if auth_after is not None else None
     sleep_s = float(os.environ.get("AFFORD_FAKE_TURN_SLEEP", "0"))
     history_path = os.environ.get("AFFORD_FAKE_HISTORY")
+    interrupt_mode = os.environ.get("AFFORD_FAKE_INTERRUPT", "ok")
+    strip_ids_on_interrupt = bool(os.environ.get("AFFORD_FAKE_STRIP_IDS_ON_INTERRUPT"))
+    echo_prompts = bool(os.environ.get("AFFORD_FAKE_ECHO_PROMPTS"))
     threads: dict[str, list[str]] = {}
     pending_turns: dict[str, threading.Event] = {}
+    stripped_ids: set[str] = set()
     next_thread = 1
     next_turn = 1
 
@@ -112,31 +120,29 @@ def main() -> None:
                 snapshot = [] if seen is None else list(seen)
                 interrupted = ev.wait(sleep_s) if sleep_s > 0 else ev.is_set()
                 status = "interrupted" if interrupted else "completed"
+                reason = json.dumps(snapshot) if echo_prompts else None
                 body = json.dumps(
                     {
                         "status": "complete",
                         "matches": [],
                         "searched_paths": 1,
                         "uncertainty": [],
-                        "reason": None,
+                        "reason": reason,
                     }
                 )
                 if history_path and not interrupted:
                     with open(history_path, "a") as fh:
                         fh.write(json.dumps({"thread": th, "prompts": snapshot}) + "\n")
-                _send(
-                    {
-                        "method": "turn/completed",
-                        "params": {
-                            "threadId": th,
-                            "turn": {
-                                "id": tid,
-                                "status": status,
-                                "items": [{"type": "agentMessage", "text": body}],
-                            },
-                        },
+                params: dict[str, Any] = {
+                    "turn": {
+                        "status": status,
+                        "items": [{"type": "agentMessage", "text": body}],
                     }
-                )
+                }
+                if tid not in stripped_ids:
+                    params["threadId"] = th
+                    params["turn"]["id"] = tid
+                _send({"method": "turn/completed", "params": params})
 
             threading.Thread(
                 target=_finish,
@@ -148,6 +154,17 @@ def main() -> None:
         if method == "turn/interrupt":
             turn_id = str(params.get("turnId") or "")
             ev = pending_turns.get(turn_id)
+            if strip_ids_on_interrupt and turn_id:
+                stripped_ids.add(turn_id)
+            if interrupt_mode == "missing":
+                # Method is absent: do not cancel the in-flight turn.
+                _send(
+                    {
+                        "id": ident,
+                        "error": {"code": -32601, "message": "Method not found: turn/interrupt"},
+                    }
+                )
+                continue
             if ev is not None:
                 ev.set()
             _send({"id": ident, "result": {}})

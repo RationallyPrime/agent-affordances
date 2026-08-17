@@ -255,6 +255,14 @@ class CodexAppServer:
                 raise SparkProtocolError(f"timed out waiting for {method}") from exc
             if message.get("method") != method:
                 continue
+            if (turn_id or thread_id) and not (
+                _event_turn_id(message) or _event_thread_id(message)
+            ):
+                params = message.get("params")
+                keys = sorted(params) if isinstance(params, dict) else type(params).__name__
+                raise SparkProtocolError(
+                    f"{method} carried no turn or thread id (params keys: {keys})"
+                )
             if not _notification_belongs(message, turn_id=turn_id, thread_id=thread_id):
                 continue
             return message
@@ -404,8 +412,11 @@ def _event_turn_id(message: dict[str, Any]) -> str | None:
     if not isinstance(params, dict):
         return None
     turn = params.get("turn")
-    if isinstance(turn, dict) and isinstance(turn.get("id"), str):
-        return turn["id"]
+    if isinstance(turn, dict):
+        if isinstance(turn.get("id"), str):
+            return turn["id"]
+        if isinstance(turn.get("turnId"), str):
+            return turn["turnId"]
     if isinstance(params.get("turnId"), str):
         return params["turnId"]
     return None
@@ -429,11 +440,21 @@ def _notification_belongs(
     turn_id: str | None,
     thread_id: str | None,
 ) -> bool:
+    """Admit only a notification whose recognised identity matches.
+
+    Fail closed: if the caller supplied a turn or thread id and the
+    notification carries none of the recognised identity fields, it is
+    not this turn. A missing identity is not a wildcard.
+    """
     got_turn = _event_turn_id(message)
+    got_thread = _event_thread_id(message)
+    if (turn_id or thread_id) and not (got_turn or got_thread):
+        return False
     if turn_id and got_turn and got_turn != turn_id:
         return False
-    got_thread = _event_thread_id(message)
-    return not (thread_id and got_thread and got_thread != thread_id)
+    if thread_id and got_thread and got_thread != thread_id:
+        return False
+    return True
 
 
 def _agent_text(turn: dict[str, Any]) -> str | None:
