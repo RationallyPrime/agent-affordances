@@ -115,7 +115,7 @@ def test_strictify_requires_every_property() -> None:
 def test_locate_refuses_a_path_escaping_the_root(tmp_path: Path) -> None:
     (tmp_path / "a.py").write_text("x = 1\n")
     result = runner.invoke(app, ["spark", "locate", "q", "../outside.py", "--root", str(tmp_path)])
-    assert result.exit_code == 1
+    assert result.exit_code == 2
     assert "escapes the working root" in result.output
 
 
@@ -188,7 +188,7 @@ def test_transform_empty_diff_downgrades_a_completion_claim(fake_codex, tmp_path
 
 def test_triage_requires_stdin(fake_codex) -> None:
     result = runner.invoke(app, ["spark", "triage", "--kind", "pytest"], input="")
-    assert result.exit_code == 1
+    assert result.exit_code == 2
     assert "nothing on stdin" in result.output
 
 
@@ -227,7 +227,7 @@ def test_transform_refuses_a_path_escaping_the_root(fake_codex, tmp_path: Path) 
     invoked = tmp_path / "invoked"
     fake_codex(f'printf invoked > "{invoked}"\n' + _emit_last_message(_complete_payload()))
     result = runner.invoke(app, ["spark", "transform", "rule", str(outside), "--root", str(repo)])
-    assert result.exit_code == 1
+    assert result.exit_code == 2
     assert "escapes the working root" in result.output
     assert not invoked.exists()
 
@@ -371,3 +371,114 @@ def test_transform_telemetry_uses_wrapper_audit(fake_codex, tmp_path: Path) -> N
     assert rec["changed_files"] == ["a.py"]
     assert rec["status"] == "complete"
     assert rec["workdir"] == str(repo)
+
+
+def test_transform_refuses_gitignored_creation_outside_the_allowlist(
+    fake_codex, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_repo(repo)
+    (repo / ".gitignore").write_text(".env\nbuild/\n")
+    subprocess.run(["git", "add", ".gitignore"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "ignore"], cwd=repo, check=True)
+    fake_codex(
+        _workdir_prelude()
+        + 'echo "z = 3" >> "$workdir/a.py"\n'
+        + 'echo secret > "$workdir/.env"\n'
+        + 'mkdir -p "$workdir/build"\n'
+        + 'echo z > "$workdir/build/x.py"\n'
+        + _emit_last_message(_complete_payload())
+    )
+    result = runner.invoke(app, ["spark", "transform", "append z", "a.py", "--root", str(repo)])
+    payload = json.loads(result.output)
+    assert payload["status"] == "refused"
+    assert ".env" in payload["reason"]
+    assert "build/x.py" in payload["reason"]
+    assert result.exit_code == 5
+    assert (repo / "a.py").read_text() == "x = 1\n"
+
+
+def test_transform_refuses_excludesfile_creation_outside_the_allowlist(
+    fake_codex, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_repo(repo)
+    excludes = tmp_path / "excludes"
+    excludes.write_text("notes.txt\n")
+    subprocess.run(["git", "config", "core.excludesFile", str(excludes)], cwd=repo, check=True)
+    fake_codex(
+        _workdir_prelude()
+        + 'echo "z = 3" >> "$workdir/a.py"\n'
+        + 'echo secret > "$workdir/notes.txt"\n'
+        + _emit_last_message(_complete_payload())
+    )
+    result = runner.invoke(app, ["spark", "transform", "append z", "a.py", "--root", str(repo)])
+    payload = json.loads(result.output)
+    assert payload["status"] == "refused"
+    assert "notes.txt" in payload["reason"]
+    assert result.exit_code == 5
+
+
+def test_transform_accepts_non_ascii_allowlisted_path(fake_codex, tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    named = repo / "é.py"
+    named.write_text("x = 1\n")
+    subprocess.run(["git", "add", "-f", "é.py"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=repo, check=True)
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    fake_codex(
+        _workdir_prelude()
+        + 'echo "z = 3" >> "$workdir/é.py"\n'
+        + _emit_last_message(
+            {
+                "status": "complete",
+                "base_sha": None,
+                "touched_paths": ["é.py"],
+                "patch": None,
+                "claims": ["only é.py changed"],
+                "reason": None,
+                "decision_required": None,
+            }
+        )
+    )
+    result = runner.invoke(app, ["spark", "transform", "append z", "é.py", "--root", str(repo)])
+    payload = json.loads(result.output)
+    assert payload["status"] == "complete"
+    assert payload["base_sha"] == sha
+    assert "é.py" in payload["touched_paths"]
+    assert result.exit_code == 0
+
+
+def test_transform_telemetry_failure_still_removes_worktree(
+    fake_codex, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_repo(repo)
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x")
+    monkeypatch.setenv("AFFORD_SPARK_TELEMETRY", str(blocker / "telemetry.jsonl"))
+    fake_codex(
+        _workdir_prelude()
+        + 'echo "z = 3" >> "$workdir/a.py"\n'
+        + _emit_last_message(_complete_payload())
+    )
+    result = runner.invoke(app, ["spark", "transform", "append z", "a.py", "--root", str(repo)])
+    assert result.exit_code == 1
+    assert "telemetry write failed" in result.output
+    listed = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "afford-spark-wt" not in listed
+    assert (repo / "a.py").read_text() == "x = 1\n"

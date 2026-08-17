@@ -48,11 +48,16 @@ def _die(message: str) -> None:
     raise typer.Exit(1)
 
 
+def _usage(message: str) -> None:
+    typer.echo(f"afford spark: {message}", err=True)
+    raise typer.Exit(2)
+
+
 def _under_root(path: Path, root: Path) -> Path:
     """Resolve ``path`` against ``root`` and refuse anything that escapes it."""
     absolute = (root / path).resolve() if not path.is_absolute() else path.resolve()
     if not absolute.is_relative_to(root):
-        _die(f"path escapes the working root: {path}")
+        _usage(f"path escapes the working root: {path}")
     return absolute
 
 
@@ -70,41 +75,35 @@ def _resolve_paths(paths: list[Path], root: Path) -> list[str]:
         elif absolute.is_file():
             files.append(str(absolute.relative_to(root)))
         else:
-            _die(f"no such path: {p}")
+            _usage(f"no such path: {p}")
     if not files:
-        _die("the resolved path set is empty")
+        _usage("the resolved path set is empty")
     return files
 
 
-def _worktree_changes(wt: Path, base_sha: str) -> tuple[str, list[str]]:
-    """Working-tree changes vs ``base_sha``, including staged, committed, untracked."""
-    diff = subprocess.run(
-        ["git", "-C", str(wt), "diff", "--patch", base_sha],
+def _git(wt: Path, *args: str) -> str:
+    """Git in ``wt`` with pathnames left unquoted so they match pathlib."""
+    return subprocess.run(
+        ["git", "-C", str(wt), "-c", "core.quotePath=false", *args],
         capture_output=True,
         text=True,
         check=False,
     ).stdout
+
+
+def _worktree_changes(wt: Path, base_sha: str) -> tuple[str, list[str]]:
+    """Working-tree changes vs ``base_sha``, including staged, committed, untracked, ignored."""
+    diff = _git(wt, "diff", "--patch", base_sha)
     touched = [
         line.split("\t", 2)[2]
-        for line in subprocess.run(
-            ["git", "-C", str(wt), "diff", "--numstat", base_sha],
-            capture_output=True,
-            text=True,
-            check=False,
-        ).stdout.splitlines()
+        for line in _git(wt, "diff", "--numstat", base_sha).splitlines()
         if "\t" in line
     ]
-    porcelain = subprocess.run(
-        ["git", "-C", str(wt), "status", "--porcelain", "-uall"],
-        capture_output=True,
-        text=True,
-        check=False,
-    ).stdout
-    for line in porcelain.splitlines():
-        if line.startswith("?? "):
-            path = line[3:]
-            if path not in touched:
-                touched.append(path)
+    extra = _git(wt, "ls-files", "--others", "--exclude-standard")
+    ignored = _git(wt, "ls-files", "--others", "--ignored", "--exclude-standard")
+    for path in (*extra.splitlines(), *ignored.splitlines()):
+        if path and path not in touched:
+            touched.append(path)
     return diff, touched
 
 
@@ -193,11 +192,11 @@ def transform(
     """One bounded edit in an ephemeral worktree; returns a patch, never writes here."""
     root = (root or Path.cwd()).resolve()
     if not (root / ".git").exists():
-        _die(f"--root must be a git repository: {root}")
+        _usage(f"--root must be a git repository: {root}")
     # Refuse escapes against the live root before any worktree or model call.
     allow = [str(_under_root(p, root).relative_to(root)) for p in paths]
     if not allow:
-        _die("the resolved path set is empty")
+        _usage("the resolved path set is empty")
     base_sha = subprocess.run(
         ["git", "-C", str(root), "rev-parse", base],
         capture_output=True,
@@ -205,7 +204,7 @@ def transform(
         check=False,
     ).stdout.strip()
     if not base_sha:
-        _die(f"cannot resolve base rev {base!r} in {root}")
+        _usage(f"cannot resolve base rev {base!r} in {root}")
 
     prompt = transform_prompt(rule, allow, base_sha)
     started = time.monotonic()
@@ -237,7 +236,7 @@ def transform(
             missing = [p for p in allow if not (wt / p).is_file()]
             if missing:
                 status = "error"
-                _die(f"allowlisted paths absent at {base_sha[:8]}: {', '.join(missing)}")
+                _usage(f"allowlisted paths absent at {base_sha[:8]}: {', '.join(missing)}")
             try:
                 model = run_spark(
                     prompt,
@@ -268,12 +267,19 @@ def transform(
             changed = list(result.touched_paths)
             raw = result.model_dump_json()
         finally:
-            emit_invocation(record, started=started, status=status, raw=raw, changed_files=changed)
-            subprocess.run(
-                ["git", "-C", str(root), "worktree", "remove", "--force", str(wt)],
-                capture_output=True,
-                check=False,
-            )
+            try:
+                subprocess.run(
+                    ["git", "-C", str(root), "worktree", "remove", "--force", str(wt)],
+                    capture_output=True,
+                    check=False,
+                )
+            finally:
+                try:
+                    emit_invocation(
+                        record, started=started, status=status, raw=raw, changed_files=changed
+                    )
+                except OSError as exc:
+                    _die(f"telemetry write failed: {exc}")
     if result is None:
         _die("transform produced no result")
     _emit(result)
@@ -286,7 +292,7 @@ def triage(
     """Unix filter: noisy stdin in, relation map out. Prepares packets, never verdicts."""
     content = sys.stdin.read()
     if not content.strip():
-        _die("nothing on stdin to triage")
+        _usage("nothing on stdin to triage")
     if len(content.encode()) > MAX_INLINE_BYTES:
         content = content[: MAX_INLINE_BYTES // 2] + "\n\n[TRUNCATED BY WRAPPER]\n"
     with tempfile.TemporaryDirectory(prefix="afford-spark-triage-") as tmp:
