@@ -107,8 +107,13 @@ def invocation_record(
     base_sha: str | None = None,
     allowed_paths: list[str] | None = None,
     repo: Path | None = None,
+    transport: str | None = None,
 ) -> dict[str, object]:
-    """SPEC v1 telemetry fields. ``verification`` is always null this slice."""
+    """SPEC v1 telemetry fields. ``verification`` is always null this slice.
+
+    ``transport`` is resolved by the caller at the typed boundary. This
+    builder must not read env that can raise.
+    """
     return {
         "at": datetime.now(UTC).isoformat(),
         "caller": caller or os.environ.get("AFFORD_SPARK_CALLER"),
@@ -121,7 +126,7 @@ def invocation_record(
         "workdir": str(repo or workdir),
         "writable": writable,
         "verification": None,
-        "transport": resolve_transport(),
+        "transport": transport,
     }
 
 
@@ -179,25 +184,27 @@ def run_spark[M: BaseModel](
     can know.
     """
     started = time.monotonic()
-    record = invocation_record(
-        verb=verb,
-        prompt=prompt,
-        workdir=workdir,
-        writable=writable,
-        caller=caller,
-        base_sha=base_sha,
-        allowed_paths=allowed_paths,
-        repo=repo,
-    )
-    target = telemetry_record if telemetry_record is not None else record
+    record: dict[str, object] | None = None
     sandbox = "workspace-write" if writable else "read-only"
     status: str | None = None
     raw: str | None = None
     try:
-        schema_obj = _strictify(schema.model_json_schema())
-        transport = _choose_transport()
+        transport = choose_transport()
+        record = invocation_record(
+            verb=verb,
+            prompt=prompt,
+            workdir=workdir,
+            writable=writable,
+            caller=caller,
+            base_sha=base_sha,
+            allowed_paths=allowed_paths,
+            repo=repo,
+            transport=transport,
+        )
+        target = telemetry_record if telemetry_record is not None else record
         target["transport"] = transport
         record["transport"] = transport
+        schema_obj = _strictify(schema.model_json_schema())
         if transport == "daemon":
             raw = _run_via_daemon(
                 prompt,
@@ -232,11 +239,23 @@ def run_spark[M: BaseModel](
         status = status or "unavailable"
         raise
     except SparkProtocolError as exc:
+        if record is None:
+            record = invocation_record(
+                verb=verb,
+                prompt=prompt,
+                workdir=workdir,
+                writable=writable,
+                caller=caller,
+                base_sha=base_sha,
+                allowed_paths=allowed_paths,
+                repo=repo,
+                transport=None,
+            )
         if status is None:
             status = "timeout" if "timed out" in str(exc).lower() else "protocol_error"
         raise
     finally:
-        if emit_telemetry:
+        if emit_telemetry and record is not None:
             inflight = sys.exc_info()[0]
             try:
                 emit_invocation(
@@ -252,7 +271,7 @@ def run_spark[M: BaseModel](
                     raise
 
 
-def _choose_transport() -> str:
+def choose_transport() -> str:
     try:
         return resolve_transport()
     except ValueError as exc:

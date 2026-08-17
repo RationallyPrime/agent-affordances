@@ -111,6 +111,19 @@ def _read_telemetry() -> list[dict]:
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
+def test_invalid_transport_is_typed_protocol_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    monkeypatch.setenv("AFFORD_SPARK_TRANSPORT", "Daemon!")
+    monkeypatch.setenv("AFFORD_SPARK_SOCKET", str(tmp_path / "no.sock"))
+    with pytest.raises(SparkProtocolError, match="AFFORD_SPARK_TRANSPORT"):
+        run_spark("q", verb="locate", workdir=tmp_path, schema=LocateResult)
+    rec = _read_telemetry()[-1]
+    assert rec["status"] == "protocol_error"
+
+
 def test_oneshot_when_no_socket(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AFFORD_SPARK_SOCKET", str(tmp_path / "no-such.sock"))
     monkeypatch.setenv("AFFORD_SPARK_TRANSPORT", "auto")

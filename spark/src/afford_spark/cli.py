@@ -18,6 +18,7 @@ import typer
 from afford_spark.engine import (
     SparkProtocolError,
     SparkUnavailableError,
+    choose_transport,
     emit_invocation,
     invocation_record,
     run_spark,
@@ -238,6 +239,24 @@ def transform(
 
     prompt = transform_prompt(rule, allow, base_sha)
     started = time.monotonic()
+    try:
+        transport = choose_transport()
+    except SparkProtocolError as exc:
+        record = invocation_record(
+            verb="transform",
+            prompt=prompt,
+            workdir=root,
+            writable=True,
+            base_sha=base_sha,
+            allowed_paths=allow,
+            repo=root,
+            transport=None,
+        )
+        try:
+            emit_invocation(record, started=started, status="protocol_error")
+        except OSError:
+            pass
+        _die(str(exc))
     record = invocation_record(
         verb="transform",
         prompt=prompt,
@@ -246,6 +265,7 @@ def transform(
         base_sha=base_sha,
         allowed_paths=allow,
         repo=root,
+        transport=transport,
     )
     status: str | None = None
     raw: str | None = None
