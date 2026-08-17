@@ -236,6 +236,25 @@ def test_oneshot_status_401_is_unavailable(
     assert rec["transport"] == "oneshot"
 
 
+def test_oneshot_error403_path_is_not_auth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    stub = bin_dir / "codex"
+    stub.write_text("#!/bin/bash\necho 'see src/http/error403.py' >&2\nexit 1\n")
+    stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    monkeypatch.setenv("AFFORD_SPARK_TRANSPORT", "oneshot")
+    monkeypatch.setenv("AFFORD_SPARK_SOCKET", str(tmp_path / "no.sock"))
+    with pytest.raises(SparkProtocolError, match="codex exec failed"):
+        run_spark("q", verb="locate", workdir=tmp_path, schema=LocateResult)
+    rec = _read_telemetry()[-1]
+    assert rec["status"] == "protocol_error"
+
+
 def test_auth_expiry_fails_loud_and_does_not_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

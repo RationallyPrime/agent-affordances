@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -271,6 +272,24 @@ def run_spark[M: BaseModel](
                     raise
 
 
+_EXEC_AUTH_MARKERS = (
+    "usage limit",
+    "rate limit",
+    "unauthorized",
+    "429",
+)
+# Token 401/403 — same bound as appserver._is_auth_text. A path like
+# error403.py or a JSON-RPC code of -32403 is not auth.
+_EXEC_AUTH_STATUS_RE = re.compile(r"(?<![A-Za-z0-9_])40[13](?![A-Za-z0-9_])")
+
+
+def _is_exec_auth_text(text: str) -> bool:
+    lowered = text.lower()
+    if any(marker in lowered for marker in _EXEC_AUTH_MARKERS):
+        return True
+    return _EXEC_AUTH_STATUS_RE.search(lowered) is not None
+
+
 def choose_transport() -> str:
     try:
         return resolve_transport()
@@ -368,18 +387,7 @@ def _run_via_exec(
 
         stderr_tail = proc.stderr[-2000:] if proc.stderr else ""
         if proc.returncode != 0:
-            lowered = (proc.stderr + proc.stdout).lower()
-            if any(
-                marker in lowered
-                for marker in (
-                    "usage limit",
-                    "rate limit",
-                    "unauthorized",
-                    "429",
-                    "401",
-                    "403",
-                )
-            ):
+            if _is_exec_auth_text(f"{proc.stderr}{proc.stdout}"):
                 raise SparkUnavailableError(
                     f"Spark pool or entitlement refused the call (exit {proc.returncode}): "
                     f"{stderr_tail}"
