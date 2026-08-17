@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import os
 import queue
-import re
 import subprocess
 import threading
 import time
@@ -19,21 +18,9 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+from afford_spark.auth import classify_code, classify_refusal, refusal_message
 from afford_spark.engine import SPARK_MODEL, SparkProtocolError, SparkUnavailableError
 
-AUTH_MARKERS = (
-    "unauthorized",
-    "unauthenticated",
-    "not authenticated",
-    "auth expired",
-    "token expired",
-    "login required",
-    "re-authenticate",
-    "not logged in",
-)
-# Structured JSON-RPC / HTTP auth codes. Never match these as substrings of a
-# rendered error — a code of -32403 or a path like error403.py is not auth.
-AUTH_CODES = {401, 403}
 # Methods tried in order; a method-not-found is not an auth failure.
 AUTH_METHODS = ("account/read", "account/rateLimits/read")
 # App-server protocol we speak. A server that *states* a different version is
@@ -103,8 +90,7 @@ class CodexAppServer:
 
     def check_auth(self, timeout_s: float = 10.0) -> None:
         """Fail loud on expiry. A missing auth method is not a pass — we still
-        classify structured 401/403 and unauthorized-class text (including a
-        token ``401``/``403``) on the turn itself."""
+        classify structured 401/403 and refusal text on the turn itself."""
         if self._auth_method is False:
             return
         methods: Iterator[str]
@@ -122,11 +108,9 @@ class CodexAppServer:
                 if _is_missing_method(str(exc)):
                     last_missing = True
                     continue
-                if _is_auth_text(str(exc)):
-                    raise SparkUnavailableError(
-                        "Spark auth expired or missing — re-authenticate the "
-                        "Codex CLI (`codex login`). The warm daemon will not retry."
-                    ) from exc
+                kind = classify_refusal(str(exc))
+                if kind is not None:
+                    raise SparkUnavailableError(refusal_message(kind)) from exc
                 raise
             else:
                 self._auth_method = method
@@ -143,7 +127,13 @@ class CodexAppServer:
         schema: dict[str, object],
         timeout_s: float,
     ) -> str:
-        """Fresh ephemeral thread → one turn → drop. Returns the last agent text."""
+        """Fresh ephemeral thread → one turn → drop. Returns the last agent text.
+
+        A warm call is five RPCs, all inside the serial lock: ``account/read``
+        (auth re-check so mid-life expiry fails before a turn is spent),
+        ``thread/start``, ``turn/start``, ``thread/archive``,
+        ``thread/unsubscribe``.
+        """
         self.check_auth(timeout_s=min(10.0, timeout_s))
         # Stale notifications from an abandoned predecessor must not be
         # visible to this turn — the queue is process-global.
@@ -372,11 +362,9 @@ class CodexAppServer:
 
     def _raise_if_dead(self) -> None:
         if self._dead is not None:
-            if _is_auth_text(self._dead):
-                raise SparkUnavailableError(
-                    "Spark auth expired or missing — re-authenticate the "
-                    "Codex CLI (`codex login`). The warm daemon will not retry."
-                )
+            kind = classify_refusal(self._dead)
+            if kind is not None:
+                raise SparkUnavailableError(refusal_message(kind))
             raise AppServerDead(self._dead)
 
 
@@ -476,35 +464,14 @@ def _rpc_error(method: str, error: object) -> SparkProtocolError | SparkUnavaila
         message = str(error.get("message", error))
         code = error.get("code")
         text = f"codex {method} error {code}: {message}"
-        if _is_auth_code(code) or _is_auth_text(message):
-            return SparkUnavailableError(
-                "Spark auth expired or missing — re-authenticate the "
-                "Codex CLI (`codex login`). The warm daemon will not retry."
-            )
+        kind = classify_code(code) or classify_refusal(message)
+        if kind is not None:
+            return SparkUnavailableError(refusal_message(kind))
         return SparkProtocolError(text)
-    text = f"codex {method} error: {error}"
-    if _is_auth_text(text):
-        return SparkUnavailableError(
-            "Spark auth expired or missing — re-authenticate the "
-            "Codex CLI (`codex login`). The warm daemon will not retry."
-        )
-    return SparkProtocolError(text)
-
-
-def _is_auth_code(code: object) -> bool:
-    return isinstance(code, int) and code in AUTH_CODES
-
-
-# Token 401/403 on unstructured text (oneshot stderr, non-dict RPC, child
-# death). Word-bounded so -32403 and error403.py stay non-auth.
-_AUTH_STATUS_RE = re.compile(r"(?<![A-Za-z0-9_])40[13](?![A-Za-z0-9_])")
-
-
-def _is_auth_text(text: str) -> bool:
-    lowered = text.lower()
-    if any(marker in lowered for marker in AUTH_MARKERS):
-        return True
-    return _AUTH_STATUS_RE.search(lowered) is not None
+    kind = classify_refusal(str(error))
+    if kind is not None:
+        return SparkUnavailableError(refusal_message(kind))
+    return SparkProtocolError(f"codex {method} error: {error}")
 
 
 def _is_missing_method(text: str) -> bool:

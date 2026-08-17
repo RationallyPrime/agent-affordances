@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from afford_spark.appserver import _notification_belongs, _rpc_error
+from afford_spark.auth import classify_refusal
 from afford_spark.engine import (
     SparkProtocolError,
     SparkUnavailableError,
@@ -202,16 +203,86 @@ def test_auth_classification_uses_structured_code() -> None:
     assert isinstance(path_lookalike, SparkProtocolError)
     assert not isinstance(path_lookalike, SparkUnavailableError)
 
+    path_segment = _rpc_error(
+        "turn/start",
+        {"code": -32602, "message": "cwd /repo/tests/fixtures/403/ is not a directory"},
+    )
+    assert isinstance(path_segment, SparkProtocolError)
+
+    file_line = _rpc_error(
+        "turn/start",
+        {"code": -32603, "message": "read failed at src/engine.py:403: permission denied"},
+    )
+    assert isinstance(file_line, SparkProtocolError)
+
+    count = _rpc_error(
+        "turn/start",
+        {"code": -32000, "message": "tool call failed after scanning 401 files"},
+    )
+    assert isinstance(count, SparkProtocolError)
+
     by_code = _rpc_error("account/read", {"code": 401, "message": "nope"})
     assert isinstance(by_code, SparkUnavailableError)
+    assert "re-authenticate" in str(by_code)
+
+    by_pool_code = _rpc_error("turn/start", {"code": 429, "message": "nope"})
+    assert isinstance(by_pool_code, SparkUnavailableError)
+    assert "usage or rate limit" in str(by_pool_code)
+    assert "re-authenticate" not in str(by_pool_code)
 
     by_message = _rpc_error(
         "account/read", {"code": -32000, "message": "unauthorized: token expired"}
     )
     assert isinstance(by_message, SparkUnavailableError)
+    assert "re-authenticate" in str(by_message)
+
+    wrapped_status = _rpc_error(
+        "turn/start", {"code": -32000, "message": "Error: request failed with status 401"}
+    )
+    assert isinstance(wrapped_status, SparkUnavailableError)
+    assert "re-authenticate" in str(wrapped_status)
+
+    pool = _rpc_error(
+        "turn/start", {"code": -32000, "message": "You have reached your usage limit."}
+    )
+    assert isinstance(pool, SparkUnavailableError)
+    assert "usage or rate limit" in str(pool)
+    assert "re-authenticate" not in str(pool)
+    assert "auth" not in str(pool).lower()
 
     unstructured_401 = _rpc_error("turn/start", "Error: request failed with status 401")
     assert isinstance(unstructured_401, SparkUnavailableError)
+    assert "re-authenticate" in str(unstructured_401)
+
+    unstructured_count = _rpc_error("turn/start", "scanning 401 files")
+    assert isinstance(unstructured_count, SparkProtocolError)
+
+
+def test_classify_refusal_agrees_across_transports() -> None:
+    # One predicate: oneshot and daemon cannot diverge.
+    want = {
+        "Error: request failed with status 401": "auth",
+        "HTTP 403 Forbidden": "auth",
+        "401 Unauthorized": "auth",
+        "server returned 403": "auth",
+        "response 401": "auth",
+        "auth expired, run codex login": "auth",
+        "token expired": "auth",
+        "not logged in": "auth",
+        "login required": "auth",
+        "unauthenticated": "auth",
+        "You have reached your usage limit for Codex.": "unavailable",
+        "rate limit exceeded, retry after 60s": "unavailable",
+        "stream error: server returned 429 Too Many Reqs": "unavailable",
+        "cwd /repo/tests/fixtures/403/ is not a directory": None,
+        "read failed at src/engine.py:403: permission denied": None,
+        "tool call failed after scanning 401 files": None,
+        "turn took 403 ms": None,
+        "src/http/error403.py not found": None,
+        "cwd is not a directory": None,
+    }
+    for text, expected in want.items():
+        assert classify_refusal(text) == expected, text
 
 
 def test_oneshot_status_401_is_unavailable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -227,7 +298,7 @@ def test_oneshot_status_401_is_unavailable(tmp_path: Path, monkeypatch: pytest.M
     (tmp_path / "home").mkdir()
     monkeypatch.setenv("AFFORD_SPARK_TRANSPORT", "oneshot")
     monkeypatch.setenv("AFFORD_SPARK_SOCKET", str(tmp_path / "no.sock"))
-    with pytest.raises(SparkUnavailableError, match="refused the call"):
+    with pytest.raises(SparkUnavailableError, match="re-authenticate"):
         run_spark("q", verb="locate", workdir=tmp_path, schema=LocateResult)
     rec = _read_telemetry()[-1]
     assert rec["status"] == "unavailable"
@@ -249,6 +320,37 @@ def test_oneshot_error403_path_is_not_auth(tmp_path: Path, monkeypatch: pytest.M
         run_spark("q", verb="locate", workdir=tmp_path, schema=LocateResult)
     rec = _read_telemetry()[-1]
     assert rec["status"] == "protocol_error"
+
+
+def test_daemon_usage_limit_is_unavailable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    proc, _ = _start_daemon(tmp_path, monkeypatch, extra_env={"AFFORD_FAKE_USAGE_LIMIT": "1"})
+    try:
+        with pytest.raises(SparkUnavailableError, match="usage or rate limit"):
+            run_spark("q", verb="locate", workdir=tmp_path, schema=LocateResult)
+        rec = _read_telemetry()[-1]
+        assert rec["transport"] == "daemon"
+        assert rec["status"] == "unavailable"
+    finally:
+        _stop(proc)
+
+
+def test_warm_call_is_five_rpcs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    rpc_log = tmp_path / "rpc.log"
+    proc, _ = _start_daemon(tmp_path, monkeypatch, extra_env={"AFFORD_FAKE_RPC_LOG": str(rpc_log)})
+    try:
+        before = rpc_log.read_text().splitlines() if rpc_log.is_file() else []
+        result = run_spark("q", verb="locate", workdir=tmp_path, schema=LocateResult)
+        assert result.status == "complete"
+        after = rpc_log.read_text().splitlines()
+        assert after[len(before) :] == [
+            "account/read",
+            "thread/start",
+            "turn/start",
+            "thread/archive",
+            "thread/unsubscribe",
+        ]
+    finally:
+        _stop(proc)
 
 
 def test_auth_expiry_fails_loud_and_does_not_retry(

@@ -12,6 +12,8 @@ Env knobs (all optional):
 * ``AFFORD_FAKE_STRIP_IDS_ON_INTERRUPT`` — if set, a turn whose interrupt
   was attempted emits ``turn/completed`` with no turn/thread ids
 * ``AFFORD_FAKE_ECHO_PROMPTS`` — if set, ``reason`` is the thread's prompt list
+* ``AFFORD_FAKE_RPC_LOG`` — path; each received method name is appended
+* ``AFFORD_FAKE_USAGE_LIMIT`` — if set, ``turn/start`` returns a pool refusal
 """
 
 from __future__ import annotations
@@ -42,6 +44,8 @@ def main() -> None:
     interrupt_mode = os.environ.get("AFFORD_FAKE_INTERRUPT", "ok")
     strip_ids_on_interrupt = bool(os.environ.get("AFFORD_FAKE_STRIP_IDS_ON_INTERRUPT"))
     echo_prompts = bool(os.environ.get("AFFORD_FAKE_ECHO_PROMPTS"))
+    rpc_log = os.environ.get("AFFORD_FAKE_RPC_LOG")
+    usage_limit = bool(os.environ.get("AFFORD_FAKE_USAGE_LIMIT"))
     threads: dict[str, list[str]] = {}
     pending_turns: dict[str, threading.Event] = {}
     stripped_ids: set[str] = set()
@@ -61,6 +65,9 @@ def main() -> None:
         method = message.get("method")
         ident = message.get("id")
         params = message.get("params") if isinstance(message.get("params"), dict) else {}
+        if isinstance(method, str) and rpc_log:
+            with open(rpc_log, "a") as fh:
+                fh.write(method + "\n")
 
         if method == "initialize":
             _send({"id": ident, "result": {"protocolVersion": protocol, "userAgent": "fake"}})
@@ -98,6 +105,17 @@ def main() -> None:
             _send({"method": "thread/started", "params": {"thread": {"id": thread_id}}})
             continue
         if method == "turn/start":
+            if usage_limit:
+                _send(
+                    {
+                        "id": ident,
+                        "error": {
+                            "code": -32000,
+                            "message": "You have reached your usage limit.",
+                        },
+                    }
+                )
+                continue
             thread_id = str(params.get("threadId") or "")
             prompts = threads.setdefault(thread_id, [])
             user_text = ""

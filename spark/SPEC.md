@@ -157,8 +157,17 @@ second slice keeps the wrapper contract and amortizes boot:
   a thread.
 - Protocol is pinned at v1. A different version fails loud — it is not a
   silent fallback to oneshot.
-- Auth expiry fails loud (`SparkUnavailableError`); the daemon does not retry
-  and does not fall through to the metered Codex pool.
+- Auth expiry and pool/rate-limit refusals fail loud (`SparkUnavailableError`);
+  the daemon does not retry and does not fall through to the metered Codex
+  pool. One classifier serves both transports: integer `401`/`403`, word
+  markers, pool phrases, and `401`/`403`/`429` only in a status context
+  (`status 401` is auth; `/403/` and `file.py:403:` are not).
+- A warm call is five JSON-RPC round trips against the held app-server, all
+  inside the serial lock and the per-request budget: `account/read` (re-check
+  so mid-life expiry fails loud before a turn is spent) + `thread/start` +
+  `turn/start` + `thread/archive` + `thread/unsubscribe`. Boot is separate
+  (`initialize` / `initialized` / first `account/read`). "Drop" is both
+  archive and unsubscribe — archive alone can leave the connection subscribed.
 - Each request has its own timeout (default 300s). The daemon is strictly
   serial (one app-server turn at a time). The budget starts when the request
   is received and includes time queued behind a predecessor; a hung turn
