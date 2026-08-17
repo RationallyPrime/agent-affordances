@@ -278,6 +278,7 @@ def transform(
                     allowed_paths=allow,
                     repo=root,
                     emit_telemetry=False,
+                    telemetry_record=record,
                 )
             except SparkUnavailableError as exc:
                 status = "unavailable"

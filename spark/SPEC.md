@@ -136,8 +136,33 @@ Spark never touches a seat's live checkout.
   caller (`AFFORD_SPARK_CALLER` or null), operation, base SHA, allowed paths,
   input hash, model, pool (`spark`), latency, output hash, changed files
   (wrapper-audited on `transform`; null otherwise), result state, subsequent
-  verification outcome (always null this slice — a later correlator fills it).
-  A few hundred calls tell us empirically which verbs Spark deserves.
+  verification outcome (always null this slice — a later correlator fills it),
+  `transport` (`oneshot` | `daemon`). A few hundred calls tell us empirically
+  which verbs Spark deserves.
+
+## Warm daemon (`afford-sparkd`) — second slice
+
+Boot of `codex exec` dominates a cold locate (field-measured 20–30s). The
+second slice keeps the wrapper contract and amortizes boot:
+
+- `afford-sparkd` is a socket-activated systemd **user** unit that holds one
+  warm `codex app-server` process.
+- `afford` is a thin unix-socket client when the socket is present
+  (`$AFFORD_SPARK_SOCKET`, else `$XDG_RUNTIME_DIR/afford-sparkd/sparkd.sock`).
+  `AFFORD_SPARK_TRANSPORT=oneshot|daemon|auto` (default `auto`: socket if
+  present, otherwise oneshot `codex exec`).
+- **Fresh conversation per request, dropped after delivery.** Isolation is the
+  conversation layer, not process recycling. Consecutive calls must not share
+  a thread.
+- Protocol is pinned at v1. A different version fails loud — it is not a
+  silent fallback to oneshot.
+- Auth expiry fails loud (`SparkUnavailableError`); the daemon does not retry
+  and does not fall through to the metered Codex pool.
+- Each request has its own timeout (default 300s). A hung turn cannot stall
+  the next caller past that budget.
+
+Units live in `spark/systemd/user/`. Enable with
+`systemctl --user enable --now afford-sparkd.socket`.
 
 ## Later: the quota scavenger (NOT in the first slice)
 

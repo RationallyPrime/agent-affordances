@@ -6,6 +6,7 @@ directory as an independent uv project.
 | Tool | What it does |
 | --- | --- |
 | [`linear-reads`](linear-reads/) | Token-lean read-only CLI for Linear (issue lookups, board sweeps, label queries) |
+| [`spark`](spark/) | `afford spark` semantic coreutils over Codex-Spark; optional `afford-sparkd` warm daemon |
 
 ## House standards
 
