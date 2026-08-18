@@ -76,6 +76,7 @@ EXHAUSTED_MARKER_RE = re.compile(
     r"(?:v2:([^:\s]+):max-rounds=(\d+)|([^:\s]+)) -->"
 )
 PRODUCT_GATE_MARKER_PREFIX = "<!-- weave-review-loop:product-gate:"
+NOISE_MARKER_PREFIX = "<!-- weave-review-loop:noise:"
 SUBSTITUTE_SUMMON_MARKER_PREFIX = "<!-- weave-review-loop:substitute-summon:"
 SUBSTITUTE_VERDICT_MARKER_PREFIX = "<!-- weave-review-loop:substitute-verdict:"
 # head : actor : clean | findings:<p1>:<p2>:<p3>.  The marker — not the prose
@@ -1063,6 +1064,29 @@ def product_gate_comment_body(head_sha: str) -> str:
     )
 
 
+def noise_marker(head_sha: str) -> str:
+    return f"{NOISE_MARKER_PREFIX}{MARKER_SCHEMA_VERSION}:{head_sha} -->"
+
+
+def legacy_noise_marker(head_sha: str) -> str:
+    """Burn seats persist this form per the talos-burn skill; read it forever."""
+    return f"{NOISE_MARKER_PREFIX}{head_sha} -->"
+
+
+def noise_comment_body(head_sha: str) -> str:
+    """The once-per-head record that a burn completed as all-noise.
+
+    The head is unchanged on purpose; without this marker the scheduled
+    redelivery path treats that as a stall and re-wakes Talos.
+    """
+    return (
+        "Review-loop: noise recorded for this head; the head is "
+        "unchanged on purpose. Standing-wake redelivery must not treat this "
+        "as an ignored wake.\n"
+        f"{noise_marker(head_sha)}"
+    )
+
+
 def nudge_marker(head_sha: str) -> str:
     return f"{NUDGE_MARKER_PREFIX}{MARKER_SCHEMA_VERSION}:{head_sha} -->"
 
@@ -1598,7 +1622,7 @@ def build_burn_messages(
         f"Exact-head review: `yes` — round {review_round}/{MAX_REVIEW_ROUNDS}.\n"
         "Any repair changes the head and invalidates this review closure. Push "
         "one coherent burn, then wait for a fresh exact-head Codex review.\n\n"
-        "Doctrine: in-scope findings are fixed unless tagged `product-gate`; "
+        "Doctrine: in-scope findings are fixed unless tagged `product-gate` or `noise`; "
         "out-of-scope findings become follow-up tickets, then seek fresh "
         "exact-head closure. Never interleave fixing with merging. "
         "If this seat cannot access the repo, re-WAKE the authoring seat with "
@@ -2844,9 +2868,9 @@ def redeliver_standing_wake(
     only.  It adds no review round, no repair authority, and no merge authority,
     and it never summons a reviewer.
 
-    "Acted" is a head change or a trusted product-gate marker on this head
-    dated at or after the standing verdict. An unchanged head past the window
-    with neither is a stall.
+    "Acted" is a head change or a trusted product-gate or noise marker on
+    this head dated at or after the standing verdict. An unchanged head past
+    the window with none of those is a stall.
     """
     gate_state = exhaustion_marker_state(comments, head_sha)
     if gate_state == "terminal":
@@ -2877,6 +2901,16 @@ def redeliver_standing_wake(
     if gated_at is not None and verdict_at <= gated_at:
         print(
             f"product-gate recorded for {repository}#{pr_number} "
+            f"(head={head_sha}); not a stall"
+        )
+        return False
+    noised_at = trusted_marker_time(
+        comments,
+        (noise_marker(head_sha), legacy_noise_marker(head_sha)),
+    )
+    if noised_at is not None and verdict_at <= noised_at:
+        print(
+            f"noise recorded for {repository}#{pr_number} "
             f"(head={head_sha}); not a stall"
         )
         return False
