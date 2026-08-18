@@ -8,7 +8,8 @@ already injects; it does not depend on ``gh``, ``jq``, or a package manager.
 Commands:
 
 ``route``
-    Route one native Codex result: a submitted findings review goes to Talos;
+    Route one native Codex result: a submitted findings review goes to the
+    burn seat (``REVIEW_BURN_ACTOR``, default ``talos``);
     a bot-authored clean PR comment — in either verdict format Codex emits —
     goes to the authoring seat.  A Codex comment that looks like a verdict but
     cannot be routed is reported to Hive rather than dropped.  At the
@@ -25,7 +26,7 @@ Commands:
     Theoros: the retrospective requires findings still present on the exact
     current head, and this branch is entered only because that head has none.
 ``canary``
-    Post a harmless Talos liveness wake for end-to-end verification.
+    Post a harmless burn-seat liveness wake for end-to-end verification.
 """
 
 from __future__ import annotations
@@ -99,6 +100,11 @@ SUBSTITUTE_VERDICT_MARKER_RE = re.compile(
 CODEX_QUOTA_REFUSAL_PREFIX = "You have reached your Codex usage limits"
 AI_USAGE_DEFAULT_THRESHOLD = 0.9
 DEFAULT_SUBSTITUTE_ACTOR = "theoros"
+# The find half and the burn twin are a CAST, not an anatomy: both seats are
+# repo/org Actions variables (REVIEW_SUBSTITUTE_ACTOR / REVIEW_BURN_ACTOR)
+# so a recast — e.g. 2026-08-18, Talos reviews and Theoros burns while
+# Ariadne's usage is out — is a `gh variable set`, never a code sync.
+DEFAULT_BURN_ACTOR = "talos"
 FINDING_IDENTITY_MAX = 96
 _IDENTITY_NOISE = re.compile(
     r"</?sub>|!\[[^\]]*\]\([^)]*\)|\[P[123]-[A-Za-z]+\]|\*{1,2}|_{1,2}"
@@ -384,14 +390,19 @@ def commit_author_name(commit: Mapping[str, Any]) -> str:
 
 
 def choose_author(names: Iterable[str], fallback: str = "") -> str:
-    """Choose the original non-Talos seat, then Talos, then HEAD author."""
-    first_talos = ""
+    """Choose the original non-burn-seat committer, then the burn seat, then HEAD author.
+
+    Burn commits land on the PR branch under the burn seat's identity; the
+    wake must still address the seat whose judgment the PR carries.
+    """
+    burn = burn_actor()
+    first_burn = ""
     for name in names:
-        if name in {"Fable", "Ariadne", "gnomon", "Theoros"}:
+        if name in SEAT_ACTORS and SEAT_ACTORS[name] != burn:
             return name
-        if name == "Talos" and not first_talos:
-            first_talos = name
-    return first_talos or fallback
+        if name in SEAT_ACTORS and not first_burn:
+            first_burn = name
+    return first_burn or fallback
 
 
 def author_for_pr(
@@ -1054,7 +1065,7 @@ def product_gate_comment_body(head_sha: str) -> str:
     """The once-per-head record that a burn completed as product-gate.
 
     The head is unchanged on purpose; without this marker the scheduled
-    redelivery path treats that as a stall and re-wakes Talos.
+    redelivery path treats that as a stall and re-wakes the burn seat.
     """
     return (
         "Review-loop: product-gate recorded for this head; the head is "
@@ -1077,7 +1088,7 @@ def noise_comment_body(head_sha: str) -> str:
     """The once-per-head record that a burn completed as all-noise.
 
     The head is unchanged on purpose; without this marker the scheduled
-    redelivery path treats that as a stall and re-wakes Talos.
+    redelivery path treats that as a stall and re-wakes the burn seat.
     """
     return (
         "Review-loop: noise recorded for this head; the head is "
@@ -1608,9 +1619,10 @@ def build_burn_messages(
         if history
         else "## Finding digest\n"
     )
+    actor = burn_actor()
     header = (
-        "WAKE: talos\n\n"
-        "@Talos-burn — load skill `talos-burn` and burn these findings.\n\n"
+        f"WAKE: {actor}\n\n"
+        f"Burn seat `{actor}` — load skill `talos-burn` and burn these findings.\n\n"
         f"Review-loop hook: {verdict} {word}\n\n"
         f"PR: {pr_url}\n"
         f"Branch: `{branch}`\n"
@@ -2177,7 +2189,7 @@ def route_review(event: Mapping[str, Any] | None = None) -> None:
     )
     post_threaded_messages(slack, messages)
     print(
-        f"woke talos for {repository}#{pr_number} "
+        f"woke {burn_actor()} for {repository}#{pr_number} "
         f"(findings={len(findings)}, author={author_actor}, messages={len(messages)})"
     )
 
@@ -2580,7 +2592,7 @@ def route_substitute_verdict(event: Mapping[str, Any]) -> None:
         )
         post_threaded_messages(slack, messages)
         print(
-            f"woke talos for {repository}#{pr_number} "
+            f"woke {burn_actor()} for {repository}#{pr_number} "
             f"(substitute findings by {verdict['actor']}, "
             f"counts={verdict['counts']}, messages={len(messages)})"
         )
@@ -3217,6 +3229,24 @@ def substitute_actor() -> str:
     return actor
 
 
+def burn_actor() -> str:
+    """The seat every burn wake addresses; same normalization as the reviewer.
+
+    The token doubles as the WAKE envelope's actor, so the marker grammar is
+    also the envelope grammar — an unroutable name is refused here, not
+    discovered as a dead-lettered wake.
+    """
+    raw = os.environ.get("REVIEW_BURN_ACTOR", "").strip() or DEFAULT_BURN_ACTOR
+    actor = normalize_substitute_actor(raw)
+    if actor is None:
+        raise ValueError(
+            f"REVIEW_BURN_ACTOR={raw!r} is outside the actor grammar "
+            "[a-z0-9-]+ after normalization; refusing to wake an "
+            "unroutable burn seat"
+        )
+    return actor
+
+
 def quota_refusal_is_latest_codex_signal(
     reviews: Sequence[Mapping[str, Any]],
     comments: Sequence[Mapping[str, Any]],
@@ -3366,7 +3396,8 @@ def substitute_review_wake_message(
     return (
         f"WAKE: {actor}\n\n"
         "Review-loop router: the Codex find half is unavailable for this "
-        f"summon ({reason}). You hold this review round.\n\n"
+        f"summon ({reason}). You hold this review round — load skill "
+        "`substitute-review`; it is this seat's conduct contract.\n\n"
         f"PR: {pr_url}\n"
         f"Repo: `{repository}`\n"
         f"Branch: `{branch}`\n"
@@ -3611,13 +3642,15 @@ def send_canary() -> None:
     repository = required_env("GITHUB_REPOSITORY")
     run_id = required_env("GITHUB_RUN_ID")
     slack = SlackApi(required_env("HIVE_BOT_TOKEN"), required_env("HIVE_CHANNEL"))
+    actor = burn_actor()
     slack.post_message(
-        "WAKE: talos\n\n"
-        "@Talos-burn automation canary - no PR and no code changes. This is a "
-        "controlled GitHub Actions -> Slack -> Hive -> RunPod -> Grok probe. "
-        "Reply in this thread with exactly `TALOS REVIEW-LOOP CANARY OK`, your "
-        "current `/workspace/weave-doctrine` short commit, and whether the edge "
-        "is healthy. Do not modify anything or print secrets.\n\n"
+        f"WAKE: {actor}\n\n"
+        "Review-loop burn-seat canary - no PR and no code changes. This is a "
+        "controlled GitHub Actions -> Slack -> Hive -> burn-seat probe. "
+        "Reply in this thread with exactly `REVIEW-LOOP CANARY OK`, your "
+        "current weave-doctrine short commit if this seat holds a checkout, "
+        "and whether your edge is healthy. Do not modify anything or print "
+        "secrets.\n\n"
         f"Source: `{repository}` workflow run `{run_id}`."
     )
     print(f"posted review-loop canary for {repository} run {run_id}")
