@@ -1,0 +1,13 @@
+[Unit]
+Description=afford-sparkd activation socket
+
+[Socket]
+ListenStream=%t/afford-sparkd/sparkd.sock
+SocketMode=0600
+DirectoryMode=0700
+# Accept=no: this unit passes the listening socket so one warm process
+# inherits it. Accept=yes would spawn a process per connection and
+# re-pay Codex boot on every call.
+
+[Install]
+WantedBy=sockets.target

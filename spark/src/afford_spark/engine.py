@@ -15,10 +15,20 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
 from pydantic import BaseModel, ValidationError
+
+from afford_spark.auth import RefusalKind, classify_refusal, refusal_message
+from afford_spark.client import DaemonConnectError, ProtocolPinError, request_daemon
+from afford_spark.protocol import (
+    DaemonRequest,
+    resolve_transport,
+    socket_path,
+    transport_mode,
+)
 
 SPARK_MODEL = "gpt-5.3-codex-spark"
 SPARK_POOL = "spark"
@@ -33,7 +43,15 @@ def _telemetry_path() -> Path:
 
 
 class SparkUnavailableError(RuntimeError):
-    """The pool or entitlement refused us. The caller hears it plainly."""
+    """The pool or entitlement refused us. The caller hears it plainly.
+
+    ``kind`` carries the classifier's verdict so no consumer has to re-derive
+    it by substring-matching the human message.
+    """
+
+    def __init__(self, message: str, *, kind: RefusalKind = "unavailable") -> None:
+        super().__init__(message)
+        self.kind: RefusalKind = kind
 
 
 class SparkProtocolError(RuntimeError):
@@ -98,8 +116,13 @@ def invocation_record(
     base_sha: str | None = None,
     allowed_paths: list[str] | None = None,
     repo: Path | None = None,
+    transport: str | None = None,
 ) -> dict[str, object]:
-    """SPEC v1 telemetry fields. ``verification`` is always null this slice."""
+    """SPEC v1 telemetry fields. ``verification`` is always null this slice.
+
+    ``transport`` is resolved by the caller at the typed boundary. This
+    builder must not read env that can raise.
+    """
     return {
         "at": datetime.now(UTC).isoformat(),
         "caller": caller or os.environ.get("AFFORD_SPARK_CALLER"),
@@ -112,6 +135,7 @@ def invocation_record(
         "workdir": str(repo or workdir),
         "writable": writable,
         "verification": None,
+        "transport": transport,
     }
 
 
@@ -148,6 +172,7 @@ def run_spark[M: BaseModel](
     changed_files: list[str] | None = None,
     repo: Path | None = None,
     emit_telemetry: bool = True,
+    telemetry_record: dict[str, object] | None = None,
 ) -> M:
     """One bounded Spark invocation validated against the verb's result model.
 
@@ -157,94 +182,56 @@ def run_spark[M: BaseModel](
     itself constrains the final message; we validate again on our side because
     the wrapper, not the model, owns the contract.
 
+    When ``afford-sparkd`` is reachable (or ``AFFORD_SPARK_TRANSPORT=daemon``)
+    the invocation is a thin unix-socket call against the warm app-server.
+    Otherwise this is still a oneshot ``codex exec``. ``transport`` is stamped
+    on the telemetry record with the path that actually ran.
+
     Telemetry is written in ``finally`` so pool refusals, protocol errors, and
     timeouts leave a record. ``verification`` is always null in this slice —
     subsequent gate outcome is a later correlator, not something the invocation
     can know.
     """
     started = time.monotonic()
-    record = invocation_record(
-        verb=verb,
-        prompt=prompt,
-        workdir=workdir,
-        writable=writable,
-        caller=caller,
-        base_sha=base_sha,
-        allowed_paths=allowed_paths,
-        repo=repo,
-    )
+    record: dict[str, object] | None = None
     sandbox = "workspace-write" if writable else "read-only"
     status: str | None = None
     raw: str | None = None
     try:
-        with tempfile.TemporaryDirectory(prefix="afford-spark-") as tmp:
-            schema_path = Path(tmp) / "result.schema.json"
-            out_path = Path(tmp) / "result.json"
-            schema_path.write_text(json.dumps(_strictify(schema.model_json_schema())))
-            cmd = [
-                "codex",
-                "exec",
-                "--model",
-                SPARK_MODEL,
-                "-c",
-                "model_reasoning_effort=low",
-                "--sandbox",
-                sandbox,
-                "--skip-git-repo-check",
-                "-C",
-                str(workdir),
-                "--output-schema",
-                str(schema_path),
-                "--output-last-message",
-                str(out_path),
-                "-",
-            ]
-            try:
-                proc = subprocess.run(
-                    cmd,
-                    input=prompt,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout_s,
-                    env={**os.environ, "NO_COLOR": "1"},
-                )
-            except FileNotFoundError as exc:
-                status = "unavailable"
-                raise SparkUnavailableError(
-                    "codex CLI not found on PATH — install codex and authenticate first"
-                ) from exc
-            except subprocess.TimeoutExpired as exc:
-                status = "timeout"
-                raise SparkProtocolError(f"spark {verb} timed out after {timeout_s}s") from exc
-
-            stderr_tail = proc.stderr[-2000:] if proc.stderr else ""
-            if proc.returncode != 0:
-                lowered = (proc.stderr + proc.stdout).lower()
-                if any(
-                    marker in lowered
-                    for marker in (
-                        "usage limit",
-                        "rate limit",
-                        "unauthorized",
-                        "429",
-                        "401",
-                        "403",
-                    )
-                ):
-                    status = "unavailable"
-                    raise SparkUnavailableError(
-                        f"Spark pool or entitlement refused the call (exit {proc.returncode}): "
-                        f"{stderr_tail}"
-                    )
-                status = "protocol_error"
-                raise SparkProtocolError(
-                    f"codex exec failed (exit {proc.returncode}): {stderr_tail}"
-                )
-
-            if not out_path.exists():
-                status = "protocol_error"
-                raise SparkProtocolError("codex exec exited 0 but wrote no last message")
-            raw = out_path.read_text().strip()
+        transport = choose_transport()
+        record = invocation_record(
+            verb=verb,
+            prompt=prompt,
+            workdir=workdir,
+            writable=writable,
+            caller=caller,
+            base_sha=base_sha,
+            allowed_paths=allowed_paths,
+            repo=repo,
+            transport=transport,
+        )
+        target = telemetry_record if telemetry_record is not None else record
+        target["transport"] = transport
+        record["transport"] = transport
+        schema_obj = _strictify(schema.model_json_schema())
+        if transport == "daemon":
+            raw = _run_via_daemon(
+                prompt,
+                verb=verb,
+                workdir=workdir,
+                writable=writable,
+                schema_obj=schema_obj,
+                timeout_s=timeout_s,
+            )
+        else:
+            raw = _run_via_exec(
+                prompt,
+                verb=verb,
+                workdir=workdir,
+                sandbox=sandbox,
+                schema_obj=schema_obj,
+                timeout_s=timeout_s,
+            )
 
         try:
             result = schema.model_validate_json(raw)
@@ -257,8 +244,27 @@ def run_spark[M: BaseModel](
 
         status = getattr(result, "status", None)
         return result
+    except SparkUnavailableError:
+        status = status or "unavailable"
+        raise
+    except SparkProtocolError as exc:
+        if record is None:
+            record = invocation_record(
+                verb=verb,
+                prompt=prompt,
+                workdir=workdir,
+                writable=writable,
+                caller=caller,
+                base_sha=base_sha,
+                allowed_paths=allowed_paths,
+                repo=repo,
+                transport=None,
+            )
+        if status is None:
+            status = "timeout" if "timed out" in str(exc).lower() else "protocol_error"
+        raise
     finally:
-        if emit_telemetry:
+        if emit_telemetry and record is not None:
             inflight = sys.exc_info()[0]
             try:
                 emit_invocation(
@@ -272,3 +278,113 @@ def run_spark[M: BaseModel](
                 print(f"afford spark: telemetry write failed: {exc}", file=sys.stderr)
                 if inflight is None:
                     raise
+
+
+def choose_transport() -> str:
+    try:
+        return resolve_transport()
+    except ValueError as exc:
+        raise SparkProtocolError(str(exc)) from exc
+
+
+def _run_via_daemon(
+    prompt: str,
+    *,
+    verb: str,
+    workdir: Path,
+    writable: bool,
+    schema_obj: JsonDict,
+    timeout_s: int,
+) -> str:
+    path = socket_path()
+    if transport_mode() == "daemon" and not path.exists():
+        raise SparkUnavailableError(f"afford-sparkd socket missing: {path}")
+    req = DaemonRequest(
+        id=uuid.uuid4().hex,
+        verb=verb,
+        prompt=prompt,
+        workdir=str(workdir),
+        writable=writable,
+        output_schema=schema_obj,
+        timeout_s=timeout_s,
+    )
+    try:
+        response = request_daemon(req, path)
+    except DaemonConnectError as exc:
+        raise SparkUnavailableError(str(exc)) from exc
+    except ProtocolPinError as exc:
+        raise SparkProtocolError(str(exc)) from exc
+    except TimeoutError as exc:
+        raise SparkProtocolError(f"spark {verb} timed out after {timeout_s}s") from exc
+    if not response.ok:
+        message = response.message or "afford-sparkd refused the call"
+        if response.error in {"unavailable", "auth"}:
+            raise SparkUnavailableError(message, kind=response.error)
+        if response.error == "timeout":
+            raise SparkProtocolError(f"spark {verb} timed out after {timeout_s}s")
+        raise SparkProtocolError(message)
+    if not response.raw:
+        raise SparkProtocolError("afford-sparkd returned ok with no payload")
+    return response.raw
+
+
+def _run_via_exec(
+    prompt: str,
+    *,
+    verb: str,
+    workdir: Path,
+    sandbox: str,
+    schema_obj: JsonDict,
+    timeout_s: int,
+) -> str:
+    with tempfile.TemporaryDirectory(prefix="afford-spark-") as tmp:
+        schema_path = Path(tmp) / "result.schema.json"
+        out_path = Path(tmp) / "result.json"
+        schema_path.write_text(json.dumps(schema_obj))
+        cmd = [
+            "codex",
+            "exec",
+            "--model",
+            SPARK_MODEL,
+            "-c",
+            "model_reasoning_effort=low",
+            "--sandbox",
+            sandbox,
+            "--skip-git-repo-check",
+            "-C",
+            str(workdir),
+            "--output-schema",
+            str(schema_path),
+            "--output-last-message",
+            str(out_path),
+            "-",
+        ]
+        try:
+            proc = subprocess.run(
+                cmd,
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+                env={**os.environ, "NO_COLOR": "1"},
+            )
+        except FileNotFoundError as exc:
+            raise SparkUnavailableError(
+                "codex CLI not found on PATH — install codex and authenticate first"
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise SparkProtocolError(f"spark {verb} timed out after {timeout_s}s") from exc
+
+        stderr_tail = proc.stderr[-2000:] if proc.stderr else ""
+        if proc.returncode != 0:
+            kind = classify_refusal(f"{proc.stderr}{proc.stdout}")
+            if kind is not None:
+                raise SparkUnavailableError(
+                    f"{refusal_message(kind)} (exit {proc.returncode}): {stderr_tail}",
+                    kind=kind,
+                )
+            raise SparkProtocolError(f"codex exec failed (exit {proc.returncode}): {stderr_tail}")
+
+        if not out_path.exists():
+            raise SparkProtocolError("codex exec exited 0 but wrote no last message")
+        return out_path.read_text().strip()

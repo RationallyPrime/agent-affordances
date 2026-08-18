@@ -27,8 +27,25 @@ fallback to the metered Codex pool) · `2` usage.
 
 Requires an authenticated `codex` CLI whose account carries the Spark
 research-preview entitlement. Telemetry (caller, operation, base SHA, allowed
-paths, hashes, model, pool, latency, changed files, result state — never
-content) appends to `~/.local/state/afford-spark/telemetry.jsonl` on every
-invocation, including failures. `AFFORD_SPARK_TELEMETRY` overrides the path;
-`AFFORD_SPARK_CALLER` stamps the caller field. Subsequent verification is
-null in this slice.
+paths, hashes, model, pool, latency, changed files, result state, `transport`
+`oneshot|daemon` — never content) appends to
+`~/.local/state/afford-spark/telemetry.jsonl` on every invocation, including
+failures. `AFFORD_SPARK_TELEMETRY` overrides the path; `AFFORD_SPARK_CALLER`
+stamps the caller field. Subsequent verification is null in this slice.
+
+### Warm daemon
+
+Cold `codex exec` pays 20–30s of boot per call. To amortize it:
+
+```bash
+uv tool install -e .
+systemctl --user link $PWD/systemd/user/afford-sparkd.socket \
+                      $PWD/systemd/user/afford-sparkd.service
+systemctl --user enable --now afford-sparkd.socket
+```
+
+`afford` then talks to the socket (`AFFORD_SPARK_SOCKET` overrides the path).
+Each request is a **new conversation, dropped after delivery**. Auth expiry
+and a protocol other than v1 fail loud. `AFFORD_SPARK_TRANSPORT=oneshot`
+forces the original exec path; `=daemon` refuses to start if the socket is
+missing. Default `auto` uses the daemon when the socket exists.

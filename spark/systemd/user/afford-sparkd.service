@@ -1,0 +1,17 @@
+[Unit]
+Description=afford-sparkd — one warm Codex app-server for afford spark
+Requires=afford-sparkd.socket
+After=afford-sparkd.socket
+
+[Service]
+Type=simple
+# systemd's default PATH will not see a uv-tool install under ~/.local/bin.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env afford-sparkd --systemd
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

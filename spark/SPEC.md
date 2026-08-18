@@ -136,8 +136,63 @@ Spark never touches a seat's live checkout.
   caller (`AFFORD_SPARK_CALLER` or null), operation, base SHA, allowed paths,
   input hash, model, pool (`spark`), latency, output hash, changed files
   (wrapper-audited on `transform`; null otherwise), result state, subsequent
-  verification outcome (always null this slice — a later correlator fills it).
-  A few hundred calls tell us empirically which verbs Spark deserves.
+  verification outcome (always null this slice — a later correlator fills it),
+  `transport` (`oneshot` | `daemon`). A few hundred calls tell us empirically
+  which verbs Spark deserves.
+
+## Warm daemon (`afford-sparkd`) — second slice
+
+Boot of `codex exec` dominates a cold locate (field-measured 20–30s). The
+second slice keeps the wrapper contract and amortizes boot:
+
+- `afford-sparkd` is a socket-activated systemd **user** unit that holds one
+  warm `codex app-server` process.
+- `afford` is a thin unix-socket client when the socket is present
+  (`$AFFORD_SPARK_SOCKET`, else `$XDG_RUNTIME_DIR/afford-sparkd/sparkd.sock`).
+  `AFFORD_SPARK_TRANSPORT=oneshot|daemon|auto` (default `auto`: socket if
+  connectable, otherwise oneshot `codex exec`). A leftover socket file
+  with no listener is oneshot, not a hard-down.
+- **Fresh conversation per request, dropped after delivery.** Isolation is the
+  conversation layer, not process recycling. Consecutive calls must not share
+  a thread.
+- Protocol is pinned at v1. A different version fails loud — it is not a
+  silent fallback to oneshot.
+- Auth expiry and pool/rate-limit refusals fail loud (`SparkUnavailableError`);
+  the daemon does not retry and does not fall through to the metered Codex
+  pool. One classifier serves both transports, invoked **once** per error —
+  nothing re-classifies a message that has already been rendered: integer
+  `401`/`403`, word markers, pool phrases, and `401`/`403`/`429` only in a
+  status context with nothing word-like after it (`status 401` is auth;
+  `/403/`, `file.py:403:` and `returned 401 rows` are not). A bare
+  `<context word> <code>` is a decided accept — classified as a refusal even
+  when the number is a count, because a refusal that falls through is retried
+  against a metered pool while a false refusal is loud and terminal. The
+  daemon's wire kind is the classifier's typed verdict, never re-derived from
+  the message text.
+- A warm call is five JSON-RPC round trips against the held app-server, all
+  inside the serial lock: `account/read` (re-check so mid-life expiry fails
+  loud before a turn is spent) + `thread/start` + `turn/start` +
+  `thread/archive` + `thread/unsubscribe` — four when the app-server exposes
+  no auth method at all, in which case the mid-life re-check does not exist.
+  Boot is separate (`initialize` / `initialized` / first `account/read`).
+  "Drop" is both archive and unsubscribe — archive alone can leave the
+  connection subscribed.
+- **One deadline per request, and every hop is charged to it.** Default 300s,
+  starting when the request is received, including time queued behind a
+  predecessor, the auth hop, the turn, and teardown. No stage starts a clock
+  of its own: a slow hop shortens the next one instead of extending the call,
+  so the daemon cannot outlive the caller and spend a metered turn nobody
+  receives. Teardown is charged a reserved slice of that budget — a floor, so
+  the turn cannot consume the whole of it, and a cap, so a stalled archive
+  cannot hold a finished answer past the client's grace. The daemon is
+  strictly serial (one app-server turn at a time); a hung turn cannot stall
+  the next caller past that caller's own budget, which is a typed timeout,
+  not the client's blind deadline. If the caller is gone when the response is
+  finally written, the daemon says so on stderr — a spent turn never vanishes
+  silently.
+
+Units live in `spark/systemd/user/`. Enable with
+`systemctl --user enable --now afford-sparkd.socket`.
 
 ## Later: the quota scavenger (NOT in the first slice)
 

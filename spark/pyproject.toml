@@ -11,6 +11,7 @@ dependencies = [
 
 [project.scripts]
 afford = "afford_spark.cli:app"
+afford-sparkd = "afford_spark.daemon:main"
 
 [dependency-groups]
 # ruff/ty are deliberately not dev deps: the Weave-wide version authority is
