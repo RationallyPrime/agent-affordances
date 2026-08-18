@@ -18,7 +18,8 @@ from pathlib import Path
 import pytest
 
 from afford_spark.appserver import _notification_belongs, _rpc_error
-from afford_spark.auth import classify_refusal
+from afford_spark.auth import classify_refusal, refusal_message
+from afford_spark.client import request_daemon
 from afford_spark.engine import (
     SparkProtocolError,
     SparkUnavailableError,
@@ -87,6 +88,22 @@ def _start_daemon(
         time.sleep(0.02)
     proc.kill()
     raise AssertionError("daemon never created its socket")
+
+
+def _await_boot_rpcs(rpc_log: Path, timeout_s: float = 5.0) -> list[str]:
+    """Boot's last RPC is ``check_auth``'s ``account/read``; wait for it.
+
+    ``serve()`` binds the socket *before* the handshake, so socket existence
+    is not boot completion. Sleeping on the difference makes the exact-list
+    assertion flake under a loaded runner.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        seen = rpc_log.read_text().splitlines() if rpc_log.is_file() else []
+        if "account/read" in seen:
+            return seen
+        time.sleep(0.02)
+    raise AssertionError("daemon never completed its boot RPCs")
 
 
 def _stop(proc: subprocess.Popen[str]) -> None:
@@ -338,7 +355,7 @@ def test_warm_call_is_five_rpcs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     rpc_log = tmp_path / "rpc.log"
     proc, _ = _start_daemon(tmp_path, monkeypatch, extra_env={"AFFORD_FAKE_RPC_LOG": str(rpc_log)})
     try:
-        before = rpc_log.read_text().splitlines() if rpc_log.is_file() else []
+        before = _await_boot_rpcs(rpc_log)
         result = run_spark("q", verb="locate", workdir=tmp_path, schema=LocateResult)
         assert result.status == "complete"
         after = rpc_log.read_text().splitlines()
@@ -463,6 +480,156 @@ def test_queued_request_times_out_within_own_budget(
         assert len(oks) == 1
         assert len(timeouts) == 1
         assert timeouts[0][0] < 5.5
+    finally:
+        _stop(proc)
+
+
+def test_auth_hop_is_inside_the_request_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Hop 1 must not restart the clock.
+
+    Budget 3s, a 2s ``account/read`` and a 2s turn. If the auth hop is charged
+    to its own ``min(10, timeout_s)`` window and ``invoke`` then starts a fresh
+    ``timeout_s``, the daemon services the call in ~4s — past the caller's own
+    budget, and (with a slower auth hop) past the client's blind deadline, so a
+    metered turn completes for nobody. One deadline means the call fails inside
+    its budget instead.
+    """
+    # The stall is on the per-request re-check, not boot's account/read.
+    proc, _ = _start_daemon(
+        tmp_path,
+        monkeypatch,
+        extra_env={"AFFORD_FAKE_ACCOUNT_SLEEP": "2", "AFFORD_FAKE_TURN_SLEEP": "2"},
+    )
+    try:
+        started = time.monotonic()
+        with pytest.raises(SparkProtocolError, match="timed out"):
+            run_spark("q", verb="locate", workdir=tmp_path, schema=LocateResult, timeout_s=3)
+        elapsed = time.monotonic() - started
+        assert elapsed < 3 + 0.75, f"daemon ran {elapsed:.2f}s past a 3s budget"
+        rec = _read_telemetry()[-1]
+        assert rec["transport"] == "daemon"
+        assert rec["status"] == "timeout"
+    finally:
+        _stop(proc)
+
+
+def test_teardown_is_inside_the_request_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The drop runs before the response is written, so it is caller latency.
+
+    A fixed 5s-per-hop teardown against a 2s budget puts delivery ~6s out,
+    past the client's ``timeout_s + 2`` grace — the turn completed and the
+    caller sees a timeout. The reserved slice keeps teardown inside the
+    budget; a slow archive costs the drop, never the answer.
+    """
+    proc, _ = _start_daemon(tmp_path, monkeypatch, extra_env={"AFFORD_FAKE_DROP_SLEEP": "3"})
+    try:
+        started = time.monotonic()
+        result = run_spark("q", verb="locate", workdir=tmp_path, schema=LocateResult, timeout_s=2)
+        elapsed = time.monotonic() - started
+        assert result.status == "complete"
+        assert elapsed < 2, f"teardown pushed delivery to {elapsed:.2f}s of a 2s budget"
+        rec = _read_telemetry()[-1]
+        assert rec["status"] == "complete"
+        assert rec["transport"] == "daemon"
+    finally:
+        _stop(proc)
+
+
+def test_auth_hop_error_is_not_reclassified_from_rendered_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``check_auth`` must not re-run the classifier on the rendered error.
+
+    ``_rpc_error`` already ruled on ``{-403, "cwd is not a directory"}`` — not
+    a refusal. Re-classifying ``"codex account/read error -403: ..."`` finds
+    the ``403`` the rendering itself introduced, so the same error object came
+    back as auth from ``account/read`` and as protocol from ``turn/start``.
+    """
+    error = json.dumps({"code": -403, "message": "cwd is not a directory"})
+    # Boot's account/read succeeds; the invoke's re-check gets the error.
+    proc, _ = _start_daemon(
+        tmp_path,
+        monkeypatch,
+        extra_env={"AFFORD_FAKE_AUTH_ERROR": error, "AFFORD_FAKE_AUTH_AFTER": "1"},
+    )
+    try:
+        with pytest.raises(SparkProtocolError) as caught:
+            run_spark("q", verb="locate", workdir=tmp_path, schema=LocateResult, timeout_s=10)
+        assert not isinstance(caught.value, SparkUnavailableError)
+        assert "re-authenticate" not in str(caught.value).lower()
+        assert "cwd is not a directory" in str(caught.value)
+        # Same object through turn/start: protocol on both sides, one verdict.
+        assert isinstance(
+            _rpc_error("turn/start", {"code": -403, "message": "cwd is not a directory"}),
+            SparkProtocolError,
+        )
+        assert proc.poll() is None
+    finally:
+        _stop(proc)
+
+
+def test_classify_refusal_ranges_over_its_own_tokens() -> None:
+    """Range over the predicate's tokens, not over a reviewer's examples.
+
+    Every context word x every code, then the same words carrying a payload
+    that is a count rather than a status. The last block is the decided
+    accept: a bare ``<context word> <code>`` is a refusal even when the
+    number is a count, and ``exit code 429`` is the case that costs.
+    """
+    for word in ("status", "http", "code", "returned", "response", "error"):
+        for token, expected in (("401", "auth"), ("403", "auth"), ("429", "unavailable")):
+            text = f"request failed with {word} {token}"
+            assert classify_refusal(text) == expected, text
+
+    not_a_status = {
+        "internal error, code 403 chunks pending": None,
+        "returned 401 rows": None,
+        "error at line 401 of the schema": None,
+        "response body was 403 bytes": None,
+        "error: cannot open src/403/handler.rs": None,
+        "error scanning 401 files": None,
+        "code 429 handlers registered": None,
+    }
+    for text, expected in not_a_status.items():
+        assert classify_refusal(text) == expected, text
+
+    # Word markers are the reliable half and are not gated on a number.
+    assert classify_refusal("Too Many Requests (429)") == "unavailable"
+    assert classify_refusal("429 Client Error: Too Many Requests for url") == "unavailable"
+
+    # Decided accept (see auth.py): terminal code after a context word is a
+    # refusal even when it is a count. False refusal beats silent fall-through.
+    assert classify_refusal("exit code 429") == "unavailable"
+
+
+def test_daemon_error_kind_is_the_typed_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wire kind comes from the classifier, not from matching the prose."""
+    auth = SparkUnavailableError(refusal_message("auth"), kind="auth")
+    pool = SparkUnavailableError(refusal_message("unavailable"), kind="unavailable")
+    assert auth.kind == "auth"
+    assert pool.kind == "unavailable"
+    # The refusal prose no longer carries the word the old derivation keyed on.
+    assert "auth" not in str(pool).lower()
+
+    proc, _ = _start_daemon(tmp_path, monkeypatch, extra_env={"AFFORD_FAKE_USAGE_LIMIT": "1"})
+    try:
+        req = DaemonRequest(
+            id="kind-1",
+            verb="locate",
+            prompt="q",
+            workdir=str(tmp_path),
+            output_schema={"type": "object"},
+            timeout_s=10,
+        )
+        response = request_daemon(req, socket_path())
+        assert response.ok is False
+        assert response.error == "unavailable"
     finally:
         _stop(proc)
 

@@ -14,6 +14,13 @@ Env knobs (all optional):
 * ``AFFORD_FAKE_ECHO_PROMPTS`` — if set, ``reason`` is the thread's prompt list
 * ``AFFORD_FAKE_RPC_LOG`` — path; each received method name is appended
 * ``AFFORD_FAKE_USAGE_LIMIT`` — if set, ``turn/start`` returns a pool refusal
+* ``AFFORD_FAKE_ACCOUNT_SLEEP`` — seconds to stall every ``account/read``
+  after boot's first, i.e. the per-request auth re-check
+* ``AFFORD_FAKE_DROP_SLEEP`` — seconds to stall each archive/unsubscribe
+* ``AFFORD_FAKE_AUTH_ERROR`` — JSON ``{"code": …, "message": …}`` returned
+  verbatim by ``account/read`` once ``AFFORD_FAKE_AUTH_AFTER`` successes are
+  spent, so the wrapper's classification of a non-refusal auth-hop error can
+  be witnessed without failing the daemon's boot check
 """
 
 from __future__ import annotations
@@ -22,6 +29,7 @@ import json
 import os
 import sys
 import threading
+import time
 from typing import Any
 
 _send_lock = threading.Lock()
@@ -46,6 +54,11 @@ def main() -> None:
     echo_prompts = bool(os.environ.get("AFFORD_FAKE_ECHO_PROMPTS"))
     rpc_log = os.environ.get("AFFORD_FAKE_RPC_LOG")
     usage_limit = bool(os.environ.get("AFFORD_FAKE_USAGE_LIMIT"))
+    account_sleep_s = float(os.environ.get("AFFORD_FAKE_ACCOUNT_SLEEP", "0"))
+    account_calls = 0
+    drop_sleep_s = float(os.environ.get("AFFORD_FAKE_DROP_SLEEP", "0"))
+    raw_auth_error = os.environ.get("AFFORD_FAKE_AUTH_ERROR")
+    auth_error = json.loads(raw_auth_error) if raw_auth_error else None
     threads: dict[str, list[str]] = {}
     pending_turns: dict[str, threading.Event] = {}
     stripped_ids: set[str] = set()
@@ -75,6 +88,18 @@ def main() -> None:
         if method == "initialized":
             continue
         if method in {"account/read", "account/rateLimits/read"}:
+            if account_sleep_s and account_calls:
+                time.sleep(account_sleep_s)
+            account_calls += 1
+            if auth_error is not None:
+                # AFFORD_FAKE_AUTH_AFTER buys that many successes first, so
+                # the daemon's boot check can pass before the error lands.
+                if remaining_ok:
+                    remaining_ok -= 1
+                    _send({"id": ident, "result": {"account": {"email": "spark@test"}}})
+                else:
+                    _send({"id": ident, "error": auth_error})
+                continue
             if remaining_ok is not None:
                 if remaining_ok <= 0:
                     auth = "expired"
@@ -188,6 +213,8 @@ def main() -> None:
             _send({"id": ident, "result": {}})
             continue
         if method in {"thread/archive", "thread/unsubscribe"}:
+            if drop_sleep_s:
+                time.sleep(drop_sleep_s)
             thread_id = str(params.get("threadId") or "")
             threads.pop(thread_id, None)
             if history_path:

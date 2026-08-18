@@ -18,7 +18,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from afford_spark.appserver import CodexAppServer
+from afford_spark.appserver import AUTH_HOP_BUDGET_S, CodexAppServer
 from afford_spark.engine import SPARK_MODEL, SparkProtocolError, SparkUnavailableError
 from afford_spark.protocol import DAEMON_PROTOCOL, DaemonRequest, DaemonResponse, socket_path
 
@@ -61,7 +61,7 @@ def serve(*, socket_file: Path | None, systemd: bool, codex: str) -> None:
     app_server = CodexAppServer.spawn(codex=codex)
     try:
         app_server.handshake()
-        app_server.check_auth()
+        app_server.check_auth(deadline=time.monotonic() + AUTH_HOP_BUDGET_S)
         threading.Thread(
             target=_watch_child,
             args=(app_server, owned_socket),
@@ -102,16 +102,24 @@ def _watch_child(app_server: CodexAppServer, owned_socket: Path | None) -> None:
 
 def _handle_conn(conn: socket.socket, app_server: CodexAppServer, lock: threading.Lock) -> None:
     try:
-        line = _recv_line(conn)
-        response = _dispatch(line, app_server, lock)
-        conn.sendall(response.model_dump_json().encode() + b"\n")
-    except OSError:
-        return
-    finally:
         try:
-            conn.close()
-        except OSError:
+            line = _recv_line(conn)
+        except OSError as exc:
+            print(f"afford-sparkd: caller vanished before its request: {exc}", file=sys.stderr)
             return
+        response = _dispatch(line, app_server, lock)
+        try:
+            conn.sendall(response.model_dump_json().encode() + b"\n")
+        except OSError as exc:
+            # R-3: a turn was spent and nobody received it. Never silent.
+            print(
+                f"afford-sparkd: caller gone before delivery "
+                f"(id={response.id} ok={response.ok} error={response.error}): {exc}",
+                file=sys.stderr,
+            )
+    finally:
+        with contextlib.suppress(OSError):
+            conn.close()
 
 
 def _dispatch(line: str, app_server: CodexAppServer, lock: threading.Lock) -> DaemonResponse:
@@ -135,6 +143,7 @@ def _dispatch(line: str, app_server: CodexAppServer, lock: threading.Lock) -> Da
             error="protocol",
             message=f"request protocol {req.v} is not pinned v{DAEMON_PROTOCOL}",
         )
+    # One deadline for the whole request: queue wait, auth hop, turn, teardown.
     deadline = time.monotonic() + req.timeout_s
     remaining = deadline - time.monotonic()
     if remaining <= 0 or not lock.acquire(timeout=remaining):
@@ -151,15 +160,17 @@ def _dispatch(line: str, app_server: CodexAppServer, lock: threading.Lock) -> Da
             workdir=Path(req.workdir),
             writable=req.writable,
             schema=req.output_schema,
-            timeout_s=max(0.05, deadline - time.monotonic()),
+            deadline=deadline,
         )
     except TimeoutError as exc:
         return DaemonResponse(
             v=DAEMON_PROTOCOL, id=ident, ok=False, error="timeout", message=str(exc)
         )
     except SparkUnavailableError as exc:
-        kind = "auth" if "auth" in str(exc).lower() else "unavailable"
-        return DaemonResponse(v=DAEMON_PROTOCOL, id=ident, ok=False, error=kind, message=str(exc))
+        # The classifier's typed verdict — never re-derived from the prose.
+        return DaemonResponse(
+            v=DAEMON_PROTOCOL, id=ident, ok=False, error=exc.kind, message=str(exc)
+        )
     except SparkProtocolError as exc:
         text = str(exc)
         error = "timeout" if "timed out" in text.lower() else "protocol"

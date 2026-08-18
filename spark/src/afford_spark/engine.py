@@ -21,7 +21,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ValidationError
 
-from afford_spark.auth import classify_refusal, refusal_message
+from afford_spark.auth import RefusalKind, classify_refusal, refusal_message
 from afford_spark.client import DaemonConnectError, ProtocolPinError, request_daemon
 from afford_spark.protocol import (
     DaemonRequest,
@@ -43,7 +43,15 @@ def _telemetry_path() -> Path:
 
 
 class SparkUnavailableError(RuntimeError):
-    """The pool or entitlement refused us. The caller hears it plainly."""
+    """The pool or entitlement refused us. The caller hears it plainly.
+
+    ``kind`` carries the classifier's verdict so no consumer has to re-derive
+    it by substring-matching the human message.
+    """
+
+    def __init__(self, message: str, *, kind: RefusalKind = "unavailable") -> None:
+        super().__init__(message)
+        self.kind: RefusalKind = kind
 
 
 class SparkProtocolError(RuntimeError):
@@ -311,7 +319,7 @@ def _run_via_daemon(
     if not response.ok:
         message = response.message or "afford-sparkd refused the call"
         if response.error in {"unavailable", "auth"}:
-            raise SparkUnavailableError(message)
+            raise SparkUnavailableError(message, kind=response.error)
         if response.error == "timeout":
             raise SparkProtocolError(f"spark {verb} timed out after {timeout_s}s")
         raise SparkProtocolError(message)
@@ -370,14 +378,10 @@ def _run_via_exec(
         stderr_tail = proc.stderr[-2000:] if proc.stderr else ""
         if proc.returncode != 0:
             kind = classify_refusal(f"{proc.stderr}{proc.stdout}")
-            if kind == "auth":
+            if kind is not None:
                 raise SparkUnavailableError(
-                    f"{refusal_message(kind)} (exit {proc.returncode}): {stderr_tail}"
-                )
-            if kind == "unavailable":
-                raise SparkUnavailableError(
-                    f"Spark pool or entitlement refused the call (exit {proc.returncode}): "
-                    f"{stderr_tail}"
+                    f"{refusal_message(kind)} (exit {proc.returncode}): {stderr_tail}",
+                    kind=kind,
                 )
             raise SparkProtocolError(f"codex exec failed (exit {proc.returncode}): {stderr_tail}")
 

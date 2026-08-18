@@ -27,6 +27,17 @@ AUTH_METHODS = ("account/read", "account/rateLimits/read")
 # refused; a server that states none is accepted (the handshake itself is the
 # pin for that generation).
 PINNED_APP_SERVER_PROTOCOL = 1
+# Boot's own auth budget. Inside a request there is no separate budget: every
+# hop, teardown included, is measured against the one request deadline.
+AUTH_HOP_BUDGET_S = 10.0
+# Teardown (interrupt + archive + unsubscribe) runs before the response is
+# written, so it is caller-visible latency. It gets a reserved slice of the
+# request budget rather than a fixed timeout of its own — a fixed one puts the
+# daemon past the client's deadline and delivers a spent turn to nobody. The
+# reserve is both a floor (the turn cannot eat the whole budget) and a cap (a
+# stalled archive cannot hold a finished answer hostage).
+CLEANUP_RESERVE_FRACTION = 0.1
+CLEANUP_RESERVE_CAP_S = 5.0
 
 
 class AppServerDead(SparkProtocolError):
@@ -88,9 +99,13 @@ class CodexAppServer:
         self.notify("initialized")
         return result
 
-    def check_auth(self, timeout_s: float = 10.0) -> None:
+    def check_auth(self, deadline: float) -> None:
         """Fail loud on expiry. A missing auth method is not a pass — we still
-        classify structured 401/403 and refusal text on the turn itself."""
+        classify structured 401/403 and refusal text on the turn itself.
+
+        ``deadline`` is absolute (``time.monotonic``) and shared with the rest
+        of the call: probing two methods cannot buy extra wall-clock.
+        """
         if self._auth_method is False:
             return
         methods: Iterator[str]
@@ -101,16 +116,17 @@ class CodexAppServer:
         last_missing = False
         for method in methods:
             try:
-                self.request(method, {}, timeout_s=timeout_s)
+                self.request(method, {}, timeout_s=_remaining(deadline))
             except SparkUnavailableError:
                 raise
             except SparkProtocolError as exc:
                 if _is_missing_method(str(exc)):
                     last_missing = True
                     continue
-                kind = classify_refusal(str(exc))
-                if kind is not None:
-                    raise SparkUnavailableError(refusal_message(kind)) from exc
+                # No second classification pass: ``_rpc_error`` already ruled on
+                # this error from its structured code and its raw message. Re-running
+                # the classifier over the *rendered* text would only ever match the
+                # rendering we just added ("codex <method> error <code>: ...").
                 raise
             else:
                 self._auth_method = method
@@ -125,20 +141,30 @@ class CodexAppServer:
         workdir: Path,
         writable: bool,
         schema: dict[str, object],
-        timeout_s: float,
+        deadline: float,
     ) -> str:
         """Fresh ephemeral thread → one turn → drop. Returns the last agent text.
 
         A warm call is five RPCs, all inside the serial lock: ``account/read``
         (auth re-check so mid-life expiry fails before a turn is spent),
         ``thread/start``, ``turn/start``, ``thread/archive``,
-        ``thread/unsubscribe``.
+        ``thread/unsubscribe`` — four when the app-server exposes no auth
+        method at all.
+
+        ``deadline`` is absolute and is the *whole* call's budget, teardown
+        included. Nothing here starts a clock of its own: a hop that finishes
+        late shortens the next hop instead of extending the call, so the
+        daemon cannot outlive the caller and spend a turn nobody receives.
         """
-        self.check_auth(timeout_s=min(10.0, timeout_s))
+        reserve = min(
+            CLEANUP_RESERVE_CAP_S,
+            max(0.0, _remaining(deadline) * CLEANUP_RESERVE_FRACTION),
+        )
+        turn_deadline = deadline - reserve
+        self.check_auth(deadline=min(turn_deadline, time.monotonic() + AUTH_HOP_BUDGET_S))
         # Stale notifications from an abandoned predecessor must not be
         # visible to this turn — the queue is process-global.
         self._drain_events()
-        deadline = time.monotonic() + timeout_s
         thread = self.request(
             "thread/start",
             {
@@ -147,7 +173,7 @@ class CodexAppServer:
                 "model": SPARK_MODEL,
                 "sandbox": "workspace-write" if writable else "read-only",
             },
-            timeout_s=_remaining(deadline),
+            timeout_s=_remaining(turn_deadline),
         )
         thread_id = _thread_id(thread)
         if not thread_id:
@@ -162,12 +188,12 @@ class CodexAppServer:
                     "outputSchema": schema,
                     "model": SPARK_MODEL,
                 },
-                timeout_s=_remaining(deadline),
+                timeout_s=_remaining(turn_deadline),
             )
             turn_id = _turn_id(started)
             completed = self.wait_notification(
                 "turn/completed",
-                timeout_s=_remaining(deadline),
+                timeout_s=_remaining(turn_deadline),
                 turn_id=turn_id,
                 thread_id=thread_id,
             )
@@ -189,10 +215,12 @@ class CodexAppServer:
                 raise SparkProtocolError("codex turn completed with no agent message")
             return text
         except Exception:
-            self._interrupt_turn(thread_id, turn_id)
+            self._interrupt_turn(
+                thread_id, turn_id, deadline=min(deadline, time.monotonic() + reserve)
+            )
             raise
         finally:
-            self._drop(thread_id)
+            self._drop(thread_id, deadline=min(deadline, time.monotonic() + reserve))
 
     def close(self) -> None:
         self._closed = True
@@ -266,24 +294,25 @@ class CodexAppServer:
         except queue.Empty:
             return
 
-    def _interrupt_turn(self, thread_id: str, turn_id: str | None) -> None:
+    def _interrupt_turn(self, thread_id: str, turn_id: str | None, *, deadline: float) -> None:
         if not turn_id:
             return
         try:
             self.request(
                 "turn/interrupt",
                 {"threadId": thread_id, "turnId": turn_id},
-                timeout_s=2.0,
+                timeout_s=_remaining(deadline),
             )
         except SparkProtocolError:
             return
 
-    def _drop(self, thread_id: str) -> None:
+    def _drop(self, thread_id: str, *, deadline: float) -> None:
         # Archive and unsubscribe are not a fallback chain: archive may succeed
-        # while the connection is still subscribed and still emitting.
+        # while the connection is still subscribed and still emitting. Both are
+        # charged to the request deadline like every other hop.
         for method in ("thread/archive", "thread/unsubscribe"):
             try:
-                self.request(method, {"threadId": thread_id}, timeout_s=5.0)
+                self.request(method, {"threadId": thread_id}, timeout_s=_remaining(deadline))
             except SparkProtocolError:
                 continue
 
@@ -364,7 +393,7 @@ class CodexAppServer:
         if self._dead is not None:
             kind = classify_refusal(self._dead)
             if kind is not None:
-                raise SparkUnavailableError(refusal_message(kind))
+                raise SparkUnavailableError(refusal_message(kind), kind=kind)
             raise AppServerDead(self._dead)
 
 
@@ -466,11 +495,11 @@ def _rpc_error(method: str, error: object) -> SparkProtocolError | SparkUnavaila
         text = f"codex {method} error {code}: {message}"
         kind = classify_code(code) or classify_refusal(message)
         if kind is not None:
-            return SparkUnavailableError(refusal_message(kind))
+            return SparkUnavailableError(refusal_message(kind), kind=kind)
         return SparkProtocolError(text)
     kind = classify_refusal(str(error))
     if kind is not None:
-        return SparkUnavailableError(refusal_message(kind))
+        return SparkUnavailableError(refusal_message(kind), kind=kind)
     return SparkProtocolError(f"codex {method} error: {error}")
 
 
