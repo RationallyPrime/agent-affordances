@@ -16,6 +16,12 @@ on:
   schedule:
     - cron: "*/15 * * * *"
   workflow_dispatch:
+    inputs:
+      canary:
+        description: "Also post the burn-seat liveness canary"
+        default: "no"
+        type: choice
+        options: ["no", "yes"]
 
 # One run at a time, never cancelled: the helper's idempotency is
 # check-then-post over comment markers, so two overlapping runs can both
@@ -71,7 +77,7 @@ jobs:
 
   review-loop-canary:
     name: Hive canary (routing only — not a test gate)
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.canary == 'yes'
     runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","cx53"]' || '["ubuntu-latest"]') }}
     steps:
       - name: Checkout trusted review-loop helper
@@ -87,7 +93,7 @@ jobs:
 
   nudge-stalled-reviews:
     name: Nudge stalled reviews (routing only — not a test gate)
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","cx53"]' || '["ubuntu-latest"]') }}
     steps:
       - name: Checkout trusted review-loop helper

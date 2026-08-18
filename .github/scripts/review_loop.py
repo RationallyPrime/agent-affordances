@@ -2237,10 +2237,18 @@ def report_unroutable_codex_comment(
         return
     body = str(comment.get("body") or "")
     kind = codex_comment_kind(body)
+    if kind == CODEX_COMMENT_QUOTA_REFUSAL:
+        # The refusal is the moment the find half went down for this head.
+        # The scheduled scan reaches the same conclusion up to the stall
+        # threshold plus one cron tick later; routing the event through the
+        # same per-PR reconciliation (stall gate off — Codex has refused,
+        # there is nothing left to wait for) removes that latency without a
+        # second routing policy.
+        summon_on_refusal(issue, repository)
+        return
     if kind in (
         CODEX_COMMENT_TASK_REPORT,
         CODEX_COMMENT_CONNECTOR_ERROR,
-        CODEX_COMMENT_QUOTA_REFUSAL,
     ):
         print(f"ignored Codex {kind} comment")
         return
@@ -2634,6 +2642,32 @@ def route_substitute_verdict(event: Mapping[str, Any]) -> None:
     print(
         f"woke {author_actor} for {repository}#{pr_number} "
         f"(substitute clean by {verdict['actor']})"
+    )
+
+
+def summon_on_refusal(issue: Mapping[str, Any], repository: str) -> None:
+    """Reconcile one PR immediately when Codex refuses it on quota."""
+    if not issue.get("pull_request"):
+        print("ignored quota refusal outside a pull request")
+        return
+    pr_number = int(issue.get("number") or 0)
+    github = GitHubApi(required_env("GITHUB_TOKEN"), repository)
+    pull_request = github.get(f"pulls/{pr_number}")
+    if str(pull_request.get("state")) != "open":
+        print(f"ignored quota refusal on non-open PR #{pr_number}")
+        return
+    codex_login = os.environ.get("CODEX_LOGIN", CODEX_LOGIN)
+    nudged, summoned, redelivered = _scan_open_pull(
+        github,
+        pull_request,
+        repository=repository,
+        codex_login=codex_login,
+        now=datetime.now(timezone.utc),
+        stall_gate=False,
+    )
+    print(
+        f"refusal-routed PR #{pr_number} "
+        f"(nudged={nudged}, summoned={summoned}, redelivered={redelivered})"
     )
 
 
@@ -3438,8 +3472,14 @@ def _scan_open_pull(
     codex_login: str,
     now: datetime,
     usage_meter: Mapping[str, Any] | None | object = _FETCH_METER,
+    stall_gate: bool = True,
 ) -> tuple[int, int, int]:
-    """Reconcile one open PR; returns ``(nudged, summoned, redelivered)`` deltas."""
+    """Reconcile one open PR; returns ``(nudged, summoned, redelivered)`` deltas.
+
+    ``stall_gate=False`` is the event path: a live quota refusal has already
+    proven the head will not be reviewed by waiting, so the commit-age
+    threshold that keeps the scheduled scan patient does not apply.
+    """
     head = pull_request.get("head")
     if not isinstance(head, Mapping):
         return (0, 0, 0)
@@ -3448,7 +3488,7 @@ def _scan_open_pull(
     if author not in SEAT_ACTORS:
         return (0, 0, 0)
     committed_at = review_stall_anchor(commit, pull_request, now)
-    if (now - committed_at).total_seconds() < REVIEW_STALL_SECONDS:
+    if stall_gate and (now - committed_at).total_seconds() < REVIEW_STALL_SECONDS:
         return (0, 0, 0)
     pr_number = int(pull_request["number"])
     reviews = github.paginate(f"pulls/{pr_number}/reviews")
