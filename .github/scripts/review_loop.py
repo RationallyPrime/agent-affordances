@@ -45,7 +45,7 @@ from typing import Any
 
 CODEX_LOGIN = "chatgpt-codex-connector[bot]"
 WORKFLOW_LOGIN = "github-actions[bot]"
-MAX_REVIEW_ROUNDS = 5
+MAX_REVIEW_ROUNDS = 7
 REVIEW_STALL_SECONDS = 20 * 60
 # Deliberately separate from REVIEW_STALL_SECONDS: that window bounds how long a
 # head may wait for a *verdict*, while this one bounds how long a delivered
