@@ -1,5 +1,12 @@
 # Weave review-loop hook. Adopt this workflow together with
-# .github/scripts/review_loop.py and set HIVE_BOT_TOKEN plus CODEX_REVIEW_PAT.
+# .github/scripts/review_loop.py and .github/scripts/merge_digest.py, and set
+# HIVE_BOT_TOKEN plus CODEX_REVIEW_PAT.
+#
+# LOGFIRE_TOKEN is optional. With it, every belt decision is exported as a
+# Logfire span (KRA-1132) and belt convergence — rounds to CLEAN, findings per
+# round, which PRs reach the bound — is a query instead of thread archaeology.
+# Without it the helper behaves exactly as it did before: telemetry is
+# collected, exported nowhere, and never gates a wake.
 #
 # This workflow ROUTES Codex verdicts. It runs no tests and asserts nothing
 # about the code. Its own success is not evidence that a head is good — a PR
@@ -9,6 +16,8 @@
 name: review-loop
 
 on:
+  pull_request:
+    types: [closed]
   pull_request_review:
     types: [submitted]
   issue_comment:
@@ -23,12 +32,57 @@ on:
         type: choice
         options: ["no", "yes"]
 
-# One run at a time, never cancelled: the helper's idempotency is
-# check-then-post over comment markers, so two overlapping runs can both
-# observe a marker as absent and both act. Serializing is cheap (the jobs are
-# small); duplicate wakes and duplicate gates are not.
+# The group is the pair a run actually writes to: (event family, subject).
+#
+# A concurrency group holds ONE running plus ONE pending run. Queuing a third
+# cancels the pending one, and `cancel-in-progress: false` does not change that
+# — it protects the run that is executing, never the one that is waiting. Under
+# the previous constant group `weave-review-loop`, every event in the repository
+# shared that single pending slot, so a chatty burn on one PR silently cancelled
+# another PR's queued verdict routing. Measured on Skrates/sokrates over the 300
+# review-loop runs to 2026-09-04T21:10Z: 47 cancelled, 20 of them
+# `pull_request_review` and 2 `pull_request`. A dropped verdict is a wake nobody
+# receives; nothing records that a round happened and the burn seat is the only
+# witness. Serialising to avoid a duplicate wake (harmless — deduped downstream)
+# at the cost of a dropped wake (a silent stall) is the asymmetry the wrong way
+# round.
+#
+# Keying on the PR alone is not enough. Measured 2026-09-02 on this repository's
+# own #138: the landing comment posted right after the squash merge evicted that
+# same PR's pending `pull_request: closed` run, which completed `cancelled` with
+# an EMPTY jobs array — the merge digest was never published and no terminal
+# belt span was emitted. So the key carries the event family as well: for any
+# one event exactly one family of jobs below can fire. Verdict and closure
+# write disjoint GitHub state. Sweep and verdict-<pr> both publish wakes
+# for the same PR: the previous constant group serialised them, so dropping
+# that without a write guard lets the scan post a stale snapshot after the
+# event route has already published a newer verdict. `redeliver_standing_wake`
+# therefore re-fetches the standing verdict immediately before publication
+# and refuses unless it is still the latest at the head.
+#
+#   verdict-<pr>   pull_request_review, issue_comment -> wake-on-codex-result
+#   closure-<pr>   pull_request (closed)              -> announce-machine-merge,
+#                                                        belt-terminal
+#   sweep          schedule, workflow_dispatch        -> nudge, terminal-sweep,
+#                                                        review-loop-canary
+#
+# Same family and same PR still serialise, because that is the only place the
+# helper's check-then-post marker idempotency actually races. Losing a pending
+# `sweep` run is safe by construction and not by luck: the scheduled leg
+# re-enumerates every open PR from GitHub state, so the next run five minutes
+# later does the evicted run's work. That same enumeration
+# (`review_loop._scan_open_pull` -> `redeliver_standing_wake`) is the belt's
+# reconciliation leg for a verdict whose routing was dropped — it re-derives the
+# standing verdict from the reviews and comments at the head rather than from
+# event delivery. It is deliberately the only such leg (KRA-1325).
 concurrency:
-  group: weave-review-loop
+  group: >-
+    weave-review-loop-${{
+    (github.event_name == 'pull_request_review' || github.event_name == 'issue_comment')
+    && format('verdict-{0}', github.event.issue.number || github.event.pull_request.number)
+    || github.event_name == 'pull_request'
+    && format('closure-{0}', github.event.pull_request.number)
+    || 'sweep' }}
   cancel-in-progress: false
 
 env:
@@ -43,10 +97,31 @@ env:
   AI_USAGE_CODEX_THRESHOLD: ${{ vars.AI_USAGE_CODEX_THRESHOLD }}
   REVIEW_SUBSTITUTE_ACTOR: ${{ vars.REVIEW_SUBSTITUTE_ACTOR }}
   REVIEW_BURN_ACTOR: ${{ vars.REVIEW_BURN_ACTOR }}
+  # Optional `Git Author Name=seat` overlay. Two home cases: a non-seat
+  # author (the commits land under a human identity) and GitHub's
+  # "Update branch" merge commit (HEAD is the clicker's git name, so the
+  # seat gate would otherwise skip the PR in silence). Honoured only on
+  # same-repo heads — see review_loop.author_aliases.
+  REVIEW_AUTHOR_ALIASES: ${{ vars.REVIEW_AUTHOR_ALIASES }}
+  # Optional comma-separated corpus roots that skip the review loop in THIS
+  # repository, on top of the fixed skill roots (`skills/`, `.agents/skills/`,
+  # `.claude/skills/`). Declare only corpora whose whole quality bar is a
+  # mechanical CI gate — recipe YAML, law primitives (ruling 2026-09-03), e.g.
+  # `nomos/corpus_source/,polis/src/polis/ergon/registry/recipes/`. A PR
+  # touching only these paths gets no summon, burn, or exhaustion gate; a
+  # mixed PR rides the loop. Read at workflow level on purpose: the scheduled
+  # scan that summons, the verdict router and the terminal leg must all apply
+  # one list. The weekly skill audit never sweeps these roots.
+  REVIEW_LOOP_EXEMPT_PATHS: ${{ vars.REVIEW_LOOP_EXEMPT_PATHS }}
 
 permissions:
   contents: read
   pull-requests: write
+  checks: read
+  # The terminal legs date a declared REVIEW_LOOP_EXEMPT_PATHS against the
+  # variable's updated_at, so a closure that predates the declaration is not
+  # filed as exempt. Reading a repository variable needs this.
+  actions: read
 
 jobs:
   wake-on-codex-result:
@@ -73,6 +148,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HIVE_BOT_TOKEN: ${{ secrets.HIVE_BOT_TOKEN }}
+          LOGFIRE_TOKEN: ${{ secrets.LOGFIRE_TOKEN }}
         run: python3 .github/scripts/review_loop.py route
 
   review-loop-canary:
@@ -89,6 +165,7 @@ jobs:
       - name: Wake Talos with a read-only canary
         env:
           HIVE_BOT_TOKEN: ${{ secrets.HIVE_BOT_TOKEN }}
+          LOGFIRE_TOKEN: ${{ secrets.LOGFIRE_TOKEN }}
         run: python3 .github/scripts/review_loop.py canary
 
   nudge-stalled-reviews:
@@ -112,4 +189,82 @@ jobs:
           HIVE_BOT_TOKEN: ${{ secrets.HIVE_BOT_TOKEN }}
           # Optional reviewer-router meter credential; absent => Codex always.
           AI_USAGE_READ_TOKEN: ${{ secrets.AI_USAGE_READ_TOKEN }}
+          LOGFIRE_TOKEN: ${{ secrets.LOGFIRE_TOKEN }}
         run: python3 .github/scripts/review_loop.py nudge
+
+  announce-machine-merge:
+    name: Announce machine merge (routing only — not a test gate)
+    # The per-merge half of the machine-merge digest (KRA-1083). Under the
+    # retrospective-veto regime the composed boundary admits the merge, so this
+    # is where Hákon learns what landed — one substance line, at merge time.
+    #
+    # A merged fork PR carries no secrets on this event and so cannot be
+    # announced here; the scheduled cross-repo digest reads it with its own
+    # token, and is the completeness backstop for exactly that case.
+    if: github.event_name == 'pull_request' && github.event.pull_request.merged == true
+    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","cx53"]' || '["ubuntu-latest"]') }}
+    steps:
+      - name: Checkout trusted digest helper
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Announce the machine merge to Hive
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HIVE_BOT_TOKEN: ${{ secrets.HIVE_BOT_TOKEN }}
+        run: python3 .github/scripts/merge_digest.py announce
+
+  belt-terminal:
+    name: Record the belt outcome (telemetry only — not a test gate)
+    # Every close, not only a merge: a PR abandoned after five rounds is the
+    # convergence signal a merged-only view cannot see. Wakes nobody and posts
+    # nothing; with no LOGFIRE_TOKEN it is a no-op that still exits green.
+    #
+    # A fork-originated PR carries no secrets on this event, so its closure
+    # cannot be exported here — the same limitation announce-machine-merge
+    # declares above. belt-terminal-sweep is the completeness backstop for
+    # exactly that case, and the span is keyed on the closure, so the two
+    # paths cannot double-count a PR between them.
+    if: github.event_name == 'pull_request'
+    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","cx53"]' || '["ubuntu-latest"]') }}
+    steps:
+      - name: Checkout trusted review-loop helper
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Emit the terminal belt span
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LOGFIRE_TOKEN: ${{ secrets.LOGFIRE_TOKEN }}
+        run: python3 .github/scripts/review_loop.py terminal
+
+  belt-terminal-sweep:
+    name: Backfill fork closures into the belt (telemetry only — not a test gate)
+    # The completeness backstop belt-terminal names. A fork PR's closure event
+    # holds no secrets, so that job exports nothing and the closure is missing
+    # from the live convergence distribution — indistinguishable from a PR that
+    # never closed. This runs on the schedule, in the base repository's own
+    # context, where LOGFIRE_TOKEN exists, and re-emits recent fork closures.
+    #
+    # Overlapping the closure event is harmless and deliberate: the span
+    # carries the closure's own id, not the export's, and every dashboard query
+    # groups on it. Detecting which closures already exported would need a
+    # second store to be right; the dedup already is.
+    if: github.event_name == 'schedule'
+    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","cx53"]' || '["ubuntu-latest"]') }}
+    steps:
+      - name: Checkout trusted review-loop helper
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Emit terminal spans for fork closures
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LOGFIRE_TOKEN: ${{ secrets.LOGFIRE_TOKEN }}
+        run: python3 .github/scripts/review_loop.py terminal-sweep

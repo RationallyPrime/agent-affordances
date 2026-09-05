@@ -25,22 +25,43 @@ Commands:
     exhaustion path posts the same human gate as ``route`` but does not wake
     Theoros: the retrospective requires findings still present on the exact
     current head, and this branch is entered only because that head has none.
+    This leg also chases a requested retrospective that never reached the PR —
+    on every open PR, and on those closed within the last
+    ``RETROSPECTIVE_CLOSED_SWEEP_HOURS`` hours, because a retrospective gates no
+    closure and so routinely outlives the PR that owes it.
 ``canary``
     Post a harmless burn-seat liveness wake for end-to-end verification.
+``terminal``
+    Emit the closing belt span for a seat-authored PR: rounds consumed,
+    rounds to CLEAN, findings burned, whether the bound was reached, and the
+    SHA that landed.  Routes nothing and wakes nobody.
+``terminal-sweep``
+    Re-emit the closing span for recent FORK-originated closures, which the
+    ``pull_request`` event cannot export because it holds no repository
+    secrets.  Runs on the schedule, in the base repository's own context.
+    Spans are keyed on the closure, so overlapping the event is harmless.
+
+Every command exports its decisions to Logfire as OTLP/HTTP JSON spans when
+``LOGFIRE_TOKEN`` is set (KRA-1132).  Telemetry is subordinate to routing: with
+no token, or with a failing exporter, the belt behaves exactly as it did before
+and says so on stderr.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Iterable, Mapping, Sequence
-from datetime import datetime, timezone
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 CODEX_LOGIN = "chatgpt-codex-connector[bot]"
@@ -54,7 +75,36 @@ REVIEW_STALL_SECONDS = 20 * 60
 # the worst case is one redundant wake, which seat dedupe doctrine makes safe.
 WAKE_REDELIVERY_SECONDS = 60 * 60
 DIGEST_CHUNK_BUDGET = 12000
+# Per-span cap on enumerated finding locations; the counts stay exact.
+FINDING_SPAN_BUDGET = 50
+# A history location renders as ``path:line — identity``.  One definition of
+# the join, so the site can always be read back out of it (``location_site``).
+LOCATION_IDENTITY_SEPARATOR = " — "
 ROUND_LOCATION_LINE_BUDGET = 8000
+# The complete set of ``ensure_comment_at_head`` outcomes that mean "the marker
+# this head needs is on the PR".  Every other value the helper returns is the
+# chokepoint's own refusal reason, so readers derive the positive from this set
+# and refuse on everything else — including a reason added later.  Collapsing
+# refusals into one sentinel is what let a merge race be recorded as a push.
+COMMENT_AT_HEAD_PUBLISHED = frozenset({"existing", "posted"})
+# How long a requested retrospective may go undelivered before the loop chases
+# it, and how many chases it gets.  Separate from WAKE_REDELIVERY_SECONDS even
+# at the same value: that one bounds an unacted *verdict*, this one bounds an
+# unwritten *testimony*, and a retrospective is written by hand against a
+# seven-round history — the two windows will not stay equal.  Paid for on
+# sokrates#1113, where the verdict was written to a file on cx53, posted with
+# `--body @path` (which `gh` does not expand), and sat undelivered for 8 days
+# with nothing in the loop noticing.
+RETROSPECTIVE_DELIVERY_SECONDS = 60 * 60
+RETROSPECTIVE_CHASE_ATTEMPTS = 2
+# How far back the scheduled leg reconciles pending retrospectives on CLOSED
+# pull requests.  Closure inside a delivery window is a normal outcome — the
+# retrospective is testimony and gates nothing, so the exhaustion gate leaves
+# the close to a human — and the open-PR enumeration cannot see it afterwards.
+# Both windows sit within ~2h of the request, so this is not sized for the
+# work: it is sized for the schedule, which GitHub throttles to a fire every
+# ten hours or so under load, and which must still find the row when it runs.
+RETROSPECTIVE_CLOSED_SWEEP_HOURS = 48
 EXHAUSTED_MARKER_PREFIX = "<!-- weave-review-loop:exhausted:"
 NUDGE_MARKER_PREFIX = "<!-- weave-review-loop:nudge:"
 REDELIVERY_MARKER_PREFIX = "<!-- weave-review-loop:redelivered:"
@@ -78,6 +128,58 @@ EXHAUSTED_MARKER_RE = re.compile(
 )
 PRODUCT_GATE_MARKER_PREFIX = "<!-- weave-review-loop:product-gate:"
 NOISE_MARKER_PREFIX = "<!-- weave-review-loop:noise:"
+HOLD_MARKER_PREFIX = "<!-- weave-review-loop:hold:"
+# The head-disposition family: a trusted, once-per-head record that a seat
+# stopped deliberately and left HEAD unchanged.  All three have the same
+# shape, the same trust rule and the same meaning to the scheduled leg — the
+# head's stillness is a decision, not a stall — so they are one reader over
+# this table rather than one predicate each.  A fourth disposition is an entry
+# here; it is not a fourth branch in ``_scan_open_pull`` (KRA-1326).
+HEAD_DISPOSITION_PREFIXES: dict[str, str] = {
+    "product-gate": PRODUCT_GATE_MARKER_PREFIX,
+    "noise": NOISE_MARKER_PREFIX,
+    "hold": HOLD_MARKER_PREFIX,
+}
+# The retrospective's own three markers.
+#
+# ``retrospective:`` is the only one the loop does not write: Theoros ends his
+# verdict comment with it, and the loop reads it as the delivery receipt.  Its
+# version is ``v1`` rather than MARKER_SCHEMA_VERSION because verdict files
+# already carry that form (sokrates#1113); the reader accepts any ``v<n>:`` and
+# the unversioned form, so a later bump needs no second reader.  It also accepts
+# an abbreviated head of seven hex or more, because the cost of misreading a
+# delivered verdict as missing is a wake and a PR line accusing a seat of
+# silence it is not guilty of.  Unlike every other marker here it is trusted
+# from ANY author: the retrospective is testimony a seat posts under its own
+# credential, and there is no configured retrospective identity to check.
+RETROSPECTIVE_MARKER_PREFIX = "<!-- weave-review-loop:retrospective:"
+RETROSPECTIVE_MARKER_VERSION = "v1"
+RETROSPECTIVE_MARKER_RE = re.compile(
+    r"<!-- weave-review-loop:retrospective:(?:v\d+:)?([0-9a-fA-F]{7,40}) -->"
+)
+# ``retrospective-wake:`` records that a retrospective was ASKED FOR at this
+# head.  Without it the chase leg cannot tell an undelivered verdict from one
+# nobody ever requested — the scheduled exhaustion path posts a gate and wakes
+# nobody, and chasing that head would invent an obligation.
+RETROSPECTIVE_WAKE_MARKER_PREFIX = "<!-- weave-review-loop:retrospective-wake:"
+# ``retrospective-chase:`` is the durable attempt counter.  Comments are the
+# loop's only durable state, so the attempt bound has to live in one.
+RETROSPECTIVE_CHASE_MARKER_PREFIX = "<!-- weave-review-loop:retrospective-chase:"
+# Every reader in this family accepts ``v<n>:`` rather than the one version its
+# writer currently emits.  The writers below derive their version from
+# MARKER_SCHEMA_VERSION, so a reader pinned to today's value stops recognising
+# its own output the moment that constant advances — and each of the three
+# markers fails a different way when it does.  Unread attempt counters read as
+# zero and the bound is gone; an unread request receipt reads as "nobody asked"
+# and the chase silently never fires; an unread chase timestamp reads as undated
+# and the escalation stops.  A version bump means the marker's *shape* changed,
+# and a shape change these patterns still match is one they can still read
+# correctly, so accepting every version is the reading that follows the writer.
+_RETROSPECTIVE_MARKER_VERSION_RE = r"v\d+:"
+RETROSPECTIVE_CHASE_MARKER_RE = re.compile(
+    r"<!-- weave-review-loop:retrospective-chase:"
+    rf"{_RETROSPECTIVE_MARKER_VERSION_RE}([^:\s]+):attempt=(\d+) -->"
+)
 SUBSTITUTE_SUMMON_MARKER_PREFIX = "<!-- weave-review-loop:substitute-summon:"
 SUBSTITUTE_VERDICT_MARKER_PREFIX = "<!-- weave-review-loop:substitute-verdict:"
 # head : actor : clean | findings:<p1>:<p2>:<p3>.  The marker — not the prose
@@ -105,34 +207,39 @@ DEFAULT_SUBSTITUTE_ACTOR = "theoros"
 # so a recast — e.g. 2026-08-18, Talos reviews and Theoros burns while
 # Ariadne's usage is out — is a `gh variable set`, never a code sync.
 DEFAULT_BURN_ACTOR = "talos"
+# The retrospective seat is not cast the way the find half and burn twin are:
+# the exhaustion retrospective is Theoros's charter (KRA-1029), not a role a
+# repository fills.  One constant so the wake and the chase that follows it
+# cannot address different seats.
+RETROSPECTIVE_ACTOR = "theoros"
 FINDING_IDENTITY_MAX = 96
 _IDENTITY_NOISE = re.compile(
     r"</?sub>|!\[[^\]]*\]\([^)]*\)|\[P[123]-[A-Za-z]+\]|\*{1,2}|_{1,2}"
 )
 UNRESOLVED_CLEAN_PREFIX = "unresolved-clean:"
-CODEX_CLEAN_COMMENT_PREFIX = "Codex Review: Didn't find any major issues."
-CODEX_RESULT_HEADING = "## Review Result"
-CODEX_RESULT_CLEAN_PHRASE = "no blocking findings"
-# A lone period or bang ends a sentence.  Ellipsis is continuation — the
-# prefix check `tail[0] in ".!"` treated the first dot of "..." as a stop.
-_SENTENCE_END = re.compile(r"(?<!\.)\.(?!\.)|!")
+# The clean-verdict literals and predicate are NOT declared here, and neither
+# are the patterns that read a clean verdict's declared head.  They arrive in
+# the vendored ``weave_reviewkit.verdicts`` region below, which is the single
+# home for what "Codex said this head is clean" means (KRA-1222) — including
+# which head it said it about.
 CODEX_TASK_REPORT_HEADING = "### Summary"
 CODEX_CONNECTOR_ERROR_PREFIX = "To use Codex here"
-REVIEWED_COMMIT_PATTERN = re.compile(
-    r"\*\*Reviewed commit:\*\*\s*`([0-9a-fA-F]{7,40})`"
-)
-# Codex anchors every claim in a task-channel verdict to a file permalink at the
-# exact tree it read.  ``commit``/``pull`` links are deliberately excluded: they
-# reference a commit under discussion, not the tree the verdict was formed on.
-PERMALINK_COMMIT_PATTERN = re.compile(
-    r"https://github\.com/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/(?:blob|blame)/([0-9a-fA-F]{40})/"
-)
 CODEX_COMMENT_CLEAN = "clean"
 CODEX_COMMENT_TASK_VERDICT = "task-verdict"
 CODEX_COMMENT_TASK_REPORT = "task-report"
 CODEX_COMMENT_CONNECTOR_ERROR = "connector-error"
 CODEX_COMMENT_QUOTA_REFUSAL = "quota-refusal"
 CODEX_COMMENT_UNKNOWN = "unknown"
+# KRA-1074 A1: the composed boundary is the merge authority for a seat-authored
+# PR, and Hákon's word is retrospective (KRA-1083's digest). There is no label
+# to consult and no prospective word to wait for, so every wake states the one
+# regime rather than branching on a grant that no longer exists.
+MERGE_REGIME = (
+    "Merge authority: the composed boundary itself — this exact head "
+    "review-closed, required checks green, no conflicts. No label and no "
+    "prospective word gates it; Hákon's veto is retrospective, and the "
+    "machine-merge digest carries the merge to him."
+)
 # Sentinel: ``find_half_route`` / ``_scan_open_pull`` fetch the meter themselves
 # unless the scheduled scan supplies the one reading it already took.
 _FETCH_METER = object()
@@ -143,6 +250,63 @@ SEAT_ACTORS = {
     "Talos": "talos",
     "Theoros": "theoros",
 }
+# A repository may map extra git author names onto a seat that shepherds
+# them (``REVIEW_AUTHOR_ALIASES="Some Author=fable"``). Two cases force
+# this: a model that is not a seat writes the code (commits land under a
+# human identity), and GitHub's "Update branch" writes a merge commit
+# under the clicker's git name, so HEAD is no longer a seat and the
+# scan's seat gate returns ``(0, 0, 0)`` in silence. An alias names who
+# receives the wake; it never invents a new seat.
+#
+# A git author name is unauthenticated metadata that anyone can set, so
+# an alias is honoured ONLY when the PR head lives in the base
+# repository — a branch only collaborators can push. Without that fence
+# a stranger's fork PR against a public repo could spell the aliased
+# name into a commit and help itself to the reviewer budget.
+AUTHOR_ALIASES_ENV = "REVIEW_AUTHOR_ALIASES"
+# The roster of seats this script can route a wake to, and the accept-set an
+# alias destination is checked against. The actor grammar is a *transport*
+# constraint: it decides whether a token can ride a WAKE envelope and a
+# verdict marker, not whether anyone answers it. ``Someone=ghost`` satisfies
+# the grammar, so grammar alone leaves the "never invents a new seat" promise
+# above unenforced — the alias admits that author's head into the loop,
+# spends a review on it, then dead-letters ``WAKE: ghost``.
+#
+# The three role casts (``REVIEW_SUBSTITUTE_ACTOR`` / ``REVIEW_BURN_ACTOR`` /
+# ``SKILL_AUDIT_ACTOR``) deliberately stay grammar-only. They name a seat by
+# ROLE, and a seat that reviews or burns need not author anything, so it need
+# not appear in ``SEAT_ACTORS`` — which is an authorship map. An alias is the
+# one configuration whose destination is by definition an already-known seat.
+KNOWN_SEAT_ACTORS = frozenset(SEAT_ACTORS.values())
+# Skill documents are exempt from the review loop (Hákon's ruling,
+# 2026-08-21): per-PR prose review of a skill never converges — wd#117 and
+# wd#119 each burned the full seven-round bound on oscillating P2 prose
+# findings — so skills get the weekly one-pass audit (`skill-audit` command)
+# instead of Codex rounds. A PR is exempt only when EVERY touched path,
+# including a rename's old name, sits under one of these corpus roots.
+#
+# These three roots serve the audit sweep alone. The loop exemption is wider
+# (Hákon's ruling, 2026-09-03): recipe YAML and law primitives are corpora
+# of the same kind, each with a mechanical CI gate that is its whole quality
+# bar, and their roots are repository-specific — so the adopting repo names
+# them in ``REVIEW_LOOP_EXEMPT_PATHS`` (see ``loop_exempt_prefixes``) and
+# the shared helper never hard-codes one repo's layout. The weekly audit is
+# a prose pass and never sweeps those extra roots.
+SKILL_PATH_PREFIXES = ("skills/", ".agents/skills/", ".claude/skills/")
+EXEMPT_PATHS_ENV = "REVIEW_LOOP_EXEMPT_PATHS"
+# When the declared roots took effect, as an ISO-8601 instant. The workflow
+# leaves it unset and the terminal legs read the variable's ``updated_at``
+# instead; the offline backfill sets it because it resolves the declaration
+# per repository and must not have the helper re-read one it already dated.
+EXEMPT_PATHS_SINCE_ENV = "REVIEW_LOOP_EXEMPT_PATHS_SINCE"
+DEFAULT_SKILL_AUDIT_ACTOR = "theoros"
+SKILL_AUDIT_WINDOW_DAYS = 7
+# How far back the scheduled terminal sweep looks for fork closures the
+# ``pull_request`` event could not export.  Wider than any plausible schedule
+# gap on purpose: re-emitting a closure already exported is free (the span
+# carries the closure's own id and every query groups on it), while missing one
+# is a permanent hole in the distribution.
+BELT_SWEEP_WINDOW_HOURS = 168
 
 
 def required_env(name: str) -> str:
@@ -343,7 +507,581 @@ def publication_commit_message(chunk_count: int, header: str) -> str:
     )
 
 
-def post_threaded_messages(slack: SlackApi, messages: Sequence[str]) -> None:
+# ---------------------------------------------------------------------------
+# Belt telemetry.
+#
+# The belt is a governed actor: its identity is its span (INV-13).  Export is
+# OTLP/HTTP JSON straight to Logfire so the helper keeps the zero-dependency
+# property every adopting repository relies on.  Telemetry is strictly
+# subordinate to routing: a failed export prints one bounded diagnostic and the
+# wake still goes out.
+# ---------------------------------------------------------------------------
+
+# Logfire write tokens are region-scoped and carry their region in the token
+# itself.  Posting a token's spans to the other region is a 401 that fail-open
+# telemetry can only whisper about on stderr, so read the region off the
+# credential rather than making every adopting repository configure it — and
+# refuse a region this map does not know rather than guessing one, because a
+# guess is exactly that silent 401 with the diagnostic spent on the wrong host.
+LOGFIRE_REGION_RE = re.compile(r"^pylf_v\d+_(?P<region>[a-z]+)_")
+LOGFIRE_REGION_URLS = {
+    "us": "https://logfire-us.pydantic.dev",
+    "eu": "https://logfire-eu.pydantic.dev",
+}
+BELT_SERVICE_NAME = "review-loop"
+TELEMETRY_TIMEOUT_SECONDS = 5
+OTLP_STATUS_OK = 1
+OTLP_STATUS_ERROR = 2
+
+
+def script_fingerprint() -> str:
+    """Identify this vendored copy of the helper.
+
+    Adopting repositories carry their own copy of this file, so a belt-health
+    dashboard cannot assume one version.  The digest of the running source is
+    the only identifier that cannot drift from what actually ran.
+    """
+    try:
+        with open(__file__, "rb") as source:
+            return hashlib.sha256(source.read()).hexdigest()[:12]
+    except OSError:
+        return "unknown"
+
+
+def logfire_base_url(token: str) -> str:
+    """The ingest host this write token belongs to; ``""`` when unsupported.
+
+    A token whose region this map does not resolve — an unreadable shape, or a
+    region Logfire added after this helper was vendored — has no host that can
+    accept it.  Naming one anyway sends every span to a host that answers 401,
+    so the empty string is the honest answer and the caller refuses.
+    """
+    match = LOGFIRE_REGION_RE.match(token)
+    if match is None:
+        return ""
+    return LOGFIRE_REGION_URLS.get(match.group("region"), "")
+
+
+def otlp_any_value(value: Any) -> dict[str, Any] | None:
+    """Encode one attribute value; ``None`` means "not measured", never null."""
+    if isinstance(value, bool):
+        return {"boolValue": value}
+    if isinstance(value, int):
+        return {"intValue": str(value)}
+    if isinstance(value, float):
+        return {"doubleValue": value}
+    if isinstance(value, str):
+        return {"stringValue": value}
+    if isinstance(value, (list, tuple)):
+        encoded = [otlp_any_value(item) for item in value]
+        return {
+            "arrayValue": {"values": [item for item in encoded if item is not None]}
+        }
+    return None
+
+
+def otlp_attributes(attributes: Mapping[str, Any]) -> list[dict[str, Any]]:
+    encoded: list[dict[str, Any]] = []
+    for key, value in attributes.items():
+        any_value = otlp_any_value(value)
+        if any_value is not None:
+            encoded.append({"key": key, "value": any_value})
+    return encoded
+
+
+def post_otlp_json(url: str, payload: bytes, headers: Mapping[str, str]) -> None:
+    request = urllib.request.Request(
+        url, data=payload, headers=dict(headers), method="POST"
+    )
+    with urllib.request.urlopen(request, timeout=TELEMETRY_TIMEOUT_SECONDS):
+        return
+
+
+class BeltSpan:
+    """One belt decision, recorded as an OTLP span."""
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        trace_id: str,
+        span_id: str,
+        parent_span_id: str,
+        attributes: Mapping[str, Any],
+        start_ns: int,
+    ) -> None:
+        self.name = name
+        self.trace_id = trace_id
+        self.span_id = span_id
+        self.parent_span_id = parent_span_id
+        self.attributes: dict[str, Any] = dict(attributes)
+        self.start_ns = start_ns
+        self.end_ns = start_ns
+        self.status_code = OTLP_STATUS_OK
+        self.status_message = ""
+
+    def set(self, **attributes: Any) -> None:
+        self.attributes.update(attributes)
+
+    def fail(self, error: BaseException) -> None:
+        # Bounded, type-led text: belt errors are already scrubbed of response
+        # bodies, and telemetry must not become a second leak channel.
+        self.status_code = OTLP_STATUS_ERROR
+        self.status_message = f"{type(error).__name__}: {error}"[:200]
+
+    def to_otlp(self) -> dict[str, Any]:
+        span: dict[str, Any] = {
+            "traceId": self.trace_id,
+            "spanId": self.span_id,
+            "name": self.name,
+            "kind": 1,
+            "startTimeUnixNano": str(self.start_ns),
+            "endTimeUnixNano": str(self.end_ns),
+            "attributes": otlp_attributes(
+                {
+                    "logfire.msg": str(self.attributes.get("logfire.msg", self.name)),
+                    "logfire.span_type": "span",
+                    **self.attributes,
+                }
+            ),
+            "status": {"code": self.status_code},
+        }
+        if self.status_message:
+            span["status"]["message"] = self.status_message
+        if self.parent_span_id:
+            span["parentSpanId"] = self.parent_span_id
+        return span
+
+
+class BeltTelemetry:
+    """Collect belt spans for one hook invocation and export them once.
+
+    Every public method is fail-open.  Routing wakes are the belt's job;
+    telemetry is evidence about that job and never gates it.  Failures stay
+    visible on stderr (R-3) instead of being swallowed silently.
+    """
+
+    def __init__(
+        self,
+        *,
+        token: str = "",
+        endpoint: str = "",
+        repository: str = "",
+        command: str = "",
+        run_id: str = "",
+        transport: Any = None,
+    ) -> None:
+        self.token = token
+        self.endpoint = endpoint
+        self.repository = repository
+        self.command = command
+        self.run_id = run_id
+        self.transport = transport or post_otlp_json
+        self.trace_id = os.urandom(16).hex()
+        self.spans: list[BeltSpan] = []
+        self._open_span_ids: list[str] = []
+
+    @classmethod
+    def from_env(cls, command: str, *, transport: Any = None) -> BeltTelemetry:
+        token = os.environ.get("LOGFIRE_TOKEN", "").strip()
+        # An explicit base URL still wins: a proxy or a self-hosted collector
+        # is a deployment choice the token cannot describe.
+        base_url = os.environ.get("LOGFIRE_BASE_URL", "").strip().rstrip("/")
+        if token and not base_url:
+            base_url = logfire_base_url(token)
+            if not base_url:
+                print(
+                    "belt telemetry disabled: LOGFIRE_TOKEN names no supported "
+                    f"ingest region (known: {', '.join(sorted(LOGFIRE_REGION_URLS))}); "
+                    "set LOGFIRE_BASE_URL to export it.",
+                    file=sys.stderr,
+                )
+                token = ""
+        return cls(
+            token=token,
+            endpoint=f"{base_url}/v1/traces" if base_url else "",
+            repository=os.environ.get("GITHUB_REPOSITORY", ""),
+            command=command,
+            run_id=os.environ.get("GITHUB_RUN_ID", ""),
+            transport=transport,
+        )
+
+    @classmethod
+    def disabled(cls) -> BeltTelemetry:
+        """A telemetry object with no token: collects nothing, exports nothing."""
+        return cls()
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.token)
+
+    def _record(
+        self, name: str, attributes: Mapping[str, Any], *, start_ns: int
+    ) -> BeltSpan:
+        return BeltSpan(
+            name,
+            trace_id=self.trace_id,
+            span_id=os.urandom(8).hex(),
+            parent_span_id=self._open_span_ids[-1] if self._open_span_ids else "",
+            attributes={"repository": self.repository, **attributes},
+            start_ns=start_ns,
+        )
+
+    @contextmanager
+    def span(self, name: str, **attributes: Any) -> Iterator[BeltSpan]:
+        """Open a timed span; the body's exceptions are recorded and re-raised."""
+        record = self._record(name, attributes, start_ns=time.time_ns())
+        self._open_span_ids.append(record.span_id)
+        try:
+            yield record
+        except BaseException as error:
+            record.fail(error)
+            raise
+        finally:
+            self._open_span_ids.pop()
+            record.end_ns = time.time_ns()
+            self.spans.append(record)
+
+    def event(self, name: str, **attributes: Any) -> BeltSpan:
+        """Record one belt decision as a point span under the current span."""
+        record = self._record(name, attributes, start_ns=time.time_ns())
+        self.spans.append(record)
+        return record
+
+    def head_commit_age_seconds(self, github: GitHubApi, head_sha: str) -> float | None:
+        """Seconds between the head COMMIT's own date and now, or ``None``.
+
+        Named for what it measures.  ``commit_time`` reads the committer/author
+        date written by the client, not a server-observed push: a force-reset
+        to an older commit, a cherry-pick with preserved timestamps, or a
+        skewed clock all make this larger, smaller, or negative relative to
+        routing latency, so it must never be read as one.
+
+        Telemetry-only: this is the one attribute the belt does not already
+        hold, so the lookup happens only when telemetry is enabled and any
+        failure yields an absent measurement rather than a failed route.
+        """
+        if not self.enabled:
+            return None
+        try:
+            commit = github.get(f"commits/{head_sha}")
+            if not isinstance(commit, Mapping):
+                return None
+            now = datetime.now(timezone.utc)
+            committed_at = commit_time(commit, now.isoformat())
+            return (now - committed_at).total_seconds()
+        except Exception as error:  # noqa: BLE001 - a measurement never fails a route.
+            print(f"belt telemetry head age unavailable: {error}", file=sys.stderr)
+            return None
+
+    def envelope(self, spans: Sequence[BeltSpan]) -> dict[str, Any]:
+        return {
+            "resourceSpans": [
+                {
+                    "resource": {
+                        "attributes": otlp_attributes(
+                            {
+                                "service.name": BELT_SERVICE_NAME,
+                                "service.version": script_fingerprint(),
+                            }
+                        )
+                    },
+                    "scopeSpans": [
+                        {
+                            "scope": {"name": BELT_SERVICE_NAME},
+                            "spans": [span.to_otlp() for span in spans],
+                        }
+                    ],
+                }
+            ]
+        }
+
+    def flush(self) -> None:
+        """Export this invocation's spans once.  Never raises."""
+        spans, self.spans = self.spans, []
+        if not self.enabled or not spans:
+            return
+        try:
+            self.transport(
+                self.endpoint,
+                json.dumps(self.envelope(spans)).encode(),
+                {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.token}",
+                    "User-Agent": "weave-doctrine-review-loop",
+                },
+            )
+        except Exception as error:  # noqa: BLE001 - telemetry never fails the belt.
+            print(
+                f"belt telemetry export failed: {type(error).__name__}: {error}",
+                file=sys.stderr,
+            )
+
+
+_TELEMETRY = BeltTelemetry.disabled()
+
+
+def belt() -> BeltTelemetry:
+    """This invocation's telemetry sink; disabled until ``main`` installs one."""
+    return _TELEMETRY
+
+
+def install_belt_telemetry(telemetry: BeltTelemetry) -> BeltTelemetry:
+    """Install the sink for this process: one hook run, one trace."""
+    global _TELEMETRY
+    _TELEMETRY = telemetry
+    return telemetry
+
+
+def verdict_event_time(raw: Any) -> str:
+    """The SOURCE event's own instant, as a sortable UTC string.
+
+    Export time is not verdict time.  A rerun of an older findings workflow
+    publishes its span *after* a newer CLEAN already landed on the same
+    unchanged head, so a query that orders by ``start_timestamp`` reads the
+    superseded verdict as the head's latest and reports findings for a round
+    the belt closed.  This is the key the dashboard's per-head reduction orders
+    on, so it comes from the review or comment that produced the verdict.
+
+    An event with no usable timestamp yields ``""`` rather than a floor value:
+    a sentinel instant would sort as a real one, and an empty string is
+    readable as the absence it is (it sorts last under ``desc``).
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return ""
+    try:
+        parsed = parse_github_time(raw.strip())
+    except ValueError:
+        return ""
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return (
+        parsed.astimezone(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def belt_verdict(
+    *,
+    pr_number: int,
+    head_sha: str,
+    verdict_kind: str,
+    decision: str,
+    source_event_at: Any,
+    review_round: int,
+    rounds_consumed: int,
+    counts: Mapping[str, int] | None = None,
+    findings: Sequence[Mapping[str, Any]] = (),
+    author_seat: str = "",
+    review_state: str = "",
+    base_ref: str = "",
+    base_sha: str = "",
+    chunks: int | None = None,
+    head_commit_age: float | None = None,
+    substitute: str = "",
+) -> None:
+    """Record one round of the belt: the row a convergence query reads.
+
+    Round-level attributes are the whole point of the instrument — a PR's
+    rounds-to-CLEAN, its severity mix per round, and whether the same finding
+    locations keep coming back are all one query over these spans.
+
+    ``source_event_at`` is the raw GitHub timestamp of the review or comment
+    this verdict was read from.  It is required, not defaulted: a call site
+    that cannot name its source event cannot be ordered against a competing
+    verdict on the same head, and a silent default would publish export time
+    under a name that promises otherwise.
+    """
+    counts = counts or {"p1": 0, "p2": 0, "p3": 0, "total": 0}
+    belt().event(
+        "belt.verdict",
+        **{
+            "logfire.msg": (
+                f"#{pr_number} round {review_round}/{MAX_REVIEW_ROUNDS}: "
+                f"{verdict_kind} -> {decision}"
+            ),
+            "pull_request": pr_number,
+            "head_sha": head_sha,
+            "verdict_kind": verdict_kind,
+            "decision": decision,
+            # The source event's time, not the export's: what orders two
+            # verdicts on one unchanged head.  See ``verdict_event_time``.
+            "verdict_at": verdict_event_time(source_event_at),
+            "round": review_round,
+            "rounds_consumed": rounds_consumed,
+            "max_review_rounds": MAX_REVIEW_ROUNDS,
+            "findings_total": counts["total"],
+            "findings_p1": counts["p1"],
+            "findings_p2": counts["p2"],
+            "findings_p3": counts["p3"],
+            # Bounded: a round with hundreds of findings must not turn one
+            # span into a megabyte of payload.  The count above stays exact.
+            "finding_locations": [
+                history_location(finding) for finding in findings[:FINDING_SPAN_BUDGET]
+            ],
+            "author_seat": author_seat,
+            "review_state": review_state,
+            "base_ref": base_ref,
+            "base_sha": base_sha,
+            "wake_chunks": chunks,
+            "head_commit_age_seconds": head_commit_age,
+            "substitute_actor": substitute,
+        },
+    )
+
+
+def belt_ignored(reason: str, **attributes: Any) -> None:
+    """Record a route that ended without a wake, and why."""
+    belt().event(
+        "belt.route.ignored",
+        **{"logfire.msg": f"route ignored: {reason}", "reason": reason, **attributes},
+    )
+
+
+def publishable_at_head(
+    github: GitHubApi,
+    pr_number: int,
+    head_sha: str,
+    repository: str,
+    *,
+    decision: str,
+) -> bool:
+    """Decide liveness at the publication itself, not at the route's first read.
+
+    ``refresh_pr_at_head`` at the top of a route returns a snapshot, and the
+    route then spends more round trips before it posts anything — the
+    head-base pin, the stale-base and retarget probes, the head-commit age.
+    A PR that merges inside that window is open at the route's read and merged
+    at the publish, so the route-top read cannot be the only liveness
+    decision: it has to be repeated at the boundary it protects.  That is the
+    same argument that put liveness in the chokepoint rather than in per-path
+    guards (KRA-1226) — applied to *where* the chokepoint is called from.
+
+    This narrows the window to one HTTP round trip; it does not close it.  A
+    merge landing between this read and the post still publishes, and no
+    check-then-act over a resource this process does not hold can do better.
+    """
+    return (
+        refresh_pr_at_head(
+            github,
+            pr_number,
+            head_sha,
+            repository,
+            action=f"{decision} publication",
+            on_ignored=lambda reason: belt_ignored(
+                reason,
+                pull_request=pr_number,
+                head_sha=head_sha,
+                decision=decision,
+            ),
+        )
+        is not None
+    )
+
+
+class PublicationWithheld(Exception):
+    """The boundary refused between a wake's first Slack post and its dispatch.
+
+    A multi-message wake dispatches a seat only with its final addressed
+    message, so its check-to-publish window is the whole run of Slack requests
+    before that message rather than one HTTP round trip.  Re-deciding liveness
+    there can refuse *after* the inert root and the evidence chunks are
+    already posted, and that is not a delivery failure: nothing was
+    dispatched, the refusal is already recorded as ``belt.route.ignored``, and
+    the run must not redden.
+
+    Raised rather than returned so that a publication path which does not
+    handle it fails visibly (R-3) instead of reporting a wake it never sent.
+    """
+
+
+def deliver_wake(
+    post: Callable[[], Any],
+    *,
+    github: GitHubApi,
+    repository: str,
+    pr_number: int,
+    head_sha: str,
+    decision: str,
+    chunks: int | None = None,
+) -> bool:
+    """Publish an already-recorded verdict's wake, and record what delivery did.
+
+    This is the publication boundary for every wake the routes send, so it is
+    where liveness is re-decided: ``github`` and ``repository`` are required,
+    not optional, because a caller allowed to omit them is a path with no
+    guard — the shape KRA-1226 deleted.  Returns whether the wake was posted;
+    a refusal records ``belt.route.ignored`` with the chokepoint's reason and
+    posts nothing.
+
+    A ``post`` that runs the multi-message protocol carries a second boundary
+    of its own and raises ``PublicationWithheld`` when it refuses there; that
+    is the same refusal one HTTP hop later, so it answers ``False`` and
+    records no delivery.
+
+    The verdict and its delivery are two facts, and only the second one is
+    transported.  Recording them together makes a Slack outage delete the
+    first: the belt observed a Codex result, classified it, and acted on it,
+    and a convergence query would read a round that never happened.  So every
+    caller records ``belt.verdict`` (and, at the bound, ``belt.exhaustion``)
+    *before* calling this, and this span carries delivery alone.
+
+    Worse at the bound, which is why the ordering is not cosmetic: the gate
+    comment is durable and posted first, so a later scheduled scan sees the
+    existing gate and returns early — without a manual rerun those spans are
+    never reconstructed, and the exhaustion is invisible forever.
+
+    Re-raises (R-3): a failed wake must still redden the run.  What it must
+    not do is take the observation down with it.
+    """
+    if not publishable_at_head(
+        github, pr_number, head_sha, repository, decision=decision
+    ):
+        return False
+    try:
+        post()
+    except PublicationWithheld:
+        return False
+    except Exception as error:
+        belt().event(
+            "belt.delivery",
+            **{
+                "logfire.msg": f"#{pr_number} {decision}: delivery FAILED",
+                "pull_request": pr_number,
+                "head_sha": head_sha,
+                "decision": decision,
+                "delivered": False,
+                "delivery_error": f"{type(error).__name__}: {error}",
+                "wake_chunks": chunks,
+            },
+        )
+        raise
+    belt().event(
+        "belt.delivery",
+        **{
+            "logfire.msg": f"#{pr_number} {decision}: delivered",
+            "pull_request": pr_number,
+            "head_sha": head_sha,
+            "decision": decision,
+            "delivered": True,
+            "delivery_error": "",
+            "wake_chunks": chunks,
+        },
+    )
+    return True
+
+
+def post_threaded_messages(
+    slack: SlackApi,
+    messages: Sequence[str],
+    *,
+    github: GitHubApi,
+    repository: str,
+    pr_number: int,
+    head_sha: str,
+    decision: str,
+) -> None:
     """Publish a wake atomically: evidence first, the addressed WAKE last.
 
     Hive binds a seat to the thread of a WAKE delivery, and it can claim the
@@ -356,18 +1094,127 @@ def post_threaded_messages(slack: SlackApi, messages: Sequence[str]) -> None:
     neutralized, and only after all of them succeed a final small addressed
     message carrying the envelope and the belt subject.  Any earlier post
     failing raises out (R-3) and no WAKE is ever published.
+
+    That final message is the dispatch, so liveness is re-decided immediately
+    before it.  A single-message wake already has that property — its one post
+    sits directly after its caller's own check — while a chunked wake spends
+    one Slack request per chunk in between, so the caller's check protects the
+    root and this one protects the dispatch.  On refusal the chunks stay
+    posted and inert, no seat is dispatched, and ``PublicationWithheld`` says
+    so.  The liveness arguments are required for the reason ``deliver_wake``'s
+    are: a caller allowed to omit them is a publication with no guard.
     """
     if not messages:
         return
     if len(messages) == 1:
         slack.post_message(messages[0])
         return
-    envelope = wake_envelope_line(messages[0])
-    thread_ts = slack.post_message(evidence_root_notice(envelope, len(messages)))
-    for message in messages:
-        slack.post_message(neutralize_wake_lines(message), thread_ts=thread_ts)
+    thread_ts = _post_inert_evidence(
+        slack,
+        messages,
+        root_notice=evidence_root_notice(
+            wake_envelope_line(messages[0]), len(messages)
+        ),
+    )
+    if not publishable_at_head(
+        github, pr_number, head_sha, repository, decision=decision
+    ):
+        print(
+            f"withheld the addressed {decision} for {repository}#{pr_number} "
+            f"(head={head_sha}): {len(messages)} evidence chunk(s) are posted "
+            "and inert, and no seat was dispatched"
+        )
+        raise PublicationWithheld(decision)
     slack.post_message(
         publication_commit_message(len(messages), messages[0]),
+        thread_ts=thread_ts,
+    )
+
+
+def _post_inert_evidence(
+    slack: SlackApi, messages: Sequence[str], *, root_notice: str
+) -> str:
+    """Post the thread root and every neutralized chunk; dispatch nothing.
+
+    Everything this posts is inert by construction: the root is a notice its
+    caller composes, and each chunk has its envelope lines neutralized, so no
+    seat is bound by any of it.  The addressed dispatch is assembled only by
+    ``publication_commit_message``, whose single call site is the wake path
+    above — that is what makes this helper safe to share rather than a second
+    publication path with no check.
+    """
+    thread_ts = slack.post_message(root_notice)
+    for message in messages:
+        slack.post_message(neutralize_wake_lines(message), thread_ts=thread_ts)
+    return thread_ts
+
+
+def digest_root_notice(subject: str, chunk_count: int) -> str:
+    """The inert thread root for a publication that dispatches nobody."""
+    return (
+        f"Review-loop: publishing the {subject} as {chunk_count} message(s) in "
+        "this thread. Nothing here dispatches a seat: this is a report, and "
+        "every routing envelope it quotes is inert."
+    )
+
+
+def digest_completion_notice(subject: str, chunk_count: int) -> str:
+    """The final message of a no-dispatch publication.
+
+    Deliberately *not* ``publication_commit_message``: that one carries the
+    wake's own instruction live, because for a wake the last message **is** the
+    dispatch.  A digest has no seat to dispatch, and its content is a merged
+    pull request's prose — which in this estate routinely quotes ``WAKE:`` and
+    ``NEXT`` lines — so reusing the commit point would let an informational
+    report bind a seat.  This says the report is complete and carries no
+    envelope of its own.
+    """
+    return (
+        f"The {subject} above is complete — {chunk_count} message(s) in this "
+        "thread. Report only: no seat is dispatched by any of them, and any "
+        "routing envelope quoted inside them is quoted inert."
+    )
+
+
+def post_threaded_digest_without_a_pull_subject(
+    slack: SlackApi, messages: Sequence[str], *, subject: str
+) -> None:
+    """The one publication with no pull request for the liveness rule to read.
+
+    ``post_threaded_messages`` requires its five liveness arguments because a
+    caller allowed to omit them is a publication with no guard.  The
+    machine-merge digest is not that caller: it reports a *window* of merges
+    across several repositories, so there is no single pull request it could be
+    live at, and the rule cannot be evaluated there at all rather than being
+    waived per path.  Enforcing it anyway deletes the leg — the same argument
+    that gives ``refresh_pr_at_head`` its one ``require_open=False`` waiver for
+    the retrospective chase, whose subject is likewise a dead PR.
+
+    This is one documented exception, not an escape hatch: the digest's
+    subjects are already merged, and nothing it posts routes a review round.
+    ``test_the_merge_digest_is_the_only_publication_without_a_pull_subject``
+    names any second caller that appears, in either script.
+
+    Every message it posts is neutralized, the single-message path included:
+    the content is authored prose from merged pull requests, so an envelope
+    line inside it is the digest's own to quote inert.  Liveness is what this
+    publication cannot check; inertness is what it must not skip.
+    """
+    if not messages:
+        return
+    if len(messages) == 1:
+        slack.post_message(neutralize_wake_lines(messages[0]))
+        return
+    thread_ts = _post_inert_evidence(
+        slack, messages, root_notice=digest_root_notice(subject, len(messages))
+    )
+    print(
+        f"published the {subject} as {len(messages)} chunk(s); it reports a "
+        "window of merges across repositories, so there is no pull request "
+        "for the liveness rule to read"
+    )
+    slack.post_message(
+        digest_completion_notice(subject, len(messages)),
         thread_ts=thread_ts,
     )
 
@@ -389,18 +1236,106 @@ def commit_author_name(commit: Mapping[str, Any]) -> str:
     return str(author.get("name") or "") if isinstance(author, Mapping) else ""
 
 
-def choose_author(names: Iterable[str], fallback: str = "") -> str:
+def author_aliases() -> Mapping[str, str]:
+    """Repository-configured ``git author name -> seat`` overlay.
+
+    Parsed from ``REVIEW_AUTHOR_ALIASES`` as ``Name=seat`` pairs. A value
+    that contains a newline is newline-separated (so a git author name
+    may contain a comma); a single-line value is comma-separated.
+
+    A destination is refused here, not discovered later as a
+    dead-lettered wake, on two counts: it must be able to carry a wake
+    (the actor grammar) *and* it must name a seat that exists
+    (``KNOWN_SEAT_ACTORS``). Grammar alone would let ``Someone=ghost``
+    admit that author's head into the loop and spend a review on it
+    before the wake fell on the floor.
+    """
+    raw = os.environ.get(AUTHOR_ALIASES_ENV, "").strip()
+    if not raw:
+        return {}
+    entries = raw.split("\n") if "\n" in raw else raw.split(",")
+    aliases: dict[str, str] = {}
+    for entry in entries:
+        entry = entry.strip()
+        if not entry:
+            continue
+        name, separator, seat = entry.partition("=")
+        name, seat = name.strip(), seat.strip()
+        if not separator or not name or not seat:
+            raise ValueError(
+                f"{AUTHOR_ALIASES_ENV} entry {entry!r} is not 'Author Name=seat'"
+            )
+        actor = normalize_substitute_actor(seat)
+        if actor is None:
+            raise ValueError(
+                f"{AUTHOR_ALIASES_ENV} maps {name!r} to {seat!r}, which is "
+                "outside the actor grammar [a-z0-9-]+ after normalization; "
+                "refusing to wake an unroutable seat"
+            )
+        if actor not in KNOWN_SEAT_ACTORS:
+            raise ValueError(
+                f"{AUTHOR_ALIASES_ENV} maps {name!r} to {seat!r}, which is "
+                "not a known seat "
+                f"({', '.join(sorted(KNOWN_SEAT_ACTORS))}); an alias names "
+                "who receives the wake, it never invents a seat"
+            )
+        aliases[name] = actor
+    return aliases
+
+
+def seat_map(*, same_repo: bool) -> Mapping[str, str]:
+    """The author-to-seat map in force for one PR.
+
+    ``same_repo=False`` (a fork head) sees the built-in seats only: an
+    alias is a repository-scoped grant, and a fork branch is writable by
+    anyone.
+    """
+    if not same_repo:
+        return SEAT_ACTORS
+    aliases = author_aliases()
+    if not aliases:
+        return SEAT_ACTORS
+    return {**SEAT_ACTORS, **aliases}
+
+
+def head_is_same_repo(pull_request: Mapping[str, Any]) -> bool:
+    """True when the PR head branch lives in the base repository itself.
+
+    Absence never reads as same-repo: a payload missing either side is
+    treated as a fork, which costs at most one unrouted wake and never
+    spends the reviewer budget on a branch a stranger controls.
+    """
+
+    def slug(side: str) -> str:
+        section = pull_request.get(side)
+        if not isinstance(section, Mapping):
+            return ""
+        repository = section.get("repo")
+        if not isinstance(repository, Mapping):
+            return ""
+        return str(repository.get("full_name") or "")
+
+    head, base = slug("head"), slug("base")
+    return bool(head) and bool(base) and head == base
+
+
+def choose_author(
+    names: Iterable[str],
+    fallback: str = "",
+    seats: Mapping[str, str] | None = None,
+) -> str:
     """Choose the original non-burn-seat committer, then the burn seat, then HEAD author.
 
     Burn commits land on the PR branch under the burn seat's identity; the
     wake must still address the seat whose judgment the PR carries.
     """
+    mapping = SEAT_ACTORS if seats is None else seats
     burn = burn_actor()
     first_burn = ""
     for name in names:
-        if name in SEAT_ACTORS and SEAT_ACTORS[name] != burn:
+        if name in mapping and mapping[name] != burn:
             return name
-        if name in SEAT_ACTORS and not first_burn:
+        if name in mapping and not first_burn:
             first_burn = name
     return first_burn or fallback
 
@@ -408,15 +1343,130 @@ def choose_author(names: Iterable[str], fallback: str = "") -> str:
 def author_for_pr(
     github: GitHubApi, pr_number: int, head_sha: str
 ) -> tuple[str, str] | None:
-    commits = github.paginate(f"pulls/{pr_number}/commits")
-    author = choose_author(commit_author_name(item) for item in commits)
-    if not author:
-        # A queued review can outlive its HEAD SHA after a force-push or fork
-        # deletion. Do not let a needless fallback lookup suppress a seat that
-        # the surviving PR commit list already identified.
-        author = commit_author_name(github.get(f"commits/{head_sha}"))
+    """Resolve the seat this PR's wakes address, or ``None`` for no seat.
+
+    Aliases are resolved lazily and only where they can change the
+    answer: a repository with no ``REVIEW_AUTHOR_ALIASES``, or a PR a
+    built-in non-burn seat already authored, makes exactly the API calls
+    it made before aliases existed. The PR-detail fetch that carries the
+    fork fence therefore lands only on the PRs an alias could newly
+    claim. Aliased non-burn authors beat a later burn commit — otherwise
+    a burn on an aliased PR would steal the wake.
+    """
+    names = [
+        commit_author_name(item)
+        for item in github.paginate(f"pulls/{pr_number}/commits")
+    ]
+    burn = burn_actor()
+    builtin = choose_author(names)
+    if builtin and SEAT_ACTORS[builtin] != burn:
+        return (builtin, SEAT_ACTORS[builtin])
+
+    aliases = author_aliases()
+    if aliases and head_is_same_repo(github.get(f"pulls/{pr_number}")):
+        seats = seat_map(same_repo=True)
+        aliased = choose_author(names, seats=seats)
+        if aliased and seats[aliased] != burn:
+            return (aliased, seats[aliased])
+        if not builtin:
+            head_author = commit_author_name(github.get(f"commits/{head_sha}"))
+            aliased = choose_author(
+                [*names, head_author], fallback=head_author, seats=seats
+            )
+            actor = seats.get(aliased)
+            return (aliased, actor) if actor else None
+        return (builtin, SEAT_ACTORS[builtin])
+
+    if builtin:
+        return (builtin, SEAT_ACTORS[builtin])
+    # A queued review can outlive its HEAD SHA after a force-push or fork
+    # deletion. Do not let a needless fallback lookup suppress a seat that
+    # the surviving PR commit list already identified.
+    author = commit_author_name(github.get(f"commits/{head_sha}"))
     actor = SEAT_ACTORS.get(author)
     return (author, actor) if actor else None
+
+
+def loop_exempt_prefixes() -> tuple[str, ...]:
+    """The corpus roots whose PRs skip the review loop in this repository.
+
+    The skill roots are fixed (ruling 2026-08-21). A repository adds the
+    roots of its other mechanically gated corpora — recipe YAML, law
+    primitives (ruling 2026-09-03) — through ``REVIEW_LOOP_EXEMPT_PATHS``,
+    comma-separated; unset or empty adds nothing. Every entry is normalised
+    to end in ``/`` so ``nomos/data`` cannot claim ``nomos/data-sources/``.
+    An absolute path or a ``.``/``..`` segment would exempt the whole tree,
+    so it is refused rather than honoured — a misdeclared root fails the job
+    loudly instead of silently widening the exemption.
+    """
+    extra: list[str] = []
+    for raw in os.environ.get(EXEMPT_PATHS_ENV, "").split(","):
+        entry = raw.strip()
+        if not entry:
+            continue
+        segments = entry.split("/")
+        if entry.startswith("/") or any(segment in (".", "..") for segment in segments):
+            raise ValueError(
+                f"{EXEMPT_PATHS_ENV} entry {entry!r} is not a relative corpus "
+                "root inside the repository; refusing to exempt beyond it"
+            )
+        extra.append(entry.rstrip("/") + "/")
+    return SKILL_PATH_PREFIXES + tuple(extra)
+
+
+def exempt_paths_declared_since(github: GitHubApi) -> datetime | None:
+    """The instant this repository's declared roots took effect; ``None`` if none.
+
+    The environment carries the roots but not their date.  ``REVIEW_LOOP_
+    EXEMPT_PATHS_SINCE`` supplies it when a caller has already resolved the
+    declaration (the offline backfill); otherwise the variable's own
+    ``updated_at`` is read — it moves on every edit, which errs toward dating
+    older closures before the declaration, the direction that hides nothing.
+    A declaration that cannot be dated raises: a terminal leg that guessed
+    the date would file a never-reviewed closure as exempt in silence.
+    """
+    if not os.environ.get(EXEMPT_PATHS_ENV, "").strip():
+        return None
+    stated = os.environ.get(EXEMPT_PATHS_SINCE_ENV, "").strip()
+    if stated:
+        return parse_github_time(stated)
+    variable = github.get(f"actions/variables/{EXEMPT_PATHS_ENV}")
+    if not isinstance(variable, Mapping):
+        raise TypeError(
+            f"GET actions/variables/{EXEMPT_PATHS_ENV} returned no variable"
+        )
+    stamp = str(variable.get("updated_at") or variable.get("created_at") or "")
+    if not stamp:
+        raise RuntimeError(f"{EXEMPT_PATHS_ENV} variable carries no updated_at")
+    return parse_github_time(stamp)
+
+
+def loop_exempt_pr(github: GitHubApi, pr_number: int, *, closed_at: str = "") -> bool:
+    """True when every file this PR touches sits under a loop-exempt root.
+
+    Renames contribute both names: a file moved out of (or into) a corpus
+    makes the PR mixed, and a mixed PR rides the review loop like any other.
+    An empty file list is not an exempt PR — exemption is never inferred from
+    absence.
+
+    ``closed_at`` dates the question: a closed PR is judged under the roots in
+    force when it closed, so a corpus declared after the closure does not
+    reach back and exempt a PR the belt routed for review.  The routing paths
+    ask about open PRs and pass nothing — today's declaration is the one in
+    force.
+    """
+    prefixes = loop_exempt_prefixes()
+    if closed_at and len(prefixes) > len(SKILL_PATH_PREFIXES):
+        since = exempt_paths_declared_since(github)
+        if since is not None and parse_github_time(closed_at) < since:
+            prefixes = SKILL_PATH_PREFIXES
+    paths: list[str] = []
+    for entry in github.paginate(f"pulls/{pr_number}/files"):
+        for key in ("filename", "previous_filename"):
+            value = entry.get(key)
+            if value:
+                paths.append(str(value))
+    return bool(paths) and all(path.startswith(prefixes) for path in paths)
 
 
 def is_quota_refusal_body(body: str) -> bool:
@@ -458,20 +1508,6 @@ def review_findings(
     return findings
 
 
-def severity_counts(findings: Sequence[Mapping[str, Any]]) -> dict[str, int]:
-    counts = {"p1": 0, "p2": 0, "p3": 0, "total": len(findings)}
-    for finding in findings:
-        body = str(finding.get("body") or "")
-        if re.search(r"P1-orange", body):
-            counts["p1"] += 1
-        elif re.search(r"P2-yellow", body):
-            counts["p2"] += 1
-        else:
-            # P3-tagged and unmarked inline comments both remain findings.
-            counts["p3"] += 1
-    return counts
-
-
 def codex_review_heads(
     reviews: Sequence[Mapping[str, Any]], codex_login: str
 ) -> list[str]:
@@ -489,11 +1525,71 @@ def codex_review_heads(
     return heads
 
 
+# The clean-verdict predicate, vendored byte-identical from
+# ``skills/code-review/scripts/src/weave_reviewkit/verdicts.py``.  This helper is
+# standard-library-only by law and is copied into adopters that never receive the
+# skill's package, so it cannot import the module -- and two independent readings
+# of the same Codex prose is the drift KRA-1222 closes.  Edit the module; the
+# gate ``test_the_vendored_verdict_predicate_is_byte_identical`` stays red until
+# this region matches it exactly.
+# --- BEGIN weave-review-loop:verdict-predicate ---
+# No formatter owns this region, in either home.  These are vendored bytes and
+# the two homes sit under different ruff line-length settings (88 at the
+# weave-doctrine root, 100 in this package), so any construct whose joined form
+# lands between the two widths would be split in one copy and joined in the
+# other, and byte identity would be unreachable.  Hand-formatted to 88.
+# fmt: off
+# The review connector's clean comment opens with this exact sentence and
+# declares its head in a ``**Reviewed commit:**`` footer.
+CODEX_CLEAN_COMMENT_PREFIX = "Codex Review: Didn't find any major issues."
+# A verdict heading, either spelling.  ``## Review Result`` is the shape the
+# task channel emitted through 2026-08; ``## Review verdict`` is the shape
+# observed on sokrates#1113, where two of them classified as ``unknown``, left
+# no marker on the PR, and let the scheduled leg nudge for a review that had
+# already been given -- two of seven bounded rounds spent re-asking an answered
+# question (KRA-1222).  The noun is matched case-insensitively; ``Review`` is
+# required, so a bare ``## Verdict`` is still not a verdict heading and
+# arbitrary chatter cannot be promoted by its heading alone.
+CODEX_VERDICT_HEADING_RE = re.compile(
+    r"^##[ \t]+Review[ \t]+(?:Result|verdict)\b", re.IGNORECASE
+)
+CODEX_RESULT_CLEAN_PHRASE = "no blocking findings"
+# The terse clean sentence the reviewkit's own lineage reader has always
+# accepted.  It is carried forward here so collapsing the copies loses no
+# coverage -- but as a whole opening sentence now, never as a substring.
+CODEX_TERSE_CLEAN_PHRASE = "no findings"
+# The clean sentence that carries its own head.  The SHA is part of the
+# assertion, so a verdict in this shape is an exact-head claim by construction
+# and ``task_verdict_clean_head`` binds it exactly as ``**Reviewed commit:**``
+# binds the other channel.  Backticks are optional: the peel below removes
+# emphasis and terminators but not code fencing.
+CODEX_EXACT_HEAD_CLEAN_RE = re.compile(
+    r"^no major issues found at exact head `?([0-9a-f]{40})`?$"
+)
+# The footer the review connector declares its reviewed head in.  The digits
+# are however many GitHub chose to display, so this yields a commit-ish and
+# never a head: expanding it is the caller's job, against whatever authority
+# the caller has.
+REVIEWED_COMMIT_PATTERN = re.compile(
+    r"\*\*Reviewed commit:\*\*\s*`([0-9a-fA-F]{7,40})`"
+)
+# Codex anchors every claim in a task-channel verdict to a file permalink at the
+# exact tree it read.  ``commit``/``pull`` links are deliberately excluded: they
+# reference a commit under discussion, not the tree the verdict was formed on.
+PERMALINK_COMMIT_PATTERN = re.compile(
+    r"https://github\.com/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)"
+    r"/(?:blob|blame)/([0-9a-fA-F]{40})/"
+)
+# A lone period or bang ends a sentence.  Ellipsis is continuation -- the
+# prefix check `tail[0] in ".!"` treated the first dot of "..." as a stop.
+_SENTENCE_END = re.compile(r"(?<!\.)\.(?!\.)|!")
+
+
 def _opening_sentence(statement: str) -> str:
     """First sentence of a verdict line.
 
     Ellipsis (``...`` / ``…``) continues the sentence; a lone ``.`` or ``!``
-    ends it.  Keying on this boundary — not on a prefix of the line — is what
+    ends it.  Keying on this boundary -- not on a prefix of the line -- is what
     keeps ``No blocking findings... yet`` from counting as a clean verdict.
     """
     normalized = statement.replace("…", "...")
@@ -503,39 +1599,200 @@ def _opening_sentence(statement: str) -> str:
     return normalized[: match.end()]
 
 
-def task_verdict_is_clean(body: str) -> bool:
-    """True only when the opening *sentence* is the clean assertion.
+def _asserted_sentence(statement: str) -> str:
+    """The opening sentence with emphasis and its terminator peeled off.
 
-    The verdict is the first sentence under ``## Review Result``, not a prefix
-    of that sentence.  ``No blocking findings could be ruled out.`` and
-    ``No blocking findings... yet`` share the clean phrase as an opening but
-    are different sentences; treating either as CLEAN would hand merge
-    authority to a verdict Codex withheld.
-
-    Every real task-channel verdict observed opens exactly
-    ``No blocking findings.`` before elaborating.
+    Closing emphasis markers and a real terminator may arrive in either order
+    (``**phrase**.`` vs ``**phrase.**``); peel both until stable.  Ellipsis is
+    continuation, never a stop, so it is never stripped -- a line that reduces
+    to the clean phrase only because its trailing dots were removed is a
+    withheld verdict, not a clean one.
     """
-    _, _, remainder = body.partition(CODEX_RESULT_HEADING)
+    opening = _opening_sentence(statement)
+    has_stop = _SENTENCE_END.search(opening) is not None
+    asserted = opening
+    while True:
+        nxt = asserted.rstrip("*_ ").strip()
+        if has_stop and not nxt.endswith("..."):
+            nxt = nxt.rstrip(".! ").strip()
+        if nxt == asserted:
+            return asserted
+        asserted = nxt
+
+
+def _verdict_statement(body: str) -> str | None:
+    """The verdict sentence beneath a verdict heading, lowered and unadorned.
+
+    ``None`` when the body does not open with a verdict heading at all; ``""``
+    when it does but says nothing under it.
+
+    The verdict is the first sentence on a line of its *own* beneath the
+    heading.  Text trailing the heading on the same line is heading, not
+    verdict: ``weave_reviewkit.report`` writes
+    ``## Review verdict — `initial` generation 2``, and reading that suffix as
+    the verdict would classify a substitute's report by its own metadata.
+    """
+    heading = CODEX_VERDICT_HEADING_RE.match(body)
+    if heading is None:
+        return None
+    _, _, remainder = body[heading.end() :].partition("\n")
     for line in remainder.splitlines():
         statement = line.strip().lstrip("*_->#").strip().lower()
-        if not statement:
-            continue
-        opening = _opening_sentence(statement)
-        # Emphasis is markup, not sentence structure.  Closing markers and a
-        # real terminator may arrive in either order (``**phrase**.`` vs
-        # ``**phrase.**``); peel both until stable.  Ellipsis is
-        # continuation, never a stop, so it is not stripped.
-        has_stop = _SENTENCE_END.search(opening) is not None
-        asserted = opening
-        while True:
-            nxt = asserted.rstrip("*_ ").strip()
-            if has_stop and not nxt.endswith("..."):
-                nxt = nxt.rstrip(".! ").strip()
-            if nxt == asserted:
-                break
-            asserted = nxt
-        return asserted == CODEX_RESULT_CLEAN_PHRASE
-    return False
+        if statement:
+            return statement
+    return ""
+
+
+def task_verdict_is_clean(body: str) -> bool:
+    """True only when the opening *sentence* under the heading is clean.
+
+    The verdict is the first sentence, not a prefix of it.  ``No blocking
+    findings could be ruled out.`` and ``No blocking findings... yet`` share
+    the clean phrase as an opening but are different sentences; treating either
+    as CLEAN would hand merge authority to a verdict Codex withheld.
+    """
+    statement = _verdict_statement(body)
+    if not statement:
+        return False
+    asserted = _asserted_sentence(statement)
+    if asserted in (CODEX_RESULT_CLEAN_PHRASE, CODEX_TERSE_CLEAN_PHRASE):
+        return True
+    return CODEX_EXACT_HEAD_CLEAN_RE.match(asserted) is not None
+
+
+def task_verdict_clean_head(body: str) -> str | None:
+    """The exact head a clean verdict names inside its own assertion.
+
+    Only the ``No major issues found at exact head `<40-hex>`.`` shape names
+    one.  Every other clean shape returns ``None`` and the caller falls back to
+    the head the body declares or pins some other way -- an absent SHA here is
+    "this sentence made no head claim", never "this verdict covers any head".
+    """
+    statement = _verdict_statement(body)
+    if not statement:
+        return None
+    match = CODEX_EXACT_HEAD_CLEAN_RE.match(_asserted_sentence(statement))
+    return match.group(1) if match else None
+
+
+def permalink_commit(body: str, repository: str) -> str | None:
+    """Return the one commit this body's own-repository permalinks all pin.
+
+    Two distinct SHAs mean the comment spans trees, so no single reviewed head
+    can be claimed.  Links into other repositories are ignored outright -- a SHA
+    from elsewhere is not evidence about this pull request.
+    """
+    shas = {
+        match.group(2).lower()
+        for match in PERMALINK_COMMIT_PATTERN.finditer(body)
+        if match.group(1).lower() == repository.lower()
+    }
+    if len(shas) != 1:
+        return None
+    return shas.pop()
+
+
+def clean_verdict_commitish(body: str, repository: str) -> str | None:
+    """The commit a clean Codex verdict names, in whichever shape names it.
+
+    Three shapes carry a head and the order between them is a precedence, not a
+    fallback chain of equals: where Codex writes ``No major issues found at
+    exact head `<sha>`.`` the SHA *is* the claim, ``**Reviewed commit:**`` is a
+    footer the connector appends, and a permalink is the tree one individual
+    citation was read at.
+
+    ``None`` is "this verdict established no head".  Every consumer of a clean
+    verdict must fail closed on it -- the belt refuses closure, the lineage
+    reader refuses the CLEAN classification -- because a clean sentence about no
+    particular tree is not a clean sentence about this one.  Reading only the
+    exact-head shape here left every connector clean comment unbound, and the
+    reviewkit published them as CLEAN anyway with no head at all.
+
+    The result may be abbreviated: only ``REVIEWED_COMMIT_PATTERN`` can match a
+    short commit-ish, and expanding it needs an authority this module does not
+    have.  The caller expands it -- the belt against the repository, the lineage
+    reader against the heads the PR's own thread establishes.
+    """
+    stripped = body.lstrip()
+    asserted = task_verdict_clean_head(stripped)
+    if asserted:
+        return asserted
+    match = REVIEWED_COMMIT_PATTERN.search(body)
+    if match:
+        return match.group(1).lower()
+    return permalink_commit(body, repository)
+
+
+def codex_comment_is_clean(body: str) -> bool:
+    """True when a Codex-authored body asserts a clean review, either channel.
+
+    The single predicate both consumers ask.  Authorship is the caller's
+    business: this says only what the prose asserts.
+    """
+    stripped = body.lstrip()
+    if stripped.startswith(CODEX_CLEAN_COMMENT_PREFIX):
+        return True
+    return task_verdict_is_clean(stripped)
+
+
+def clean_verdict_binds_head(body: str, head_sha: str) -> bool:
+    """True when this body asserts a clean verdict *for* ``head_sha``.
+
+    Clean-ness and binding are one question at every consumer -- the belt
+    routes a wake on it, classifies a result event by it and reports history
+    from it, and the reviewkit writes a lineage row from it -- so the two
+    halves live here together instead of being re-paired at each call site.
+
+    A body whose exact-head sentence names a different SHA is a clean verdict
+    about another tree and binds nothing here: fail closed.  ``None`` from
+    ``task_verdict_clean_head`` is "this sentence made no head claim", so the
+    caller's own verified head stands -- the connector's clean comment and the
+    terse task verdict both take that path.
+    """
+    stripped = body.lstrip()
+    if not codex_comment_is_clean(stripped):
+        return False
+    asserted = task_verdict_clean_head(stripped)
+    return asserted is None or asserted == head_sha.lower()
+
+
+# A severity badge is ``P<level>-<colour>``.  The level is the contract; the
+# colour is the emitting reviewer's rendering choice, so it is not matched --
+# pinning ``P1-orange`` and ``P2-yellow`` made every other level unreadable,
+# and an unreadable level fell through to the LOWEST bucket.
+SEVERITY_BADGE = re.compile(r"\bP([0-3])-[A-Za-z]+\b")
+
+
+def finding_severity(body: str) -> int:
+    """The level a finding's own body declares, folded to ``1``, ``2`` or ``3``.
+
+    Codex writes the badge in the inline comment, not in the review summary,
+    so this is the only place either consumer can learn what a round found.
+    P0 folds into P1, the same fold the review integration applies to its own
+    legacy three-bucket marker (``weave_reviewkit.report``); without it a
+    catastrophic finding is published in the P3 bucket and reads as a nit.  A
+    body carrying no badge is a finding too and takes P3: the belt counts it,
+    so the history that reports the same round must count it as well.
+    """
+    badge = SEVERITY_BADGE.search(body)
+    level = int(badge.group(1)) if badge else 3
+    return max(1, level)
+
+
+# fmt: on
+# --- END weave-review-loop:verdict-predicate ---
+
+
+def severity_counts(findings: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    counts = {"p1": 0, "p2": 0, "p3": 0, "total": len(findings)}
+    for finding in findings:
+        # ``finding_severity`` is the vendored region's, not this file's: the
+        # history packet reports the counts this wake publishes, so a badge
+        # read two ways here is the KRA-1222 drift rebuilt in the severity
+        # column.  P0 folds into P1 and an unbadged comment takes P3 there.
+        level = finding_severity(str(finding.get("body") or ""))
+        counts[f"p{level}"] += 1
+    return counts
 
 
 def codex_comment_kind(body: str) -> str:
@@ -543,8 +1800,10 @@ def codex_comment_kind(body: str) -> str:
 
     Codex speaks through two channels.  The review connector emits
     ``CODEX_CLEAN_COMMENT_PREFIX`` with a declared ``**Reviewed commit:**``.  A
-    Codex *task* asked to review the PR emits ``## Review Result`` and anchors
-    its claims in file permalinks instead.  Both are verdicts.
+    Codex *task* asked to review the PR emits a verdict heading -- ``## Review
+    Result`` or ``## Review verdict`` -- and anchors its claims in file
+    permalinks, or names its head inside the verdict sentence itself.  Both are
+    verdicts.
 
     A task-channel verdict that is not affirmatively clean is ``task-verdict``:
     findings delivered that way reach neither ``route_review`` nor the burn
@@ -564,30 +1823,13 @@ def codex_comment_kind(body: str) -> str:
         return CODEX_COMMENT_QUOTA_REFUSAL
     if stripped.startswith(CODEX_CLEAN_COMMENT_PREFIX):
         return CODEX_COMMENT_CLEAN
-    if stripped.startswith(CODEX_RESULT_HEADING):
+    if CODEX_VERDICT_HEADING_RE.match(stripped):
         if task_verdict_is_clean(stripped):
             return CODEX_COMMENT_CLEAN
         return CODEX_COMMENT_TASK_VERDICT
     if stripped.startswith(CODEX_TASK_REPORT_HEADING):
         return CODEX_COMMENT_TASK_REPORT
     return CODEX_COMMENT_UNKNOWN
-
-
-def permalink_commit(body: str, repository: str) -> str | None:
-    """Return the one commit this body's own-repository permalinks all pin.
-
-    Two distinct SHAs mean the comment spans trees, so no single reviewed head
-    can be claimed.  Links into other repositories are ignored outright — a SHA
-    from elsewhere is not evidence about this pull request.
-    """
-    shas = {
-        match.group(2).lower()
-        for match in PERMALINK_COMMIT_PATTERN.finditer(body)
-        if match.group(1).lower() == repository.lower()
-    }
-    if len(shas) != 1:
-        return None
-    return shas.pop()
 
 
 def comment_commit_reference(body: str, repository: str) -> str | None:
@@ -611,10 +1853,10 @@ def clean_comment_commitish(
     body = str(comment.get("body") or "")
     if codex_comment_kind(body) != CODEX_COMMENT_CLEAN:
         return None
-    match = REVIEWED_COMMIT_PATTERN.search(body)
-    if match:
-        return match.group(1).lower()
-    return permalink_commit(body, repository)
+    # Authorship and shape are this function's business; which head the verdict
+    # names is the shared reading's, so the precedence between the three shapes
+    # is stated once, in the vendored region.
+    return clean_verdict_commitish(body, repository)
 
 
 def clean_comment_head(
@@ -648,13 +1890,49 @@ def codex_result_events(
     reviews: Sequence[Mapping[str, Any]],
     comments: Sequence[Mapping[str, Any]],
     codex_login: str,
-) -> list[tuple[datetime, int, str, str]]:
-    """Return time-ordered Codex results as ``(time, order, head, kind)``.
+    *,
+    pr_number: int,
+    review_comments: Sequence[Mapping[str, Any]] | None = None,
+) -> list[tuple[datetime, int, str, str, str]]:
+    """Return time-ordered results as ``(time, order, head, kind, source)``.
 
-    ``kind`` is ``findings`` for a submitted review and ``clean`` for a clean
-    comment.  Both channels are retained — including a later CLEAN on a head
+    ``kind`` is ``clean`` for a verdict that binds this head and ``findings``
+    otherwise.  Both channels are retained — including a later CLEAN on a head
     that already had findings — so a retrospective can pick the later verdict
     without treating the earlier review as current.
+
+    A submitted review is a verdict channel like any other: Codex answers a
+    summons in a review body as readily as in a comment, and ``route_review``
+    wakes the author on exactly that shape.  Recording it as ``findings``
+    regardless left every consumer of this stream contradicting that route —
+    ``redeliver_standing_wake`` read a findings state, found no inline
+    comments for it, and dropped the one-hour backstop under an unacted CLEAN,
+    while ``round_history`` reported the round as a findings review with
+    nothing retrievable.  The binding is ``clean_verdict_binds_head``, shared
+    with that route, so a clean sentence naming another SHA is not clean here
+    either.
+
+    A review's body is not the whole verdict.  ``route_review`` computes
+    ``review_findings(...)`` first and wakes the burn seat whenever it is
+    non-empty, whatever the body says, so a ``No blocking findings`` summary
+    submitted alongside P2/P3 inline comments is a findings review at the live
+    route.  Classifying it ``clean`` from the body alone put this stream back
+    in contradiction with that route in the one direction that loses work:
+    ``redeliver_standing_wake`` clears the standing digest and re-delivers a
+    CLEAN *merge* wake, and ``round_history`` marks the round closed, for a
+    head Codex had just filed findings on.  Inline findings therefore outrank
+    a clean body here as they do there.  The comment list is fetched lazily —
+    only a body that already binds clean can need it, which is rare — and
+    ``review_comments`` lets a caller that already holds the list reuse it.  A
+    review whose id cannot bind its own inline comments fails closed to
+    ``findings``: an unverifiable clean body must never authorise a merge wake.
+
+    ``source`` is ``codex`` or ``substitute``.  Kind alone cannot say which
+    producer's result won a head: when a Codex review and a substitute marker
+    both land on one head, a consumer that knows only ``findings`` reaches for
+    the Codex inline comments even where the substitute verdict is the later
+    one, and reports the superseded severities.  The producer travels with the
+    event so the winner can be selected rather than guessed.
 
     A stale short commit can become unresolvable after history changes. It still
     consumed an automatic review round, so retain a namespaced short key for the
@@ -665,7 +1943,23 @@ def codex_result_events(
     a later findings head before an earlier CLEAN. Merge by timestamp before
     treating the list as round order.
     """
-    events: list[tuple[datetime, int, str, str]] = []
+    events: list[tuple[datetime, int, str, str, str]] = []
+    inline_comments = review_comments
+
+    def review_kind(review: Mapping[str, Any], body: str, head_sha: str) -> str:
+        nonlocal inline_comments
+        if not clean_verdict_binds_head(body, head_sha):
+            return "findings"
+        try:
+            review_id = int(review["id"])
+        except (KeyError, TypeError, ValueError):
+            return "findings"
+        if inline_comments is None:
+            inline_comments = github.paginate(f"pulls/{pr_number}/comments")
+        if review_findings(inline_comments, review_id, codex_login):
+            return "findings"
+        return "clean"
+
     for review in reviews:
         user = review.get("user")
         if not isinstance(user, Mapping) or user.get("login") != codex_login:
@@ -675,12 +1969,14 @@ def codex_result_events(
         head_sha = str(review.get("commit_id") or "").strip()
         if not head_sha:
             continue
+        body = str(review.get("body") or "")
         events.append(
             (
                 result_event_time(review.get("submitted_at")),
                 len(events),
                 head_sha,
-                "findings",
+                review_kind(review, body, head_sha),
+                "codex",
             )
         )
     for comment in comments:
@@ -695,6 +1991,7 @@ def codex_result_events(
                 len(events),
                 result_head,
                 "clean",
+                "codex",
             )
         )
     for _, verdict in substitute_verdicts(comments):
@@ -704,6 +2001,7 @@ def codex_result_events(
                 len(events),
                 verdict["head"],
                 verdict["kind"],
+                "substitute",
             )
         )
     events.sort()
@@ -771,26 +2069,37 @@ def standing_substitute_findings(
 
 
 def result_heads_from_events(
-    events: Sequence[tuple[datetime, int, str, str]],
+    events: Sequence[tuple[datetime, int, str, str, str]],
 ) -> list[str]:
     """Distinct heads in first-seen time order; a later event does not add a round."""
     heads: list[str] = []
-    for _, _, head, _ in events:
+    for _, _, head, _, _ in events:
         if head not in heads:
             heads.append(head)
     return heads
 
 
-def latest_result_kind_by_head(
-    events: Sequence[tuple[datetime, int, str, str]],
-) -> dict[str, str]:
-    """Later of findings-review vs clean-comment for each head."""
-    latest: dict[str, tuple[datetime, int, str]] = {}
-    for at, order, head, kind in events:
+def latest_result_by_head(
+    events: Sequence[tuple[datetime, int, str, str, str]],
+) -> dict[str, dict[str, Any]]:
+    """The result that won each head: its ``kind``, its ``source``, its time.
+
+    Latest-wins across both channels and both producers.  The winner's SOURCE
+    is carried out with its kind, because that is what decides where the head's
+    counts and digest may be read from — a Codex review's inline comments or a
+    substitute marker's own verdict comment.  A consumer handed the kind alone
+    has to infer the producer from whichever record happens to exist, which
+    picks the superseded one whenever both do.
+    """
+    latest: dict[str, tuple[datetime, int, str, str]] = {}
+    for at, order, head, kind, source in events:
         previous = latest.get(head)
         if previous is None or (at, order) >= (previous[0], previous[1]):
-            latest[head] = (at, order, kind)
-    return {head: kind for head, (_, _, kind) in latest.items()}
+            latest[head] = (at, order, kind, source)
+    return {
+        head: {"kind": kind, "source": source, "at": at}
+        for head, (at, _order, kind, source) in latest.items()
+    }
 
 
 def codex_result_heads(
@@ -798,10 +2107,20 @@ def codex_result_heads(
     reviews: Sequence[Mapping[str, Any]],
     comments: Sequence[Mapping[str, Any]],
     codex_login: str,
+    *,
+    pr_number: int,
+    review_comments: Sequence[Mapping[str, Any]] | None = None,
 ) -> list[str]:
     """Return distinct finding-review and clean-comment heads in time order."""
     return result_heads_from_events(
-        codex_result_events(github, reviews, comments, codex_login)
+        codex_result_events(
+            github,
+            reviews,
+            comments,
+            codex_login,
+            pr_number=pr_number,
+            review_comments=review_comments,
+        )
     )
 
 
@@ -861,7 +2180,7 @@ def round_history(
     review_comments: Sequence[Mapping[str, Any]],
     codex_login: str,
     *,
-    latest_kind_by_head: Mapping[str, str] | None = None,
+    latest_results: Mapping[str, Mapping[str, Any]] | None = None,
     head_bases: Mapping[str, str] | None = None,
     issue_comments: Sequence[Mapping[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
@@ -879,6 +2198,11 @@ def round_history(
     on the same unchanged head are superseded by the later review's own
     complete assessment (an intervening CLEAN may have resolved them), so
     merging rounds would hand Theoros findings that are no longer live.
+
+    Each head's verdict is read from the producer that actually won it, not
+    from whichever record exists.  A head can carry both a Codex review and a
+    substitute marker; when the substitute is later, its counts and its digest
+    are the round's, and the Codex inline comments it superseded are not.
     """
     latest_review_by_head: dict[str, tuple[datetime, int, int]] = {}
     seen_reviews: set[int] = set()
@@ -905,32 +2229,59 @@ def round_history(
         head: review_findings(review_comments, review_id, codex_login)
         for head, (_, _, review_id) in latest_review_by_head.items()
     }
-    latest_kind = dict(latest_kind_by_head or {})
+    latest_result = dict(latest_results or {})
     bases = dict(head_bases or {})
     substitute_by_head = _substitute_history_by_head(issue_comments)
     history: list[dict[str, Any]] = []
     for index, head in enumerate(reviewed_heads, start=1):
         findings = list(findings_by_head.get(head, []))
-        kind = latest_kind.get(head)
+        winner = latest_result.get(head) or {}
+        kind = winner.get("kind")
+        # Which producer's result won this head. ``round_history`` may read
+        # counts and a digest only from that producer's own record.
+        source = winner.get("source")
         digest = ""
+        # Whether this round CLOSED review, as a field rather than a prefix of
+        # the rendered prose.  ``verdict`` is a human sentence and several of
+        # them open with CLEAN while establishing no closure at all, so any
+        # consumer that re-parses it reads the rendering instead of the result.
+        closed = False
         if head.startswith(UNRESOLVED_CLEAN_PREFIX) or kind == "clean":
             substitute_round = substitute_by_head.get(str(head).lower())
             if head.startswith(UNRESOLVED_CLEAN_PREFIX):
+                # The round is consumed and is reported as such, but the head
+                # it reviewed could not be identified — so it is not evidence
+                # that review ever closed, and no closure metric may count it.
                 verdict = "CLEAN (clean comment whose commit no longer resolves)"
-            elif substitute_round is not None and substitute_round["kind"] == "clean":
+            elif (
+                source == "substitute"
+                and substitute_round is not None
+                and substitute_round["kind"] == "clean"
+            ):
                 # A substitute CLEAN is not a Codex clean comment: the
                 # retrospective compares reviewer/repair sequences, so false
-                # provenance here is exactly where it misleads.
+                # provenance here is exactly where it misleads.  Attributed on
+                # the WINNER's source: a substitute CLEAN that a later Codex
+                # clean comment superseded is not the verdict of this round,
+                # and naming it here would misattribute Codex's.
                 verdict = f"CLEAN (substitute {substitute_round['actor']} verdict)"
+                closed = True
             else:
                 verdict = "CLEAN (Codex clean comment)"
+                closed = True
             findings = []
             counts = severity_counts(findings)
             locations = []
-        elif kind == "findings" and head not in findings_by_head:
-            # A substitute findings verdict: no Codex review exists for this
-            # head, so absence from the review map is NOT clean-comment
-            # evidence. The digest lives in the substitute's verdict comment;
+        elif kind == "findings" and (
+            source == "substitute" or head not in findings_by_head
+        ):
+            # A substitute findings verdict won this head.  It wins whether or
+            # not a Codex review also exists here: an earlier Codex review the
+            # substitute superseded describes a verdict that no longer stands,
+            # and reading its inline comments would report the superseded
+            # severities as the round's.  Where no Codex review exists at all,
+            # absence from the review map is additionally NOT clean-comment
+            # evidence.  The digest lives in the substitute's verdict comment;
             # the counts are in its marker and its prose is never re-parsed.
             substitute = substitute_by_head.get(str(head).lower())
             if substitute is not None:
@@ -950,6 +2301,7 @@ def round_history(
             locations = []
         elif head not in findings_by_head:
             verdict = "CLEAN (Codex clean comment)"
+            closed = True
             counts = severity_counts([])
             locations = []
         elif findings:
@@ -969,6 +2321,7 @@ def round_history(
                 "rounds": len(reviewed_heads),
                 "head": head,
                 "verdict": verdict,
+                "closed_review": closed,
                 "counts": counts,
                 "locations": locations,
                 "base": bases.get(head),
@@ -1003,7 +2356,20 @@ def history_location(finding: Mapping[str, Any]) -> str:
     identity = finding_identity(str(finding.get("body") or ""))
     if not identity:
         return site
-    return f"{site} — {identity}"
+    return f"{site}{LOCATION_IDENTITY_SEPARATOR}{identity}"
+
+
+def location_site(location: str) -> str:
+    """The ``path:line`` half of a history location, without the identity.
+
+    ``history_location`` appends the finding's rendered title when one can be
+    read, so comparing whole history items across rounds asks whether Codex
+    reworded the finding — never whether the same site came back.  Recurrence
+    is a question about the site, and one reworded title must not answer it
+    "no".  The line stays in: a repair that moves the line is drift, which is
+    what the coarser per-file grain exists to catch.
+    """
+    return location.split(LOCATION_IDENTITY_SEPARATOR, 1)[0]
 
 
 def exhaustion_marker(head_sha: str) -> str:
@@ -1052,13 +2418,155 @@ def exhaustion_marker_state(
     return state
 
 
+def exhaustion_marker_bound(comments: Sequence[Mapping[str, Any]]) -> int | None:
+    """The round bound the gate that stopped this PR was posted under.
+
+    ``exhausted`` is historical: it says a gate was posted at some head, under
+    whatever policy was in force then.  ``MAX_REVIEW_ROUNDS`` is the policy in
+    force *now*.  Reading the two together as one row claims a five-round gate
+    was reached under a seven-round bound whenever the policy moved in between,
+    which corrupts exactly the comparison the attribute exists for.
+
+    Only the v2 marker records the bound it gated under, and the most recently
+    posted one is the gate that ended the PR.  A legacy unversioned marker
+    recorded no policy, so it yields ``None`` — the bound stays unmeasured
+    rather than being filled in from today's configuration.
+    """
+    trusted = trusted_control_logins()
+    latest: tuple[str, int] | None = None
+    for comment in comments:
+        user = comment.get("user")
+        if not isinstance(user, Mapping) or user.get("login") not in trusted:
+            continue
+        created_at = str(comment.get("created_at") or "")
+        for match in EXHAUSTED_MARKER_RE.finditer(str(comment.get("body") or "")):
+            _, v2_rounds, _ = match.groups()
+            if v2_rounds is None:
+                continue
+            if latest is None or created_at >= latest[0]:
+                latest = (created_at, int(v2_rounds))
+    return latest[1] if latest else None
+
+
+def retrospective_marker(head_sha: str) -> str:
+    """The receipt Theoros ends his verdict comment with; the loop never writes it."""
+    return f"{RETROSPECTIVE_MARKER_PREFIX}{RETROSPECTIVE_MARKER_VERSION}:{head_sha} -->"
+
+
+def retrospective_delivered(
+    comments: Sequence[Mapping[str, Any]], head_sha: str
+) -> bool:
+    """True when some comment on this PR carries a retrospective receipt for ``head_sha``.
+
+    Any author counts (see ``RETROSPECTIVE_MARKER_PREFIX``), and an abbreviated
+    head of seven hex or more counts when it prefixes the full one.  Both
+    leniencies point the same way: a false "not delivered" spends a wake and
+    then posts a line on the PR saying testimony is missing, which is the one
+    outcome here that damages something real.
+    """
+    wanted = head_sha.lower()
+    for comment in comments:
+        for match in RETROSPECTIVE_MARKER_RE.finditer(str(comment.get("body") or "")):
+            recorded = match.group(1).lower()
+            if wanted.startswith(recorded):
+                return True
+    return False
+
+
+def retrospective_wake_marker(head_sha: str) -> str:
+    """Records that a retrospective was requested at this head."""
+    return f"{RETROSPECTIVE_WAKE_MARKER_PREFIX}{MARKER_SCHEMA_VERSION}:{head_sha} -->"
+
+
+def retrospective_wake_marker_pattern(head_sha: str) -> re.Pattern[str]:
+    """The request receipt as its reader sees it: this head, any writer version."""
+    return re.compile(
+        re.escape(RETROSPECTIVE_WAKE_MARKER_PREFIX)
+        + _RETROSPECTIVE_MARKER_VERSION_RE
+        + re.escape(f"{head_sha} -->")
+    )
+
+
+def retrospective_wake_receipt_body(head_sha: str, actor: str) -> str:
+    """The PR-visible record that testimony was asked for and is now outstanding.
+
+    The wake itself goes to Slack, where the loop cannot read it back.  This
+    comment is what makes the request observable on the evidence it concerns —
+    both to the chase leg below and to a human reading the PR cold, for whom
+    "retrospective pending" and "nobody was ever asked" look identical without
+    it.
+    """
+    return (
+        f"Review-loop: the exhaustion retrospective for head `{head_sha}` was "
+        f"requested from `{actor}` in #hive. The verdict is expected back here "
+        "as a PR comment ending with its "
+        f"`{RETROSPECTIVE_MARKER_PREFIX.removeprefix('<!-- ')}"
+        f"{RETROSPECTIVE_MARKER_VERSION}:<head>` marker. It is testimony only: "
+        "it gates nothing, repairs nothing and merges nothing.\n"
+        f"{retrospective_wake_marker(head_sha)}"
+    )
+
+
+def retrospective_chase_marker(head_sha: str, attempt: int) -> str:
+    return (
+        f"{RETROSPECTIVE_CHASE_MARKER_PREFIX}{MARKER_SCHEMA_VERSION}:"
+        f"{head_sha}:attempt={attempt} -->"
+    )
+
+
+def retrospective_chase_marker_pattern(head_sha: str, attempt: int) -> re.Pattern[str]:
+    """One chase record as its reader sees it: this head and attempt, any version."""
+    return re.compile(
+        re.escape(RETROSPECTIVE_CHASE_MARKER_PREFIX)
+        + _RETROSPECTIVE_MARKER_VERSION_RE
+        + re.escape(f"{head_sha}:attempt={attempt} -->")
+    )
+
+
+def retrospective_chase_attempts(
+    comments: Sequence[Mapping[str, Any]], head_sha: str
+) -> int:
+    """How many chases this head has already spent — the highest attempt recorded.
+
+    Highest rather than count: a duplicate marker for one attempt must not
+    consume two, and the bound is on distinct attempts.
+    """
+    trusted = trusted_control_logins()
+    highest = 0
+    for comment in comments:
+        user = comment.get("user")
+        if not isinstance(user, Mapping) or user.get("login") not in trusted:
+            continue
+        for match in RETROSPECTIVE_CHASE_MARKER_RE.finditer(
+            str(comment.get("body") or "")
+        ):
+            if match.group(1) == head_sha:
+                highest = max(highest, int(match.group(2)))
+    return highest
+
+
+def head_disposition_pattern(kind: str, head_sha: str) -> re.Pattern[str]:
+    """Any vintage of one head-disposition marker for this exact head.
+
+    Two forms are accepted and neither is optional.  The unversioned one is
+    what the talos-burn skill has always told seats to type by hand, and it
+    stands on open PRs today.  ``v\\d+`` rather than today's
+    ``MARKER_SCHEMA_VERSION`` is the version-bump rule this family needs and
+    the exhaustion marker deliberately does not: an exhaustion gate carries
+    the *policy* it gated under, so a bump means "re-decide", while these
+    three carry only a seat's decision about one immutable SHA.  Pinning the
+    reader to one version would silently lapse that decision on the next bump
+    and re-summon a head someone deliberately stopped — which is the same
+    class of defect as never reading the hold at all.
+    """
+    return re.compile(
+        rf"{re.escape(HEAD_DISPOSITION_PREFIXES[kind])}"
+        rf"(?:v\d+:)?{re.escape(head_sha)} -->"
+    )
+
+
 def product_gate_marker(head_sha: str) -> str:
     return f"{PRODUCT_GATE_MARKER_PREFIX}{MARKER_SCHEMA_VERSION}:{head_sha} -->"
-
-
-def legacy_product_gate_marker(head_sha: str) -> str:
-    """Burn seats persist this form per the talos-burn skill; read it forever."""
-    return f"{PRODUCT_GATE_MARKER_PREFIX}{head_sha} -->"
 
 
 def product_gate_comment_body(head_sha: str) -> str:
@@ -1079,11 +2587,6 @@ def noise_marker(head_sha: str) -> str:
     return f"{NOISE_MARKER_PREFIX}{MARKER_SCHEMA_VERSION}:{head_sha} -->"
 
 
-def legacy_noise_marker(head_sha: str) -> str:
-    """Burn seats persist this form per the talos-burn skill; read it forever."""
-    return f"{NOISE_MARKER_PREFIX}{head_sha} -->"
-
-
 def noise_comment_body(head_sha: str) -> str:
     """The once-per-head record that a burn completed as all-noise.
 
@@ -1098,17 +2601,70 @@ def noise_comment_body(head_sha: str) -> str:
     )
 
 
-def nudge_marker(head_sha: str) -> str:
-    return f"{NUDGE_MARKER_PREFIX}{MARKER_SCHEMA_VERSION}:{head_sha} -->"
+def hold_marker(head_sha: str) -> str:
+    return f"{HOLD_MARKER_PREFIX}{MARKER_SCHEMA_VERSION}:{head_sha} -->"
 
 
-def legacy_nudge_marker(head_sha: str) -> str:
-    return f"{NUDGE_MARKER_PREFIX}{head_sha} -->"
+def hold_comment_body(head_sha: str) -> str:
+    """The once-per-head record that a seat handed this head to a human.
+
+    The attention contract requires a burn seat to stop and raise a human gate
+    for a decision it has no authority to take.  Nothing about that act reaches
+    the belt: the head does not move, no verdict lands, and the scheduled leg
+    reads an unreviewed head past the stall window as a stall and summons a
+    reviewer — spending a review round on a head the gate has already declared
+    unable to survive (sokrates#1107 round 5, 2026-08-22).  This marker is the
+    gate's machine half.  It is head-scoped, so the push that answers the gate
+    clears it with no second act by the seat.
+    """
+    return (
+        "Review-loop: hold recorded for this head; a human gate stands above "
+        "and the head is unchanged on purpose. No reviewer is to be summoned "
+        "for this head.\n"
+        f"{hold_marker(head_sha)}"
+    )
+
+
+def head_is_held(comments: Sequence[Mapping[str, Any]], head_sha: str) -> bool:
+    """True when a trusted seat has held this exact head for a human."""
+    return marker_comment_exists(comments, head_disposition_pattern("hold", head_sha))
+
+
+def current_run_id() -> str:
+    """The workflow run posting this comment, when the process is one."""
+    return os.environ.get("GITHUB_RUN_ID", "").strip()
+
+
+def nudge_marker(head_sha: str, run_id: str = "") -> str:
+    """Exact-head marker, stamped with the run that minted it when known.
+
+    The nudge posts under ``CODEX_REVIEW_PAT``, which is the same login a
+    seat's own ``gh`` token uses, so authorship cannot tell a scheduled nudge
+    from a hand-typed one.  The run id makes provenance readable from the
+    comment instead of reconstructible from run timings.  A non-numeric run id
+    is dropped rather than embedded: the reader's suffix is ``run-\\d+``, and a
+    marker its own reader cannot match would re-nudge the head forever.
+    """
+    stamp = f":run-{run_id}" if run_id.isdigit() else ""
+    return f"{NUDGE_MARKER_PREFIX}{MARKER_SCHEMA_VERSION}:{head_sha}{stamp} -->"
+
+
+def nudge_marker_pattern(head_sha: str) -> re.Pattern[str]:
+    """Every nudge marker vintage for this head: unversioned, v2, run-stamped.
+
+    Coverage that stops being recognised is a duplicate summon, so this reader
+    is deliberately wider than any one writer: the unversioned form, any
+    version, and with or without the run stamp.
+    """
+    return re.compile(
+        rf"{re.escape(NUDGE_MARKER_PREFIX)}(?:v\d+:)?{re.escape(head_sha)}"
+        r"(?::run-\d+)? -->"
+    )
 
 
 def nudge_comment_body(head_sha: str) -> str:
     """Codex trigger plus an exact-head marker so force-pushes cannot reuse it."""
-    return f"@codex review\n{nudge_marker(head_sha)}"
+    return f"@codex review\n{nudge_marker(head_sha, current_run_id())}"
 
 
 def redelivery_marker(head_sha: str, verdict_at: str) -> str:
@@ -1253,6 +2809,10 @@ def record_reviewed_head_base(
     Deduplicates by head, not by ``(head, base)``: the first accepted pin
     is the contemporaneous one. A later pin after the target moved would
     record the wrong series bound.
+
+    Returns a member of ``COMMENT_AT_HEAD_PUBLISHED`` when the pin is on the
+    PR, and otherwise the chokepoint's refusal reason — see
+    ``ensure_comment_at_head``.
     """
     existing = comments
     if existing is None:
@@ -1339,6 +2899,9 @@ def ensure_exhaustion_gate_at_head(
     stale-policy marker does not — the situation it gated was measured against
     a bound that no longer exists, so the gate is re-stated under the current
     policy rather than silently inherited.
+
+    Same return contract as ``ensure_comment_at_head``: a member of
+    ``COMMENT_AT_HEAD_PUBLISHED``, or the chokepoint's refusal reason.
     """
     comments = github.paginate(f"issues/{pr_number}/comments")
     state = exhaustion_marker_state(comments, head_sha)
@@ -1349,6 +2912,7 @@ def ensure_exhaustion_gate_at_head(
             f"re-posting exhaustion gate for {repository}#{pr_number} "
             f"(head={head_sha}): the prior gate recorded a different policy"
         )
+    refusal: list[str] = []
     if (
         refresh_pr_at_head(
             github,
@@ -1356,10 +2920,11 @@ def ensure_exhaustion_gate_at_head(
             head_sha,
             repository,
             action=action,
+            on_ignored=refusal.append,
         )
         is None
     ):
-        return "stale"
+        return refusal[0] if refusal else "refused"
     github.post(f"issues/{pr_number}/comments", {"body": gate})
     return "posted"
 
@@ -1374,10 +2939,19 @@ def ensure_comment_at_head(
     repository: str,
     action: str,
 ) -> str:
-    """Deduplicate, then revalidate the live head immediately before posting."""
+    """Deduplicate, then revalidate the live head immediately before posting.
+
+    Returns ``"existing"`` or ``"posted"`` — both in
+    ``COMMENT_AT_HEAD_PUBLISHED`` — or the chokepoint's own refusal reason
+    (``head-moved`` / ``pr-closed`` / ``pr-merged``).  A single ``"stale"``
+    sentinel was the reason the belt recorded a merge race as a push: the
+    caller could only guess, and every caller guessed ``head-moved``
+    (KRA-1226).
+    """
     comments = github.paginate(f"issues/{pr_number}/comments")
     if marker_comment_exists(comments, marker):
         return "existing"
+    refusal: list[str] = []
     if (
         refresh_pr_at_head(
             github,
@@ -1385,10 +2959,13 @@ def ensure_comment_at_head(
             expected_head,
             repository,
             action=action,
+            on_ignored=refusal.append,
         )
         is None
     ):
-        return "stale"
+        # The chokepoint names every refusal it returns, so the fallback is
+        # unreachable today; it stays a refusal rather than a wrong reason.
+        return refusal[0] if refusal else "refused"
     github.post(f"issues/{pr_number}/comments", {"body": body})
     return "posted"
 
@@ -1412,32 +2989,56 @@ def trusted_control_logins() -> frozenset[str]:
     return frozenset(login for login in logins if login)
 
 
+def _marker_forms(
+    marker: str | re.Pattern[str] | Sequence[str | re.Pattern[str]],
+) -> list[str | re.Pattern[str]]:
+    return [marker] if isinstance(marker, (str, re.Pattern)) else list(marker)
+
+
+def _marker_in(body: str, forms: Sequence[str | re.Pattern[str]]) -> bool:
+    """One reader for both marker predicates below.
+
+    A literal is the marker exactly as some writer emits it; a pattern is what a
+    reader needs when the writer's version is derived from a constant that can
+    advance underneath it.
+    """
+    return any(
+        form.search(body) is not None if isinstance(form, re.Pattern) else form in body
+        for form in forms
+    )
+
+
 def marker_comment_exists(
     comments: Sequence[Mapping[str, Any]],
-    marker: str | Sequence[str],
+    marker: str | re.Pattern[str] | Sequence[str | re.Pattern[str]],
 ) -> bool:
     """Trust a control marker only when a trusted control identity authored it.
 
-    ``marker`` may be several equivalent forms (versioned plus legacy); any
-    one of them counts.
+    ``marker`` may be several equivalent forms (versioned plus legacy, literal
+    or pattern); any one of them counts.
     """
-    markers = [marker] if isinstance(marker, str) else list(marker)
+    forms = _marker_forms(marker)
     trusted = trusted_control_logins()
     for comment in comments:
         user = comment.get("user")
         if not isinstance(user, Mapping) or user.get("login") not in trusted:
             continue
-        body = str(comment.get("body") or "")
-        if any(form in body for form in markers):
+        if _marker_in(str(comment.get("body") or ""), forms):
             return True
     return False
 
 
 def trusted_marker_time(
-    comments: Sequence[Mapping[str, Any]], marker: str | Sequence[str]
+    comments: Sequence[Mapping[str, Any]],
+    marker: str | re.Pattern[str] | Sequence[str | re.Pattern[str]],
 ) -> datetime | None:
-    """Latest created_at of a trusted comment carrying this marker, if dated."""
-    markers = [marker] if isinstance(marker, str) else list(marker)
+    """Latest created_at of a trusted comment carrying this marker, if dated.
+
+    A form may be a literal — the marker exactly as its writer emits it today —
+    or a compiled pattern, for a reader that must keep recognising the marker
+    across a writer-version bump rather than only its own vintage.
+    """
+    forms = _marker_forms(marker)
     trusted = trusted_control_logins()
     latest: datetime | None = None
     unstamped = datetime.min.replace(tzinfo=timezone.utc)
@@ -1445,7 +3046,7 @@ def trusted_marker_time(
         user = comment.get("user")
         if not isinstance(user, Mapping) or user.get("login") not in trusted:
             continue
-        if not any(form in str(comment.get("body") or "") for form in markers):
+        if not _marker_in(str(comment.get("body") or ""), forms):
             continue
         raw = comment.get("created_at")
         if not isinstance(raw, str) or not raw.strip():
@@ -1465,8 +3066,31 @@ def refresh_pr_at_head(
     repository: str,
     *,
     action: str = "Codex result",
+    on_ignored: Callable[[str], None] | None = None,
+    require_open: bool = True,
 ) -> Mapping[str, Any] | None:
-    """Re-read the live PR immediately before publishing a verdict."""
+    """Re-read the live PR immediately before publishing a verdict.
+
+    Two facts decide publishability and both are decided here, not at the call
+    sites: the head must still be the reviewed one, and the PR must still be
+    open.  Liveness belongs at the chokepoint because this is the last read
+    before any publish, so it also closes the window where the PR merges
+    between the Codex event firing and the verdict being published — the window
+    that put an exhaustion gate on an already-merged PR three minutes after the
+    merge, asking a human for a decision already taken (KRA-1226).  A per-path
+    guard cannot close that window for the paths that do not carry one.
+
+    ``require_open`` is that rule's one exception, and it defaults to enforcing
+    it so a new caller inherits the guard rather than the hole.  It is for a
+    publication whose *subject* is a dead PR: the retrospective chase asks
+    whether testimony arrived, gates nothing, and is deliberately swept over
+    recently CLOSED pull requests (KRA-1223), so refusing it on closure would
+    delete the leg rather than protect it.  A verdict wake has no such reading
+    — it is void the moment the PR is not open — and must never pass ``False``.
+
+    ``on_ignored`` receives the refusal reason for callers that record it; the
+    printed line is the unconditional record (R-3).
+    """
     pr_state = github.get(f"pulls/{pr_number}")
     if not isinstance(pr_state, Mapping):
         raise TypeError("pull request lookup did not return an object")
@@ -1479,6 +3103,25 @@ def refresh_pr_at_head(
             f"ignored {action} after head moved for {repository}#{pr_number} "
             f"(review={expected_head}, current={current_head})"
         )
+        if on_ignored is not None:
+            on_ignored("head-moved")
+        return None
+    if require_open and str(pr_state.get("state") or "") != "open":
+        # ``state`` alone decides the refusal; the word only names it, so a
+        # reader of the job log can tell a merge race from an abandoned PR.
+        # Same predicate shape as the belt-outcome telemetry: this endpoint
+        # carries ``merged``, the list endpoint carries only ``merged_at``.
+        disposition = (
+            "merged"
+            if bool(pr_state.get("merged") or pr_state.get("merged_at"))
+            else "closed"
+        )
+        print(
+            f"ignored {action} on a {disposition} {repository}#{pr_number} "
+            f"(head={expected_head})"
+        )
+        if on_ignored is not None:
+            on_ignored(f"pr-{disposition}")
         return None
     return pr_state
 
@@ -1499,19 +3142,6 @@ def pr_base(pr_state: Mapping[str, Any]) -> tuple[str, str]:
     if not ref or not sha:
         raise TypeError("live pull_request.base is missing ref or sha")
     return ref, sha
-
-
-def merge_word(has_merge_on_green: bool) -> str:
-    if has_merge_on_green:
-        return (
-            "The merge-on-green label is present: Hákon's merge word is "
-            "pre-granted — merge only when this exact head is review-closed, "
-            "required checks are green, and the PR is conflict-free."
-        )
-    return (
-        "No merge-on-green label: the ceiling is ready-for-review; the merge "
-        "waits on Hákon's word."
-    )
 
 
 def finding_blocks(
@@ -1578,7 +3208,6 @@ def build_burn_messages(
     *,
     findings: Sequence[Mapping[str, Any]],
     review_state: str,
-    word: str,
     pr_url: str,
     branch: str,
     head_sha: str,
@@ -1587,7 +3216,6 @@ def build_burn_messages(
     repository: str,
     author: str,
     author_actor: str,
-    has_merge_on_green: bool,
     review_round: int,
     history: Sequence[Mapping[str, Any]] | None = None,
     substitute: Mapping[str, Any] | None = None,
@@ -1623,21 +3251,20 @@ def build_burn_messages(
     header = (
         f"WAKE: {actor}\n\n"
         f"Burn seat `{actor}` — load skill `talos-burn` and burn these findings.\n\n"
-        f"Review-loop hook: {verdict} {word}\n\n"
+        f"Review-loop hook: {verdict} {MERGE_REGIME}\n\n"
         f"PR: {pr_url}\n"
         f"Branch: `{branch}`\n"
         f"Head: `{head_sha}`\n"
         f"Base: `{base_ref}` @ `{base_sha}`\n"
         f"Repo: `{repository}`\n"
-        f"Author: `{author}` (seat `{author_actor}`)\n"
-        f"merge-on-green: `{'yes' if has_merge_on_green else 'no'}`\n\n"
+        f"Author: `{author}` (seat `{author_actor}`)\n\n"
         f"Exact-head review: `yes` — round {review_round}/{MAX_REVIEW_ROUNDS}.\n"
         "Any repair changes the head and invalidates this review closure. Push "
         "one coherent burn, then wait for a fresh exact-head Codex review.\n\n"
         "Doctrine: in-scope findings are fixed unless tagged `product-gate` or `noise`; "
         "out-of-scope findings become follow-up tickets, then seek fresh "
         "exact-head closure. Never interleave fixing with merging. "
-        "If this seat cannot access the repo, re-WAKE the authoring seat with "
+        "If this seat cannot access the repo, use talos-burn's explicit Hive handoff to the authoring seat with "
         "the digest intact (R-3: failures stay visible).\n\n"
         f"{evidence_heading}"
     )
@@ -1798,6 +3425,7 @@ def build_retrospective_messages(
     findings: Sequence[Mapping[str, Any]],
     history: Sequence[Mapping[str, Any]],
     pr_url: str,
+    pr_number: int,
     branch: str,
     head_sha: str,
     base_ref: str,
@@ -1810,7 +3438,7 @@ def build_retrospective_messages(
 ) -> list[str]:
     """Ask Theoros why burning could not close this PR, and what generalises."""
     header = (
-        "WAKE: theoros\n\n"
+        f"WAKE: {RETROSPECTIVE_ACTOR}\n\n"
         "Review-loop hook: the bounded automatic loop is exhausted — "
         f"{review_round} reviewed head(s) consumed against an automatic bound "
         f"of {MAX_REVIEW_ROUNDS}, and burning did not close this PR. You are "
@@ -1864,8 +3492,19 @@ def build_retrospective_messages(
         "legitimate outcome — a one-off does not earn a corpus entry, and a "
         "corpus of noise is worse than a small one.\n"
         "4. **Post the verdict on the PR** so it is attached to the evidence, "
-        "not only to this thread. Skill changes ride a review-ready PR to "
-        "weave-doctrine; merge stays Hákon's word.\n\n"
+        "not only to this thread. Write it to a file, then post the FILE:\n\n"
+        f"    gh pr comment {pr_number} -R {repository} --body-file <path>\n\n"
+        "`--body @<path>` is not an alternative: `gh` has no `@file` idiom, "
+        "so it posts the literal string `@<path>` and the verdict never "
+        "leaves the disk — that is how one sat unread for eight days "
+        "(sokrates#1113). End the posted body with exactly:\n\n"
+        f"    {retrospective_marker(head_sha)}\n\n"
+        "That marker is the loop's only evidence of delivery: without it "
+        f"this PR is chased in {RETROSPECTIVE_DELIVERY_SECONDS // 60} "
+        "minutes and then flagged on the PR as missing testimony, however "
+        "complete the verdict in this thread is. Skill changes ride a "
+        "review-ready PR to weave-doctrine; the composed boundary admits the "
+        "merge, and Hákon's veto is retrospective.\n\n"
         "The evidence below is the shape of the sequence: did severity fall, "
         "did the same file keep reappearing, did each burn draw new findings.\n\n"
         "## Per-round history, then the current head's findings\n"
@@ -1885,9 +3524,40 @@ def build_retrospective_messages(
     return chunk_digest(header, blocks, label="retrospective evidence")
 
 
+def explicit_clean_signal(
+    review: Mapping[str, Any],
+    conversation_comments: Sequence[Mapping[str, Any]],
+    github: GitHubApi,
+    codex_login: str,
+    head_sha: str,
+) -> bool:
+    """True only when a recognized clean comment covers this head.
+
+    An empty findings list is not evidence of CLEAN. The review body itself
+    may be a clean comment, or a conversation comment may already have
+    established the same head.
+
+    A review body in the exact-head shape names its own head, and
+    ``route_review`` verifies only the review object's ``commit_id`` — so the
+    two can disagree, and the prose is the claim. This channel binds the
+    sentence exactly as ``clean_comment_commitish`` does for the comment
+    channel: sentence-first, fail closed. The binding itself is
+    ``clean_verdict_binds_head``, shared with the result-event stream so this
+    route and that classification cannot answer differently.
+    """
+    wanted = head_sha.lower()
+    if clean_verdict_binds_head(str(review.get("body") or ""), wanted):
+        return True
+    return any(
+        clean_comment_head(github, comment, codex_login) == wanted
+        for comment in conversation_comments
+    )
+
+
 def publish_exhaustion_retrospective(
     slack: SlackApi,
     *,
+    github: GitHubApi,
     findings: Sequence[Mapping[str, Any]],
     history: Sequence[Mapping[str, Any]],
     pr_url: str,
@@ -1902,13 +3572,26 @@ def publish_exhaustion_retrospective(
     base_sha: str,
     substitute: Mapping[str, Any] | None = None,
 ) -> None:
-    """Wake Theoros after an exhaustion gate. Shared by ``route`` and ``nudge``."""
+    """Wake Theoros after an exhaustion gate. Shared by ``route`` and ``nudge``.
+
+    Slack first, then the receipt — the same publication rule as every other
+    wake leg.  Receipt-first would let a Slack failure leave the PR claiming
+    testimony was requested when no seat was ever asked, and the chase leg
+    would then hound a seat that owes nothing.  This way a receipt failure
+    raises out of the caller (R-3) and the worst case is the status quo ante:
+    the wake landed and no chase can see it.
+
+    A withheld dispatch propagates: the receipt below records that a seat was
+    asked, and the chase leg dates its window from it, so a receipt written
+    for a wake nobody received would hound a seat that owes nothing.
+    """
     post_threaded_messages(
         slack,
         build_retrospective_messages(
             findings=findings,
             history=history,
             pr_url=pr_url,
+            pr_number=pr_number,
             branch=branch,
             head_sha=head_sha,
             base_ref=base_ref,
@@ -1919,10 +3602,34 @@ def publish_exhaustion_retrospective(
             review_round=review_round,
             substitute=substitute,
         ),
+        github=github,
+        repository=repository,
+        pr_number=pr_number,
+        head_sha=head_sha,
+        decision="exhaustion_retrospective",
     )
     print(
-        f"woke theoros for {repository}#{pr_number} retrospective "
+        f"woke {RETROSPECTIVE_ACTOR} for {repository}#{pr_number} retrospective "
         f"(rounds={len(history)})"
+    )
+    # Once per head, however many times the wake is re-sent.  The retry
+    # contract deliberately re-wakes on an existing gate, and a second receipt
+    # would not merely duplicate a comment: the chase leg dates the delivery
+    # window from the latest receipt, so every retry would silently push the
+    # window forward and a never-delivered verdict could go unchased forever.
+    # The request happened once; the receipt records that once.
+    if marker_comment_exists(
+        github.paginate(f"issues/{pr_number}/comments"),
+        retrospective_wake_marker_pattern(head_sha),
+    ):
+        print(
+            f"retrospective request already recorded for {repository}#{pr_number} "
+            f"(head={head_sha}); delivery window not re-anchored"
+        )
+        return
+    github.post(
+        f"issues/{pr_number}/comments",
+        {"body": retrospective_wake_receipt_body(head_sha, RETROSPECTIVE_ACTOR)},
     )
 
 
@@ -1933,7 +3640,6 @@ def clean_wake_message(
     head_sha: str,
     review_round: int,
     review_state: str,
-    word: str,
     pr_url: str,
     branch: str,
     verdict_source: str = "Codex review",
@@ -1942,13 +3648,13 @@ def clean_wake_message(
         f"WAKE: {author_actor}\n\n"
         f"Review-loop hook: {verdict_source} is CLEAN on the exact current head "
         f"`{head_sha}` (round {review_round}/{MAX_REVIEW_ROUNDS}; review "
-        f"state: {review_state}). {word}\n\n"
+        f"state: {review_state}). {MERGE_REGIME}\n\n"
         f"PR: {pr_url} (branch `{branch}`, author `{author}` / seat "
         f"`{author_actor}`).\n"
-        "Boundary: exact-head CLEAN closes review only; it is not by itself "
-        "a merge-ready claim. The same SHA must have green required checks, "
-        "no conflicts, and merge authority. Without merge-on-green, report "
-        "ready-for-review."
+        "Boundary: exact-head CLEAN closes review only. Compose the rest "
+        "before merging — green required checks on this same SHA, no "
+        "conflicts — and never carry either across a head change. Anything "
+        "short of the full boundary stays ready-for-review."
     )
 
 
@@ -1962,9 +3668,18 @@ def route_review(event: Mapping[str, Any] | None = None) -> None:
     codex_login = os.environ.get("CODEX_LOGIN", CODEX_LOGIN)
     if not isinstance(review_user, Mapping) or review_user.get("login") != codex_login:
         print("ignored non-Codex review")
+        belt_ignored("non-codex-review")
         return
     if is_quota_refusal_body(str(review.get("body") or "")):
         print("ignored Codex quota-refusal review")
+        belt().event(
+            "belt.refusal.observed",
+            **{
+                "logfire.msg": "Codex quota refusal observed on a review",
+                "channel": "review",
+                "pull_request": int(pull_request.get("number") or 0),
+            },
+        )
         return
 
     repository = required_env("GITHUB_REPOSITORY")
@@ -1985,52 +3700,71 @@ def route_review(event: Mapping[str, Any] | None = None) -> None:
             f"ignored stale Codex review for {repository}#{pr_number} "
             f"(review={review_head_sha}, current={head_sha})"
         )
+        belt_ignored(
+            "stale-verdict-head",
+            pull_request=pr_number,
+            head_sha=head_sha,
+            verdict_head=review_head_sha,
+        )
         return
 
     resolved = author_for_pr(github, pr_number, head_sha)
     if resolved is None:
         print("non-seat author - no wake")
+        belt_ignored("non-seat-author", pull_request=pr_number, head_sha=head_sha)
         return
     author, author_actor = resolved
+    if loop_exempt_pr(github, pr_number):
+        print(
+            f"loop-exempt PR {repository}#{pr_number} - every touched path "
+            "sits under a corpus root with its own gate; no wake"
+        )
+        belt_ignored("loop-exempt-pr", pull_request=pr_number, head_sha=head_sha)
+        return
     review_comments = github.paginate(f"pulls/{pr_number}/comments")
     findings = review_findings(review_comments, int(review["id"]), codex_login)
     reviews = github.paginate(f"pulls/{pr_number}/reviews")
     conversation_comments = github.paginate(f"issues/{pr_number}/comments")
     result_events = codex_result_events(
-        github, [*reviews, review], conversation_comments, codex_login
+        github,
+        [*reviews, review],
+        conversation_comments,
+        codex_login,
+        pr_number=pr_number,
+        review_comments=review_comments,
     )
     reviewed_heads = result_heads_from_events(result_events)
     review_round = result_round_for_head(reviewed_heads, review_head_sha)
-    refreshed_pr = refresh_pr_at_head(github, pr_number, review_head_sha, repository)
+    refreshed_pr = refresh_pr_at_head(
+        github,
+        pr_number,
+        review_head_sha,
+        repository,
+        on_ignored=lambda reason: belt_ignored(
+            reason, pull_request=pr_number, head_sha=review_head_sha
+        ),
+    )
     if refreshed_pr is None:
         return
     pr_state = refreshed_pr
     refreshed_head = pr_state.get("head")
     assert isinstance(refreshed_head, Mapping)
     branch = str(refreshed_head["ref"])
-    labels = {
-        str(label.get("name"))
-        for label in pr_state.get("labels", [])
-        if isinstance(label, Mapping)
-    }
-    has_merge_on_green = "merge-on-green" in labels
-    word = merge_word(has_merge_on_green)
     pr_url = str(pr_state.get("html_url") or pull_request["html_url"])
     review_state = str(review.get("state") or "unknown")
     slack = SlackApi(required_env("HIVE_BOT_TOKEN"), required_env("HIVE_CHANNEL"))
     base_ref, base_sha = pr_base(pr_state)
-    if (
-        record_reviewed_head_base(
-            github,
-            pr_number,
-            head_sha,
-            base_ref,
-            base_sha,
-            repository=repository,
-            comments=conversation_comments,
-        )
-        == "stale"
-    ):
+    pin_state = record_reviewed_head_base(
+        github,
+        pr_number,
+        head_sha,
+        base_ref,
+        base_sha,
+        repository=repository,
+        comments=conversation_comments,
+    )
+    if pin_state not in COMMENT_AT_HEAD_PUBLISHED:
+        belt_ignored(pin_state, pull_request=pr_number, head_sha=head_sha)
         return
 
     if not findings:
@@ -2045,6 +3779,16 @@ def route_review(event: Mapping[str, Any] | None = None) -> None:
                 "longer names the reviewed subject; resolve the retarget and "
                 "request a fresh exact-head review"
             )
+            belt().event(
+                "belt.closure.refused",
+                **{
+                    "logfire.msg": "clean closure refused: stale-base-ref",
+                    "reason": "stale-base-ref",
+                    "pull_request": pr_number,
+                    "head_sha": head_sha,
+                    "base_ref": base_ref,
+                },
+            )
             return
         retargeted_at = base_retarget_after(
             github, pr_number, str(review.get("submitted_at") or "")
@@ -2056,20 +3800,65 @@ def route_review(event: Mapping[str, Any] | None = None) -> None:
                 "verdict was formed — the review's subject is not the PR as "
                 "now targeted; request a fresh exact-head review"
             )
-            return
-        slack.post_message(
-            clean_wake_message(
-                author_actor=author_actor,
-                author=author,
-                head_sha=head_sha,
-                review_round=review_round,
-                review_state=review_state,
-                word=word,
-                pr_url=pr_url,
-                branch=branch,
+            belt().event(
+                "belt.closure.refused",
+                **{
+                    "logfire.msg": "clean closure refused: base-retargeted",
+                    "reason": "base-retargeted",
+                    "pull_request": pr_number,
+                    "head_sha": head_sha,
+                    "base_ref": base_ref,
+                },
             )
+            return
+        if explicit_clean_signal(
+            review,
+            conversation_comments,
+            github,
+            codex_login,
+            head_sha,
+        ):
+            belt_verdict(
+                pr_number=pr_number,
+                head_sha=head_sha,
+                verdict_kind="clean",
+                decision="clean_wake",
+                source_event_at=review.get("submitted_at"),
+                review_round=review_round,
+                rounds_consumed=len(reviewed_heads),
+                author_seat=author_actor,
+                review_state=review_state,
+                base_ref=base_ref,
+                base_sha=base_sha,
+                head_commit_age=belt().head_commit_age_seconds(github, head_sha),
+            )
+            if deliver_wake(
+                lambda: slack.post_message(
+                    clean_wake_message(
+                        author_actor=author_actor,
+                        author=author,
+                        head_sha=head_sha,
+                        review_round=review_round,
+                        review_state=review_state,
+                        pr_url=pr_url,
+                        branch=branch,
+                    )
+                ),
+                github=github,
+                repository=repository,
+                pr_number=pr_number,
+                head_sha=head_sha,
+                decision="clean_wake",
+            ):
+                print(f"woke {author_actor} for {repository}#{pr_number} (findings=0)")
+            return
+        print(
+            f"ignored empty findings review for {repository}#{pr_number} "
+            f"(head={head_sha}) — not evidence of CLEAN"
         )
-        print(f"woke {author_actor} for {repository}#{pr_number} (findings=0)")
+        belt_ignored(
+            "empty-findings-not-clean", pull_request=pr_number, head_sha=head_sha
+        )
         return
 
     if review_round >= MAX_REVIEW_ROUNDS:
@@ -2099,35 +3888,69 @@ def route_review(event: Mapping[str, Any] | None = None) -> None:
             repository=repository,
             action="exhaustion gate",
         )
-        if comment_state == "stale":
+        if comment_state not in COMMENT_AT_HEAD_PUBLISHED:
             print(
-                f"ignored stale exhaustion gate for "
-                f"{repository}#{pr_number} (head={head_sha})"
+                f"ignored exhaustion gate for {repository}#{pr_number} "
+                f"(head={head_sha}): {comment_state}"
             )
+            belt_ignored(comment_state, pull_request=pr_number, head_sha=head_sha)
             return
         if comment_state == "existing":
             print(
                 f"exhaustion gate already present for "
                 f"{repository}#{pr_number} (head={head_sha}); retrying wake"
             )
-        if (
-            refresh_pr_at_head(
-                github,
-                pr_number,
-                head_sha,
-                repository,
-                action="exhaustion wake",
-            )
-            is None
+        # The gate comment is durable and already posted, so a later scheduled
+        # scan returns early on it: these two spans are recorded before the
+        # fallible wake because a Slack failure here would otherwise erase an
+        # exhaustion that really happened, with no path back to it.
+        belt_verdict(
+            pr_number=pr_number,
+            head_sha=head_sha,
+            verdict_kind="findings",
+            decision="exhaustion_gate",
+            source_event_at=review.get("submitted_at"),
+            review_round=review_round,
+            rounds_consumed=len(reviewed_heads),
+            counts=counts,
+            findings=findings,
+            author_seat=author_actor,
+            review_state=review_state,
+            base_ref=base_ref,
+            base_sha=base_sha,
+            head_commit_age=belt().head_commit_age_seconds(github, head_sha),
+        )
+        belt().event(
+            "belt.exhaustion",
+            **{
+                "logfire.msg": (
+                    f"#{pr_number} exhausted at round "
+                    f"{review_round}/{MAX_REVIEW_ROUNDS}"
+                ),
+                "pull_request": pr_number,
+                "head_sha": head_sha,
+                "round": review_round,
+                "max_review_rounds": MAX_REVIEW_ROUNDS,
+                "gate_comment_state": comment_state,
+                "findings_total": counts["total"],
+                "author_seat": author_actor,
+            },
+        )
+        if not deliver_wake(
+            lambda: slack.post_message(
+                f"WAKE: {author_actor}\n\n"
+                f"Review-loop hook: automatic repair/re-review exhausted at round "
+                f"{review_round}/{MAX_REVIEW_ROUNDS}. Do not burn or merge "
+                "automatically.\n\n"
+                f"{gate}"
+            ),
+            github=github,
+            repository=repository,
+            pr_number=pr_number,
+            head_sha=head_sha,
+            decision="exhaustion_gate",
         ):
             return
-        slack.post_message(
-            f"WAKE: {author_actor}\n\n"
-            f"Review-loop hook: automatic repair/re-review exhausted at round "
-            f"{review_round}/{MAX_REVIEW_ROUNDS}. Do not burn or merge "
-            "automatically.\n\n"
-            f"{gate}"
-        )
         print(
             f"review loop exhausted for {repository}#{pr_number} "
             f"(head={head_sha}, findings={len(findings)})"
@@ -2142,24 +3965,32 @@ def route_review(event: Mapping[str, Any] | None = None) -> None:
             [*reviews, review],
             review_comments,
             codex_login,
-            latest_kind_by_head=latest_result_kind_by_head(result_events),
+            latest_results=latest_result_by_head(result_events),
             head_bases=head_bases,
             issue_comments=conversation_comments,
         )
-        publish_exhaustion_retrospective(
-            slack,
-            findings=findings,
-            history=history,
-            pr_url=pr_url,
-            branch=branch,
-            head_sha=head_sha,
-            base_ref=base_ref,
-            base_sha=base_sha,
+        deliver_wake(
+            lambda: publish_exhaustion_retrospective(
+                slack,
+                github=github,
+                findings=findings,
+                history=history,
+                pr_url=pr_url,
+                branch=branch,
+                head_sha=head_sha,
+                base_ref=base_ref,
+                base_sha=base_sha,
+                repository=repository,
+                author=author,
+                author_actor=author_actor,
+                review_round=review_round,
+                pr_number=pr_number,
+            ),
+            github=github,
             repository=repository,
-            author=author,
-            author_actor=author_actor,
-            review_round=review_round,
             pr_number=pr_number,
+            head_sha=head_sha,
+            decision="exhaustion_retrospective",
         )
         return
 
@@ -2168,13 +3999,12 @@ def route_review(event: Mapping[str, Any] | None = None) -> None:
         [*reviews, review],
         review_comments,
         codex_login,
-        latest_kind_by_head=latest_result_kind_by_head(result_events),
+        latest_results=latest_result_by_head(result_events),
         issue_comments=conversation_comments,
     )
     messages = build_burn_messages(
         findings=findings,
         review_state=review_state,
-        word=word,
         pr_url=pr_url,
         branch=branch,
         head_sha=head_sha,
@@ -2183,15 +4013,48 @@ def route_review(event: Mapping[str, Any] | None = None) -> None:
         repository=repository,
         author=author,
         author_actor=author_actor,
-        has_merge_on_green=has_merge_on_green,
         review_round=review_round,
         history=history,
     )
-    post_threaded_messages(slack, messages)
-    print(
-        f"woke {burn_actor()} for {repository}#{pr_number} "
-        f"(findings={len(findings)}, author={author_actor}, messages={len(messages)})"
+    belt_verdict(
+        pr_number=pr_number,
+        head_sha=head_sha,
+        verdict_kind="findings",
+        decision="burn_wake",
+        source_event_at=review.get("submitted_at"),
+        review_round=review_round,
+        rounds_consumed=len(reviewed_heads),
+        counts=severity_counts(findings),
+        findings=findings,
+        author_seat=author_actor,
+        review_state=review_state,
+        base_ref=base_ref,
+        base_sha=base_sha,
+        chunks=len(messages),
+        head_commit_age=belt().head_commit_age_seconds(github, head_sha),
     )
+    if deliver_wake(
+        lambda: post_threaded_messages(
+            slack,
+            messages,
+            github=github,
+            repository=repository,
+            pr_number=pr_number,
+            head_sha=head_sha,
+            decision="burn_wake",
+        ),
+        github=github,
+        repository=repository,
+        pr_number=pr_number,
+        head_sha=head_sha,
+        decision="burn_wake",
+        chunks=len(messages),
+    ):
+        print(
+            f"woke {burn_actor()} for {repository}#{pr_number} "
+            f"(findings={len(findings)}, author={author_actor}, "
+            f"messages={len(messages)})"
+        )
 
 
 def unroutable_comment_message(
@@ -2238,6 +4101,14 @@ def report_unroutable_codex_comment(
     body = str(comment.get("body") or "")
     kind = codex_comment_kind(body)
     if kind == CODEX_COMMENT_QUOTA_REFUSAL:
+        belt().event(
+            "belt.refusal.observed",
+            **{
+                "logfire.msg": "Codex quota refusal observed on a comment",
+                "channel": "comment",
+                "pull_request": int(issue.get("number") or 0),
+            },
+        )
         # The refusal is the moment the find half went down for this head.
         # The scheduled scan reaches the same conclusion up to the stall
         # threshold plus one cron tick later; routing the event through the
@@ -2269,6 +4140,14 @@ def report_unroutable_codex_comment(
         )
     )
     print(f"reported unroutable Codex {kind} comment on {repository}#{pr_number}")
+    belt().event(
+        "belt.comment.unroutable",
+        **{
+            "logfire.msg": f"unroutable Codex {kind} comment",
+            "comment_kind": kind,
+            "pull_request": int(pr_number or 0),
+        },
+    )
 
 
 def route_clean_comment(event: Mapping[str, Any] | None = None) -> None:
@@ -2292,6 +4171,10 @@ def route_clean_comment(event: Mapping[str, Any] | None = None) -> None:
     reviewed_head = clean_comment_head(github, comment, codex_login)
     if reviewed_head is None:
         print("ignored unresolvable Codex clean comment")
+        belt_ignored(
+            "unresolvable-clean-comment",
+            pull_request=int(issue.get("number") or 0),
+        )
         return
 
     pr_number = int(issue["number"])
@@ -2307,46 +4190,65 @@ def route_clean_comment(event: Mapping[str, Any] | None = None) -> None:
             f"ignored stale Codex clean comment for {repository}#{pr_number} "
             f"(review={reviewed_head}, current={head_sha})"
         )
+        belt_ignored(
+            "stale-verdict-head",
+            pull_request=pr_number,
+            head_sha=head_sha,
+            verdict_head=reviewed_head,
+        )
         return
 
     resolved = author_for_pr(github, pr_number, head_sha)
     if resolved is None:
         print("non-seat author - no wake")
+        belt_ignored("non-seat-author", pull_request=pr_number, head_sha=head_sha)
         return
     author, author_actor = resolved
+    if loop_exempt_pr(github, pr_number):
+        print(
+            f"loop-exempt PR {repository}#{pr_number} - every touched path "
+            "sits under a corpus root with its own gate; no wake"
+        )
+        belt_ignored("loop-exempt-pr", pull_request=pr_number, head_sha=head_sha)
+        return
     reviews = github.paginate(f"pulls/{pr_number}/reviews")
     conversation_comments = github.paginate(f"issues/{pr_number}/comments")
     reviewed_heads = codex_result_heads(
-        github, reviews, [*conversation_comments, comment], codex_login
+        github,
+        reviews,
+        [*conversation_comments, comment],
+        codex_login,
+        pr_number=pr_number,
     )
     review_round = result_round_for_head(reviewed_heads, head_sha)
-    refreshed_pr = refresh_pr_at_head(github, pr_number, head_sha, repository)
+    refreshed_pr = refresh_pr_at_head(
+        github,
+        pr_number,
+        head_sha,
+        repository,
+        on_ignored=lambda reason: belt_ignored(
+            reason, pull_request=pr_number, head_sha=head_sha
+        ),
+    )
     if refreshed_pr is None:
         return
     pr_state = refreshed_pr
     refreshed_head = pr_state.get("head")
     assert isinstance(refreshed_head, Mapping)
-    labels = {
-        str(label.get("name"))
-        for label in pr_state.get("labels", [])
-        if isinstance(label, Mapping)
-    }
-    word = merge_word("merge-on-green" in labels)
     branch = str(refreshed_head["ref"])
     pr_url = str(pr_state.get("html_url") or issue.get("html_url") or "")
     base_ref, base_sha = pr_base(pr_state)
-    if (
-        record_reviewed_head_base(
-            github,
-            pr_number,
-            head_sha,
-            base_ref,
-            base_sha,
-            repository=repository,
-            comments=conversation_comments,
-        )
-        == "stale"
-    ):
+    pin_state = record_reviewed_head_base(
+        github,
+        pr_number,
+        head_sha,
+        base_ref,
+        base_sha,
+        repository=repository,
+        comments=conversation_comments,
+    )
+    if pin_state not in COMMENT_AT_HEAD_PUBLISHED:
+        belt_ignored(pin_state, pull_request=pr_number, head_sha=head_sha)
         return
     stale_ref = stale_base_ref_for_closure(conversation_comments, head_sha, base_ref)
     if stale_ref is not None:
@@ -2356,6 +4258,16 @@ def route_clean_comment(event: Mapping[str, Any] | None = None) -> None:
             f"PR now targets `{base_ref}` — the head SHA alone no longer "
             "names the reviewed subject; resolve the retarget and request a "
             "fresh exact-head review"
+        )
+        belt().event(
+            "belt.closure.refused",
+            **{
+                "logfire.msg": "clean closure refused: stale-base-ref",
+                "reason": "stale-base-ref",
+                "pull_request": pr_number,
+                "head_sha": head_sha,
+                "base_ref": base_ref,
+            },
         )
         return
     retargeted_at = base_retarget_after(
@@ -2368,21 +4280,51 @@ def route_clean_comment(event: Mapping[str, Any] | None = None) -> None:
             "formed — the review's subject is not the PR as now targeted; "
             "request a fresh exact-head review"
         )
+        belt().event(
+            "belt.closure.refused",
+            **{
+                "logfire.msg": "clean closure refused: base-retargeted",
+                "reason": "base-retargeted",
+                "pull_request": pr_number,
+                "head_sha": head_sha,
+                "base_ref": base_ref,
+            },
+        )
         return
     slack = SlackApi(required_env("HIVE_BOT_TOKEN"), required_env("HIVE_CHANNEL"))
-    slack.post_message(
-        clean_wake_message(
-            author_actor=author_actor,
-            author=author,
-            head_sha=head_sha,
-            review_round=review_round,
-            review_state="clean-comment",
-            word=word,
-            pr_url=pr_url,
-            branch=branch,
-        )
+    belt_verdict(
+        pr_number=pr_number,
+        head_sha=head_sha,
+        verdict_kind="clean",
+        decision="clean_wake",
+        source_event_at=comment.get("created_at"),
+        review_round=review_round,
+        rounds_consumed=len(reviewed_heads),
+        author_seat=author_actor,
+        review_state="clean-comment",
+        base_ref=base_ref,
+        base_sha=base_sha,
+        head_commit_age=belt().head_commit_age_seconds(github, head_sha),
     )
-    print(f"woke {author_actor} for {repository}#{pr_number} (clean comment)")
+    if deliver_wake(
+        lambda: slack.post_message(
+            clean_wake_message(
+                author_actor=author_actor,
+                author=author,
+                head_sha=head_sha,
+                review_round=review_round,
+                review_state="clean-comment",
+                pr_url=pr_url,
+                branch=branch,
+            )
+        ),
+        github=github,
+        repository=repository,
+        pr_number=pr_number,
+        head_sha=head_sha,
+        decision="clean_wake",
+    ):
+        print(f"woke {author_actor} for {repository}#{pr_number} (clean comment)")
 
 
 def route_substitute_verdict(event: Mapping[str, Any]) -> None:
@@ -2408,6 +4350,10 @@ def route_substitute_verdict(event: Mapping[str, Any]) -> None:
         author = comment.get("user")
         login = author.get("login") if isinstance(author, Mapping) else "unknown"
         print(f"ignored substitute-verdict marker from untrusted author {login}")
+        belt_ignored(
+            "untrusted-substitute-marker",
+            pull_request=int(issue.get("number") or 0),
+        )
         return
     _, verdict = parsed[0]
     repository = required_env("GITHUB_REPOSITORY")
@@ -2426,47 +4372,67 @@ def route_substitute_verdict(event: Mapping[str, Any]) -> None:
             f"{repository}#{pr_number} "
             f"(verdict={verdict['head']}, current={head_sha})"
         )
+        belt_ignored(
+            "stale-verdict-head",
+            pull_request=pr_number,
+            head_sha=head_sha,
+            verdict_head=str(verdict["head"]),
+            substitute_actor=str(verdict["actor"]),
+        )
         return
 
     resolved = author_for_pr(github, pr_number, head_sha)
     if resolved is None:
         print("non-seat author - no wake")
+        belt_ignored("non-seat-author", pull_request=pr_number, head_sha=head_sha)
         return
     author, author_actor = resolved
+    if loop_exempt_pr(github, pr_number):
+        print(
+            f"loop-exempt PR {repository}#{pr_number} - every touched path "
+            "sits under a corpus root with its own gate; no wake"
+        )
+        belt_ignored("loop-exempt-pr", pull_request=pr_number, head_sha=head_sha)
+        return
     codex_login = os.environ.get("CODEX_LOGIN", CODEX_LOGIN)
     reviews = github.paginate(f"pulls/{pr_number}/reviews")
     conversation_comments = github.paginate(f"issues/{pr_number}/comments")
     reviewed_heads = codex_result_heads(
-        github, reviews, [*conversation_comments, comment], codex_login
+        github,
+        reviews,
+        [*conversation_comments, comment],
+        codex_login,
+        pr_number=pr_number,
     )
     review_round = result_round_for_head(reviewed_heads, head_sha.lower())
-    refreshed_pr = refresh_pr_at_head(github, pr_number, head_sha, repository)
+    refreshed_pr = refresh_pr_at_head(
+        github,
+        pr_number,
+        head_sha,
+        repository,
+        on_ignored=lambda reason: belt_ignored(
+            reason, pull_request=pr_number, head_sha=head_sha
+        ),
+    )
     if refreshed_pr is None:
         return
     pr_state = refreshed_pr
     refreshed_head = pr_state.get("head")
     assert isinstance(refreshed_head, Mapping)
-    labels = {
-        str(label.get("name"))
-        for label in pr_state.get("labels", [])
-        if isinstance(label, Mapping)
-    }
-    word = merge_word("merge-on-green" in labels)
     branch = str(refreshed_head["ref"])
     pr_url = str(pr_state.get("html_url") or issue.get("html_url") or "")
     base_ref, base_sha = pr_base(pr_state)
-    if (
-        record_reviewed_head_base(
-            github,
-            pr_number,
-            head_sha,
-            base_ref,
-            base_sha,
-            repository=repository,
-            comments=conversation_comments,
-        )
-        == "stale"
-    ):
+    pin_state = record_reviewed_head_base(
+        github,
+        pr_number,
+        head_sha,
+        base_ref,
+        base_sha,
+        repository=repository,
+        comments=conversation_comments,
+    )
+    if pin_state not in COMMENT_AT_HEAD_PUBLISHED:
+        belt_ignored(pin_state, pull_request=pr_number, head_sha=head_sha)
         return
     slack = SlackApi(required_env("HIVE_BOT_TOKEN"), required_env("HIVE_CHANNEL"))
     if verdict["kind"] != "clean":
@@ -2501,25 +4467,71 @@ def route_substitute_verdict(event: Mapping[str, Any]) -> None:
                 repository=repository,
                 action="exhaustion gate",
             )
-            if comment_state == "stale":
+            if comment_state not in COMMENT_AT_HEAD_PUBLISHED:
                 print(
-                    f"ignored stale substitute exhaustion gate for "
-                    f"{repository}#{pr_number} (head={head_sha})"
+                    f"ignored substitute exhaustion gate for "
+                    f"{repository}#{pr_number} (head={head_sha}): "
+                    f"{comment_state}"
                 )
+                belt_ignored(comment_state, pull_request=pr_number, head_sha=head_sha)
                 return
             if comment_state == "existing":
                 print(
                     f"exhaustion gate already present for "
                     f"{repository}#{pr_number} (head={head_sha}); retrying wake"
                 )
-            slack.post_message(
-                f"WAKE: {author_actor}\n\n"
-                f"Review-loop hook: automatic repair/re-review exhausted at "
-                f"round {review_round}/{MAX_REVIEW_ROUNDS} (substitute "
-                f"verdict by `{verdict['actor']}`). Do not burn or merge "
-                "automatically.\n\n"
-                f"{gate}"
+            # Recorded before the fallible wake, for the reason the Codex
+            # exhaustion branch states: the gate comment is durable, so a
+            # later scan returns early and never rebuilds these spans.
+            belt_verdict(
+                pr_number=pr_number,
+                head_sha=head_sha,
+                verdict_kind="substitute-findings",
+                decision="exhaustion_gate",
+                source_event_at=comment.get("created_at"),
+                review_round=review_round,
+                rounds_consumed=len(reviewed_heads),
+                counts={**counts, "total": total},
+                author_seat=author_actor,
+                review_state=f"substitute-findings:{verdict['actor']}",
+                base_ref=base_ref,
+                base_sha=base_sha,
+                substitute=str(verdict["actor"]),
+                head_commit_age=belt().head_commit_age_seconds(github, head_sha),
             )
+            belt().event(
+                "belt.exhaustion",
+                **{
+                    "logfire.msg": (
+                        f"#{pr_number} exhausted at round "
+                        f"{review_round}/{MAX_REVIEW_ROUNDS} (substitute)"
+                    ),
+                    "pull_request": pr_number,
+                    "head_sha": head_sha,
+                    "round": review_round,
+                    "max_review_rounds": MAX_REVIEW_ROUNDS,
+                    "gate_comment_state": comment_state,
+                    "findings_total": total,
+                    "author_seat": author_actor,
+                    "substitute_actor": str(verdict["actor"]),
+                },
+            )
+            if not deliver_wake(
+                lambda: slack.post_message(
+                    f"WAKE: {author_actor}\n\n"
+                    f"Review-loop hook: automatic repair/re-review exhausted at "
+                    f"round {review_round}/{MAX_REVIEW_ROUNDS} (substitute "
+                    f"verdict by `{verdict['actor']}`). Do not burn or merge "
+                    "automatically.\n\n"
+                    f"{gate}"
+                ),
+                github=github,
+                repository=repository,
+                pr_number=pr_number,
+                head_sha=head_sha,
+                decision="exhaustion_gate",
+            ):
+                return
             print(
                 f"review loop exhausted for {repository}#{pr_number} "
                 f"(head={head_sha}, substitute findings={total})"
@@ -2532,36 +4544,46 @@ def route_substitute_verdict(event: Mapping[str, Any]) -> None:
                 reviews,
                 review_comments,
                 codex_login,
-                latest_kind_by_head=latest_result_kind_by_head(
+                latest_results=latest_result_by_head(
                     codex_result_events(
                         github,
                         reviews,
                         [*conversation_comments, comment],
                         codex_login,
+                        pr_number=pr_number,
+                        review_comments=review_comments,
                     )
                 ),
                 head_bases=head_bases,
                 issue_comments=[*conversation_comments, comment],
             )
-            publish_exhaustion_retrospective(
-                slack,
-                findings=[],
-                history=history,
-                pr_url=pr_url,
-                branch=branch,
-                head_sha=head_sha,
-                base_ref=base_ref,
-                base_sha=base_sha,
+            deliver_wake(
+                lambda: publish_exhaustion_retrospective(
+                    slack,
+                    github=github,
+                    findings=[],
+                    history=history,
+                    pr_url=pr_url,
+                    branch=branch,
+                    head_sha=head_sha,
+                    base_ref=base_ref,
+                    base_sha=base_sha,
+                    repository=repository,
+                    author=author,
+                    author_actor=author_actor,
+                    review_round=review_round,
+                    pr_number=pr_number,
+                    substitute={
+                        "actor": verdict["actor"],
+                        "counts": verdict["counts"],
+                        "body": str(comment.get("body") or ""),
+                    },
+                ),
+                github=github,
                 repository=repository,
-                author=author,
-                author_actor=author_actor,
-                review_round=review_round,
                 pr_number=pr_number,
-                substitute={
-                    "actor": verdict["actor"],
-                    "counts": verdict["counts"],
-                    "body": str(comment.get("body") or ""),
-                },
+                head_sha=head_sha,
+                decision="exhaustion_retrospective",
             )
             return
         review_comments = github.paginate(f"pulls/{pr_number}/comments")
@@ -2570,9 +4592,14 @@ def route_substitute_verdict(event: Mapping[str, Any]) -> None:
             reviews,
             review_comments,
             codex_login,
-            latest_kind_by_head=latest_result_kind_by_head(
+            latest_results=latest_result_by_head(
                 codex_result_events(
-                    github, reviews, [*conversation_comments, comment], codex_login
+                    github,
+                    reviews,
+                    [*conversation_comments, comment],
+                    codex_login,
+                    pr_number=pr_number,
+                    review_comments=review_comments,
                 )
             ),
             issue_comments=[*conversation_comments, comment],
@@ -2580,7 +4607,6 @@ def route_substitute_verdict(event: Mapping[str, Any]) -> None:
         messages = build_burn_messages(
             findings=[],
             review_state=f"substitute-findings:{verdict['actor']}",
-            word=word,
             pr_url=pr_url,
             branch=branch,
             head_sha=head_sha,
@@ -2589,7 +4615,6 @@ def route_substitute_verdict(event: Mapping[str, Any]) -> None:
             repository=repository,
             author=author,
             author_actor=author_actor,
-            has_merge_on_green="merge-on-green" in labels,
             review_round=review_round,
             history=history,
             substitute={
@@ -2598,12 +4623,49 @@ def route_substitute_verdict(event: Mapping[str, Any]) -> None:
                 "body": str(comment.get("body") or ""),
             },
         )
-        post_threaded_messages(slack, messages)
-        print(
-            f"woke {burn_actor()} for {repository}#{pr_number} "
-            f"(substitute findings by {verdict['actor']}, "
-            f"counts={verdict['counts']}, messages={len(messages)})"
+        counts = verdict["counts"]
+        belt_verdict(
+            pr_number=pr_number,
+            head_sha=head_sha,
+            verdict_kind="substitute-findings",
+            decision="burn_wake",
+            source_event_at=comment.get("created_at"),
+            review_round=review_round,
+            rounds_consumed=len(reviewed_heads),
+            counts={
+                **counts,
+                "total": counts["p1"] + counts["p2"] + counts["p3"],
+            },
+            author_seat=author_actor,
+            review_state=f"substitute-findings:{verdict['actor']}",
+            base_ref=base_ref,
+            base_sha=base_sha,
+            chunks=len(messages),
+            substitute=str(verdict["actor"]),
+            head_commit_age=belt().head_commit_age_seconds(github, head_sha),
         )
+        if deliver_wake(
+            lambda: post_threaded_messages(
+                slack,
+                messages,
+                github=github,
+                repository=repository,
+                pr_number=pr_number,
+                head_sha=head_sha,
+                decision="burn_wake",
+            ),
+            github=github,
+            repository=repository,
+            pr_number=pr_number,
+            head_sha=head_sha,
+            decision="burn_wake",
+            chunks=len(messages),
+        ):
+            print(
+                f"woke {burn_actor()} for {repository}#{pr_number} "
+                f"(substitute findings by {verdict['actor']}, "
+                f"counts={verdict['counts']}, messages={len(messages)})"
+            )
         return
     stale_ref = stale_base_ref_for_closure(conversation_comments, head_sha, base_ref)
     if stale_ref is not None:
@@ -2613,6 +4675,16 @@ def route_substitute_verdict(event: Mapping[str, Any]) -> None:
             f"the PR now targets `{base_ref}` — the head SHA alone no longer "
             "names the reviewed subject; resolve the retarget and request a "
             "fresh exact-head review"
+        )
+        belt().event(
+            "belt.closure.refused",
+            **{
+                "logfire.msg": "clean closure refused: stale-base-ref",
+                "reason": "stale-base-ref",
+                "pull_request": pr_number,
+                "head_sha": head_sha,
+                "base_ref": base_ref,
+            },
         )
         return
     retargeted_at = base_retarget_after(
@@ -2625,24 +4697,55 @@ def route_substitute_verdict(event: Mapping[str, Any]) -> None:
             "verdict was formed — the review's subject is not the PR as now "
             "targeted; request a fresh exact-head review"
         )
-        return
-    slack.post_message(
-        clean_wake_message(
-            author_actor=author_actor,
-            author=author,
-            head_sha=head_sha,
-            review_round=review_round,
-            review_state=f"substitute-clean:{verdict['actor']}",
-            word=word,
-            pr_url=pr_url,
-            branch=branch,
-            verdict_source=f"substitute review (`{verdict['actor']}`)",
+        belt().event(
+            "belt.closure.refused",
+            **{
+                "logfire.msg": "clean closure refused: base-retargeted",
+                "reason": "base-retargeted",
+                "pull_request": pr_number,
+                "head_sha": head_sha,
+                "base_ref": base_ref,
+            },
         )
+        return
+    belt_verdict(
+        pr_number=pr_number,
+        head_sha=head_sha,
+        verdict_kind="substitute-clean",
+        decision="clean_wake",
+        source_event_at=comment.get("created_at"),
+        review_round=review_round,
+        rounds_consumed=len(reviewed_heads),
+        author_seat=author_actor,
+        review_state=f"substitute-clean:{verdict['actor']}",
+        base_ref=base_ref,
+        base_sha=base_sha,
+        substitute=str(verdict["actor"]),
+        head_commit_age=belt().head_commit_age_seconds(github, head_sha),
     )
-    print(
-        f"woke {author_actor} for {repository}#{pr_number} "
-        f"(substitute clean by {verdict['actor']})"
-    )
+    if deliver_wake(
+        lambda: slack.post_message(
+            clean_wake_message(
+                author_actor=author_actor,
+                author=author,
+                head_sha=head_sha,
+                review_round=review_round,
+                review_state=f"substitute-clean:{verdict['actor']}",
+                pr_url=pr_url,
+                branch=branch,
+                verdict_source=f"substitute review (`{verdict['actor']}`)",
+            )
+        ),
+        github=github,
+        repository=repository,
+        pr_number=pr_number,
+        head_sha=head_sha,
+        decision="clean_wake",
+    ):
+        print(
+            f"woke {author_actor} for {repository}#{pr_number} "
+            f"(substitute clean by {verdict['actor']})"
+        )
 
 
 def summon_on_refusal(issue: Mapping[str, Any], repository: str) -> None:
@@ -2657,7 +4760,7 @@ def summon_on_refusal(issue: Mapping[str, Any], repository: str) -> None:
         print(f"ignored quota refusal on non-open PR #{pr_number}")
         return
     codex_login = os.environ.get("CODEX_LOGIN", CODEX_LOGIN)
-    nudged, summoned, redelivered = _scan_open_pull(
+    nudged, summoned, redelivered, chased = _scan_open_pull(
         github,
         pull_request,
         repository=repository,
@@ -2667,7 +4770,8 @@ def summon_on_refusal(issue: Mapping[str, Any], repository: str) -> None:
     )
     print(
         f"refusal-routed PR #{pr_number} "
-        f"(nudged={nudged}, summoned={summoned}, redelivered={redelivered})"
+        f"(nudged={nudged}, summoned={summoned}, redelivered={redelivered}, "
+        f"chased={chased})"
     )
 
 
@@ -2773,9 +4877,7 @@ def bare_nudge_covers_head(
     committer date, which would falsely suppress re-nudges for the current SHA.
     Marker text alone is not enough — only a trusted control identity counts.
     """
-    return marker_comment_exists(
-        comments, (nudge_marker(head_sha), legacy_nudge_marker(head_sha))
-    )
+    return marker_comment_exists(comments, nudge_marker_pattern(head_sha))
 
 
 def exact_head_codex_reviews(
@@ -2852,7 +4954,7 @@ def standing_findings(
 
 def same_head_findings_reviews_since_clean(
     reviews: Sequence[Mapping[str, Any]],
-    result_events: Sequence[tuple[datetime, int, str, str]],
+    result_events: Sequence[tuple[datetime, int, str, str, str]],
     head_sha: str,
     codex_login: str,
 ) -> list[Mapping[str, Any]]:
@@ -2864,7 +4966,7 @@ def same_head_findings_reviews_since_clean(
     """
     wanted = head_sha.lower()
     last_clean_at: datetime | None = None
-    for at, _order, head, kind in result_events:
+    for at, _order, head, kind, _source in result_events:
         if kind == "clean" and str(head).lower() == wanted:
             last_clean_at = at
     standing: list[Mapping[str, Any]] = []
@@ -2892,6 +4994,394 @@ def latest_exact_head_review(
     )[1]
 
 
+def retrospective_chase_wake_message(
+    *,
+    pr_url: str,
+    pr_number: int,
+    repository: str,
+    head_sha: str,
+    requested_at: datetime,
+    pr_state: str = "open",
+) -> str:
+    """Re-ask for a requested retrospective that never reached the PR.
+
+    A pointer, not a second digest: the evidence was delivered once and the
+    thread still holds it.  Re-sending the per-round history would make this
+    look like a fresh dispatch, and it is not — no new round, no repair
+    authority, no merge authority, and no reviewer is summoned.
+
+    A chase can reach a seat after the PR has been closed or merged, because
+    closure inside the delivery window is a normal outcome.  The wake says so
+    where that is true: the testimony is still owed and still historical, but a
+    seat that has to derive the closure from the PR itself has spent a wake
+    finding out what this line could have told it.
+    """
+    stamp = requested_at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    state_line = (
+        ""
+        if pr_state == "open"
+        else (
+            f"State: `{pr_state}` — the PR is no longer open. The retrospective "
+            "is testimony about a finished sequence: still owed, still gating "
+            "nothing, and the closure is not yours to revisit.\n"
+        )
+    )
+    return (
+        f"WAKE: {RETROSPECTIVE_ACTOR}\n\n"
+        "Review-loop hook: an exhaustion retrospective was requested from you "
+        f"at `{stamp}` and no verdict has reached the PR. This is a "
+        "redelivery of that one request, not a second one: it carries no "
+        "repair, re-review or merge authority, and it adds no review round.\n\n"
+        f"PR: {pr_url}\n"
+        f"Head: `{head_sha}`\n"
+        f"Repo: `{repository}`\n"
+        f"{state_line}\n"
+        "The original wake and its per-round evidence are in this thread's "
+        "history, above; the exhaustion gate and the request receipt are on "
+        "the PR. If you already wrote the verdict, it is on a disk and not "
+        "here — post the file:\n\n"
+        f"    gh pr comment {pr_number} -R {repository} --body-file <path>\n\n"
+        "`--body @<path>` posts the literal string `@<path>`; `gh` has no "
+        "`@file` idiom. End the body with exactly:\n\n"
+        f"    {retrospective_marker(head_sha)}\n\n"
+        "Silence is a legitimate verdict, but it is not a legitimate "
+        "delivery: if there is nothing that generalises, post that finding "
+        "with the marker. One more miss and the gap is stated on the PR."
+    )
+
+
+def retrospective_chase_comment_body(head_sha: str, attempt: int) -> str:
+    """The durable record of one chase; attempt ``RETROSPECTIVE_CHASE_ATTEMPTS`` names the gap.
+
+    The last attempt is deliberately the loud one (R-3): a retrospective that
+    was asked for and never arrived is a failure of the loop's third hook, and
+    a failure nobody can see from the evidence is the defect this whole leg
+    exists to close.  Two attempts, then it is a human's — automation that
+    keeps asking is not persistence.
+    """
+    if attempt < RETROSPECTIVE_CHASE_ATTEMPTS:
+        return (
+            "Review-loop: the exhaustion retrospective requested for head "
+            f"`{head_sha}` has not been posted here; `{RETROSPECTIVE_ACTOR}` "
+            f"was re-woken once (attempt {attempt} of "
+            f"{RETROSPECTIVE_CHASE_ATTEMPTS}). Attention only — no review "
+            "round, no repair authority, no merge authority.\n"
+            f"{retrospective_chase_marker(head_sha, attempt)}"
+        )
+    return (
+        "## Exhaustion retrospective not delivered\n\n"
+        f"The review loop asked `{RETROSPECTIVE_ACTOR}` for a structural "
+        f"retrospective on head `{head_sha}` and re-asked once. No verdict "
+        "carrying the retrospective marker has reached this PR, so the "
+        "testimony behind this PR's exhaustion is unrecorded on the evidence "
+        "it concerns.\n\n"
+        f"Automation stops here: {RETROSPECTIVE_CHASE_ATTEMPTS} attempts is "
+        "the bound, and a third would be repetition rather than persistence. "
+        "This changes nothing about the PR — the retrospective never gated, "
+        "repaired, re-reviewed or merged anything, and the human gate above "
+        "still stands on its own. It is a human's call whether the verdict is "
+        "still owed.\n"
+        f"{retrospective_chase_marker(head_sha, attempt)}"
+    )
+
+
+def chase_undelivered_retrospective(
+    github: GitHubApi,
+    *,
+    pr_number: int,
+    pr_url: str,
+    head_sha: str,
+    comments: Sequence[Mapping[str, Any]],
+    repository: str,
+    now: datetime,
+    pr_state: str = "open",
+) -> int:
+    """Chase a requested-but-undelivered retrospective; returns 1 if it acted.
+
+    The third review-loop hook produces exactly one artifact — the verdict —
+    and until now nothing asked whether it arrived.  A retrospective that was
+    never written and one still being written are the same silence, which is
+    how sokrates#1113's verdict sat on a disk for eight days with the loop
+    reporting nothing wrong.
+
+    Four facts gate the chase, and each one is a way of not inventing an
+    obligation:
+
+    * a **request receipt** for this head — a gate alone is not a request, and
+      the scheduled exhaustion path posts a gate and wakes nobody;
+    * **no delivery receipt** for this head;
+    * the request is **dated** and older than ``RETROSPECTIVE_DELIVERY_SECONDS``
+      — an undated receipt cannot be measured, and an unmeasurable window is
+      reported, not assumed elapsed;
+    * fewer than ``RETROSPECTIVE_CHASE_ATTEMPTS`` chases already spent.
+
+    The first two are re-taken below on freshly fetched comments, past the head
+    refresh and before the first act: ``comments`` is the scan's opening
+    snapshot, the seat can deliver at any point inside that pass, and a chase
+    decided on the snapshot accuses it of a silence it is not guilty of.
+
+    Every one of them is keyed to the exact head, so a push after the gate
+    ends the chase.  That is deliberate and it is the same rule the standing
+    verdict follows: the moved head starts a fresh cycle, and asking for
+    testimony about evidence the PR has left is asking for the wrong verdict.
+
+    It never gates, repairs, re-reviews, merges, or summons a reviewer
+    (KRA-1029's charter); it asks only whether the verdict was delivered.
+    """
+    if retrospective_delivered(comments, head_sha):
+        return 0
+    requested_at = trusted_marker_time(
+        comments, retrospective_wake_marker_pattern(head_sha)
+    )
+    if requested_at is None:
+        # No receipt, or one with no usable timestamp.  Either way there is no
+        # window to measure, and an unmeasured window is not an elapsed one.
+        return 0
+    if (now - requested_at).total_seconds() < RETROSPECTIVE_DELIVERY_SECONDS:
+        return 0
+    spent = retrospective_chase_attempts(comments, head_sha)
+    if spent >= RETROSPECTIVE_CHASE_ATTEMPTS:
+        return 0
+    attempt = spent + 1
+    # The second window runs from the last chase, not from the request: the
+    # re-wake is what restarts the clock, so measuring both attempts off one
+    # anchor would fire them on consecutive scans.
+    if spent:
+        last_chase_at = trusted_marker_time(
+            comments, retrospective_chase_marker_pattern(head_sha, spent)
+        )
+        if last_chase_at is None:
+            print(
+                f"undated retrospective chase marker on {repository}#{pr_number} "
+                f"(head={head_sha}, attempt {spent}); not escalating"
+            )
+            return 0
+        if (now - last_chase_at).total_seconds() < RETROSPECTIVE_DELIVERY_SECONDS:
+            return 0
+    if (
+        refresh_pr_at_head(
+            github,
+            pr_number,
+            head_sha,
+            repository,
+            action="retrospective chase",
+            # The one publication whose subject survives closure: this leg is
+            # deliberately swept over recently closed PRs, so the chokepoint's
+            # liveness rule would delete it rather than protect it.  Head
+            # exactness still refuses — a push after the gate ends the chase.
+            require_open=False,
+        )
+        is None
+    ):
+        return 0
+    # ``comments`` was read at the top of the scan, and the seat this leg is
+    # about to chase can post the retrospective at any moment inside that pass —
+    # including while the head refresh above is in flight.  Acting on the stale
+    # list costs a needless wake on attempt 1 and, on attempt 2, publicly states
+    # that testimony was never delivered when it was.  So the decision is
+    # re-taken here, on freshly fetched comments, immediately before the first
+    # act: the accusation is public and irreversible, and the one input that
+    # falsifies it is the cheapest thing in this pass to read again.
+    live = github.paginate(f"issues/{pr_number}/comments")
+    if retrospective_delivered(live, head_sha):
+        print(
+            f"retrospective for {repository}#{pr_number} arrived while the chase "
+            f"was being prepared (head={head_sha}); not chasing"
+        )
+        return 0
+    if retrospective_chase_attempts(live, head_sha) >= attempt:
+        print(
+            f"retrospective chase attempt {attempt} for {repository}#{pr_number} "
+            f"was already recorded (head={head_sha}); not chasing"
+        )
+        return 0
+    # Last, and only here: a corpus declared exempt after the request leaves
+    # every review-loop path, this chase included.  Asked after every cheap
+    # gate so the closed sweep reads a file list only for a closure it is
+    # actually about to chase, never for every closure in its window.
+    if loop_exempt_pr(github, pr_number):
+        print(
+            f"loop-exempt PR {repository}#{pr_number} - retrospective chase "
+            f"withdrawn (head={head_sha})"
+        )
+        return 0
+    if attempt < RETROSPECTIVE_CHASE_ATTEMPTS:
+        # Slack first, then the marker: a marker written before a failed wake
+        # would spend an attempt nobody received.
+        slack = SlackApi(required_env("HIVE_BOT_TOKEN"), required_env("HIVE_CHANNEL"))
+        slack.post_message(
+            retrospective_chase_wake_message(
+                pr_url=pr_url,
+                pr_number=pr_number,
+                repository=repository,
+                head_sha=head_sha,
+                requested_at=requested_at,
+                pr_state=pr_state,
+            )
+        )
+    github.post(
+        f"issues/{pr_number}/comments",
+        {"body": retrospective_chase_comment_body(head_sha, attempt)},
+    )
+    print(
+        f"chased undelivered retrospective for {repository}#{pr_number} "
+        f"(head={head_sha}, attempt {attempt}/{RETROSPECTIVE_CHASE_ATTEMPTS})"
+    )
+    belt().event(
+        "belt.retrospective.chase",
+        **{
+            "logfire.msg": (
+                f"#{pr_number} retrospective undelivered: attempt {attempt}/"
+                f"{RETROSPECTIVE_CHASE_ATTEMPTS}"
+            ),
+            "pull_request": pr_number,
+            "head_sha": head_sha,
+            "retrospective_actor": RETROSPECTIVE_ACTOR,
+            "attempt": attempt,
+            "max_attempts": RETROSPECTIVE_CHASE_ATTEMPTS,
+            "pull_request_state": pr_state,
+            "requested_at": requested_at.astimezone(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+            "undelivered_seconds": int((now - requested_at).total_seconds()),
+        },
+    )
+    return 1
+
+
+def chase_closed_pull_retrospectives(
+    github: GitHubApi,
+    *,
+    repository: str,
+    now: datetime,
+) -> tuple[int, list[tuple[int, Exception]]]:
+    """Chase pending retrospectives on recently closed PRs; ``(chased, errors)``.
+
+    The other caller of the chase enumerates ``state="open"``, and a PR closed
+    inside either delivery window would drop out of that enumeration with the
+    request receipt still standing and nothing else ever reading it.  Closure
+    there is a *normal* outcome, not an edge: the retrospective is testimony, it
+    gates nothing, and the exhaustion gate hands the close to a human by design.
+    The closure event itself cannot do this work either — at closure time the
+    window has not elapsed, so a check there would always find nothing owed —
+    which leaves a bounded backward sweep as the reconciliation that fits.
+
+    The window is sized for the schedule, not for the work: both windows put the
+    last possible chase within ~2h of the request, while the scheduled leg is
+    throttled to a fire every ten hours or so under load and has to find the row
+    when it next runs.  Re-sweeping is free of consequence — the delivery receipt
+    and the attempt markers are the same durable state the open path reads, so a
+    row with nothing outstanding returns 0 — and it costs one comment fetch per
+    closed PR in the window.
+
+    Errors are returned rather than raised: one unreadable closure must not
+    abort the pass, or every eligible row behind it is re-skipped on every retry
+    until it ages past the horizon.
+    """
+    horizon = now - timedelta(hours=RETROSPECTIVE_CLOSED_SWEEP_HOURS)
+    chased = 0
+    errors: list[tuple[int, Exception]] = []
+    page = 1
+    # Paged by hand, like the belt sweep: ``paginate`` materializes every page
+    # before returning, and the horizon below can only bound a stream it reads.
+    while True:
+        batch = github.get(
+            "pulls",
+            query={
+                "state": "closed",
+                "sort": "updated",
+                "direction": "desc",
+                "per_page": 100,
+                "page": page,
+            },
+        )
+        if not isinstance(batch, list) or not batch:
+            break
+        stop = False
+        for pull_request in batch:
+            if not isinstance(pull_request, Mapping):
+                continue
+            # Closing a PR updates it, so ``updated_at >= closed_at``: once the
+            # update stream falls past the horizon no later row can be inside it.
+            if result_event_time(pull_request.get("updated_at")) < horizon:
+                stop = True
+                break
+            if result_event_time(pull_request.get("closed_at")) < horizon:
+                continue
+            head = pull_request.get("head")
+            if not isinstance(head, Mapping) or not head.get("sha"):
+                continue
+            number = int(pull_request.get("number") or 0)
+            try:
+                chased += chase_undelivered_retrospective(
+                    github,
+                    pr_number=number,
+                    pr_url=str(
+                        pull_request.get("html_url") or f"{repository}#{number}"
+                    ),
+                    head_sha=str(head["sha"]),
+                    comments=github.paginate(f"issues/{number}/comments"),
+                    repository=repository,
+                    now=now,
+                    pr_state=str(pull_request.get("state") or "closed"),
+                )
+            except Exception as error:  # noqa: BLE001 - one closure, not the pass.
+                print(
+                    f"closed-PR retrospective chase failed for "
+                    f"{repository}#{number}: {type(error).__name__}: {error}",
+                    file=sys.stderr,
+                )
+                errors.append((number, error))
+                continue
+        if stop or len(batch) < 100:
+            break
+        page += 1
+    return chased, errors
+
+
+def snapshotted_verdict_is_still_latest(
+    github: GitHubApi,
+    *,
+    pr_number: int,
+    head_sha: str,
+    codex_login: str,
+    verdict_at: datetime,
+    latest_kind: str,
+) -> bool:
+    """Re-read the standing verdict at the publication itself.
+
+    ``redeliver_standing_wake`` is handed reviews and comments snapshotted at
+    the start of the scheduled scan.  Under the (family, subject) concurrency
+    key, that scan shares no group with ``verdict-<pr>``, so a new review or
+    clean comment can land and be published by the event route while this
+    snapshot is still in hand.  ``publishable_at_head`` only re-checks PR and
+    head liveness; posting the snapshot after that live verdict is how an old
+    CLEAN wake reaches the author after a findings wake and incorrectly
+    invites a merge.  Re-fetch here and refuse unless the live latest is
+    still the one we snapshotted.
+    """
+    live_reviews = list(github.paginate(f"pulls/{pr_number}/reviews"))
+    live_comments = list(github.paginate(f"issues/{pr_number}/comments"))
+    live_at = standing_verdict_time(
+        github, live_reviews, live_comments, head_sha, codex_login
+    )
+    if live_at != verdict_at:
+        return False
+    live_kind = (
+        latest_result_by_head(
+            codex_result_events(
+                github,
+                live_reviews,
+                live_comments,
+                codex_login,
+                pr_number=pr_number,
+            )
+        ).get(head_sha)
+        or {}
+    ).get("kind")
+    return live_kind == latest_kind
+
+
 def redeliver_standing_wake(
     github: GitHubApi,
     *,
@@ -2914,9 +5404,10 @@ def redeliver_standing_wake(
     only.  It adds no review round, no repair authority, and no merge authority,
     and it never summons a reviewer.
 
-    "Acted" is a head change or a trusted product-gate or noise marker on
-    this head dated at or after the standing verdict. An unchanged head past
-    the window with none of those is a stall.
+    "Acted" is a head change or any trusted head-disposition marker
+    (``product-gate`` / ``noise`` / ``hold``) on this head dated at or after
+    the standing verdict. An unchanged head past the window with none of those
+    is a stall.
     """
     gate_state = exhaustion_marker_state(comments, head_sha)
     if gate_state == "terminal":
@@ -2940,26 +5431,23 @@ def redeliver_standing_wake(
             f"(head={head_sha}); nothing to re-deliver"
         )
         return False
-    gated_at = trusted_marker_time(
-        comments,
-        (product_gate_marker(head_sha), legacy_product_gate_marker(head_sha)),
-    )
-    if gated_at is not None and verdict_at <= gated_at:
-        print(
-            f"product-gate recorded for {repository}#{pr_number} "
-            f"(head={head_sha}); not a stall"
+    # ``verdict_at <= disposed_at`` and not an unconditional stop, for the hold
+    # as much as for the other two (KRA-1326 asked this to be decided): a
+    # verdict that lands *after* the gate is news the gate's author has not
+    # seen, it has already cost its round, and re-delivery is attention-only.
+    # Silencing it would hide from the human exactly the review the incident
+    # shows can still arrive at a held head.  Suppressing the *summon* is what
+    # stops the round being spent; that is sited in ``_scan_open_pull``.
+    for kind in HEAD_DISPOSITION_PREFIXES:
+        disposed_at = trusted_marker_time(
+            comments, head_disposition_pattern(kind, head_sha)
         )
-        return False
-    noised_at = trusted_marker_time(
-        comments,
-        (noise_marker(head_sha), legacy_noise_marker(head_sha)),
-    )
-    if noised_at is not None and verdict_at <= noised_at:
-        print(
-            f"noise recorded for {repository}#{pr_number} "
-            f"(head={head_sha}); not a stall"
-        )
-        return False
+        if disposed_at is not None and verdict_at <= disposed_at:
+            print(
+                f"{kind} recorded for {repository}#{pr_number} "
+                f"(head={head_sha}); not a stall"
+            )
+            return False
     if (now - verdict_at).total_seconds() < WAKE_REDELIVERY_SECONDS:
         return False
     verdict_stamp = verdict_at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -2976,8 +5464,10 @@ def redeliver_standing_wake(
     # digest.  A later findings review does not — GitHub does not resolve the
     # earlier review's comments, so the digest is the union since the most
     # recent CLEAN.  Zero retrievable inlines is not CLEAN.
-    result_events = codex_result_events(github, reviews, comments, codex_login)
-    latest_kind = latest_result_kind_by_head(result_events).get(head_sha)
+    result_events = codex_result_events(
+        github, reviews, comments, codex_login, pr_number=pr_number
+    )
+    latest_kind = (latest_result_by_head(result_events).get(head_sha) or {}).get("kind")
     latest_review = latest_exact_head_review(reviews, head_sha, codex_login)
     clean_verdict = latest_kind == "clean"
     if clean_verdict:
@@ -2996,16 +5486,6 @@ def redeliver_standing_wake(
             f"no authoritative same-head verdict for {repository}#{pr_number} "
             f"(head={head_sha}); nothing to re-deliver"
         )
-        return False
-    listed_labels = {
-        str(label.get("name"))
-        for label in pull_request.get("labels", [])
-        if isinstance(label, Mapping)
-    }
-    if clean_verdict and "merge-on-green" not in listed_labels:
-        # Cost pre-filter on the listed PR, re-checked authoritatively below: a
-        # plain CLEAN head is parked at ready-for-review forever, and paying two
-        # lookups per scan for a state that never redelivers is pure waste.
         return False
     substitute_standing = (
         standing_substitute_findings(comments, head_sha) if not clean_verdict else None
@@ -3031,32 +5511,14 @@ def redeliver_standing_wake(
     )
     if pr_state is None:
         return False
-    if str(pr_state.get("state") or "") != "open":
-        print(
-            f"ignored wake redelivery for a closed {repository}#{pr_number} "
-            f"(head={head_sha})"
-        )
-        return False
     refreshed_head = pr_state.get("head")
     if not isinstance(refreshed_head, Mapping):
         raise TypeError("live pull_request.head is missing")
-    labels = {
-        str(label.get("name"))
-        for label in pr_state.get("labels", [])
-        if isinstance(label, Mapping)
-    }
-    has_merge_on_green = "merge-on-green" in labels
-    if clean_verdict and not has_merge_on_green:
-        # The live label, not the listed one: ready-for-review is a correct
-        # parked state, and only merge-on-green CLEAN carries a standing
-        # mechanical action to re-deliver.
-        return False
     if not clean_verdict and not findings and substitute_standing is None:
         return False
     branch = str(refreshed_head["ref"])
     pr_url = str(pr_state.get("html_url") or f"{repository}#{pr_number}")
     review_round = result_round_for_head(reviewed_heads, head_sha)
-    word = merge_word(has_merge_on_green)
 
     if clean_verdict:
         live_base_ref, _live_base_sha = pr_base(pr_state)
@@ -3085,7 +5547,6 @@ def redeliver_standing_wake(
                 head_sha=head_sha,
                 review_round=review_round,
                 review_state="clean-comment",
-                word=word,
                 pr_url=pr_url,
                 branch=branch,
             )
@@ -3098,7 +5559,7 @@ def redeliver_standing_wake(
             reviews,
             review_comments,
             codex_login,
-            latest_kind_by_head=latest_result_kind_by_head(result_events),
+            latest_results=latest_result_by_head(result_events),
             issue_comments=comments,
         )
         # Mixed sources on one head (Codex inline findings AND a later
@@ -3127,7 +5588,6 @@ def redeliver_standing_wake(
             findings=findings,
             review_state=review_state,
             substitute=substitute_payload,
-            word=word,
             pr_url=pr_url,
             branch=branch,
             head_sha=head_sha,
@@ -3136,14 +5596,59 @@ def redeliver_standing_wake(
             repository=repository,
             author=author,
             author_actor=author_actor,
-            has_merge_on_green=has_merge_on_green,
             review_round=review_round,
             history=history,
         )
     messages[0] = f"{redelivery_notice(verdict_stamp)}\n\n{messages[0]}"
 
     slack = SlackApi(required_env("HIVE_BOT_TOKEN"), required_env("HIVE_CHANNEL"))
-    post_threaded_messages(slack, messages)
+    # This leg publishes directly rather than through ``deliver_wake`` (its
+    # record is ``belt.redelivery``, not ``belt.delivery``), so the publication
+    # boundary is re-checked here for the same reason: the reads above —
+    # author, retarget probe, review comments, history — all happen after the
+    # route's own refresh, and a PR that merged inside that window must not be
+    # re-delivered to a seat.
+    #
+    # Liveness is not enough.  The reviews and comments this wake was built
+    # from were snapshotted at the top of the scan; ``verdict-<pr>`` can
+    # publish a newer same-head verdict while that scan is still in
+    # ``sweep``.  Re-validate the standing verdict immediately before the
+    # liveness check, or a stale CLEAN follows a live findings wake and
+    # invites a merge.
+    if not snapshotted_verdict_is_still_latest(
+        github,
+        pr_number=pr_number,
+        head_sha=head_sha,
+        codex_login=codex_login,
+        verdict_at=verdict_at,
+        latest_kind=str(latest_kind),
+    ):
+        print(
+            f"refused stale redelivery for {repository}#{pr_number}: "
+            f"head {head_sha} no longer carries the snapshotted standing "
+            f"verdict ({verdict_stamp} {latest_kind})"
+        )
+        return False
+    if not publishable_at_head(
+        github, pr_number, head_sha, repository, decision="redelivery"
+    ):
+        return False
+    try:
+        post_threaded_messages(
+            slack,
+            messages,
+            github=github,
+            repository=repository,
+            pr_number=pr_number,
+            head_sha=head_sha,
+            decision="redelivery",
+        )
+    except PublicationWithheld:
+        # The check above protects the thread root; the protocol's own check
+        # protects the dispatch, and a refusal there is this leg's refusal one
+        # HTTP hop later.  No marker: the one redelivery this verdict gets was
+        # never delivered, and duplicate delivery is the safe direction.
+        return False
     # Slack first, then the marker. A Slack failure leaves no marker, so the next
     # tick retries — duplicate delivery is the safe direction. A marker failure
     # after a successful post raises out of the scan rather than being swallowed.
@@ -3154,6 +5659,19 @@ def redeliver_standing_wake(
     print(
         f"re-delivered standing wake for {repository}#{pr_number} "
         f"(head={head_sha}, findings={len(findings)}, verdict={verdict_stamp})"
+    )
+    belt().event(
+        "belt.redelivery",
+        **{
+            "logfire.msg": f"#{pr_number} standing verdict re-delivered",
+            "pull_request": pr_number,
+            "head_sha": head_sha,
+            "findings_total": len(findings),
+            "verdict_kind": "clean" if clean_verdict else "findings",
+            "verdict_at": verdict_stamp,
+            "wake_chunks": len(messages),
+            "rounds_consumed": len(reviewed_heads),
+        },
     )
     return True
 
@@ -3431,7 +5949,8 @@ def substitute_review_wake_message(
         f"WAKE: {actor}\n\n"
         "Review-loop router: the Codex find half is unavailable for this "
         f"summon ({reason}). You hold this review round — load skill "
-        "`substitute-review`; it is this seat's conduct contract.\n\n"
+        "`code-review` and its Weave integration reference; "
+        "they define this seat's review and delivery contract.\n\n"
         f"PR: {pr_url}\n"
         f"Repo: `{repository}`\n"
         f"Branch: `{branch}`\n"
@@ -3451,16 +5970,22 @@ class ScanCompletedWithErrors(RuntimeError):
 
     Raised *after* the loop so the workflow run still terminalizes red (R-3)
     without one poisoned PR blinding every PR enumerated after it.
+
+    Every scheduled scan over a window of PRs owes this shape.  A scan that
+    lets one row abort the pass re-skips the same survivors on every retry
+    for as long as the poisoned row stays in the window, which is silence
+    that looks exactly like an empty window.
     """
 
-    def __init__(self, errors: Sequence[tuple[int, Exception]]) -> None:
+    def __init__(self, scan: str, errors: Sequence[tuple[int, Exception]]) -> None:
+        self.scan = scan
         self.errors = list(errors)
         summary = "; ".join(
             f"#{number}: {type(error).__name__}: {error}"
             for number, error in self.errors
         )
         super().__init__(
-            f"nudge scan completed with {len(self.errors)} PR error(s): {summary}"
+            f"{scan} scan completed with {len(self.errors)} PR error(s): {summary}"
         )
 
 
@@ -3473,8 +5998,8 @@ def _scan_open_pull(
     now: datetime,
     usage_meter: Mapping[str, Any] | None | object = _FETCH_METER,
     stall_gate: bool = True,
-) -> tuple[int, int, int]:
-    """Reconcile one open PR; returns ``(nudged, summoned, redelivered)`` deltas.
+) -> tuple[int, int, int, int]:
+    """Reconcile one open PR; returns ``(nudged, summoned, redelivered, chased)``.
 
     ``stall_gate=False`` is the event path: a live quota refusal has already
     proven the head will not be reviewed by waiting, so the commit-age
@@ -3482,19 +6007,41 @@ def _scan_open_pull(
     """
     head = pull_request.get("head")
     if not isinstance(head, Mapping):
-        return (0, 0, 0)
+        return (0, 0, 0, 0)
     commit = github.get(f"commits/{head['sha']}")
     author = commit_author_name(commit)
-    if author not in SEAT_ACTORS:
-        return (0, 0, 0)
+    if author not in seat_map(same_repo=head_is_same_repo(pull_request)):
+        return (0, 0, 0, 0)
     committed_at = review_stall_anchor(commit, pull_request, now)
     if stall_gate and (now - committed_at).total_seconds() < REVIEW_STALL_SECONDS:
-        return (0, 0, 0)
+        return (0, 0, 0, 0)
     pr_number = int(pull_request["number"])
+    if loop_exempt_pr(github, pr_number):
+        # No summon, no nudge, no redelivery, no exhaustion gate: the corpus's
+        # own gate (weekly skill audit, or the repo's mechanical CI for its
+        # declared recipe and law roots) is the whole quality bar.
+        print(f"loop-exempt PR {repository}#{pr_number} - review loop exempt")
+        return (0, 0, 0, 0)
     reviews = github.paginate(f"pulls/{pr_number}/reviews")
     head_sha = str(head["sha"])
     comments = github.paginate(f"issues/{pr_number}/comments")
-    reviewed_heads = codex_result_heads(github, reviews, comments, codex_login)
+    # Before every branch below, because an exhausted head returns early on
+    # both of the first two: a delivery check sited after either one would
+    # never run on the exact PRs it exists for.  It is independent of the
+    # routing decisions that follow — it summons nobody and changes no round
+    # count — so it neither consumes nor is consumed by them.
+    chased = chase_undelivered_retrospective(
+        github,
+        pr_number=pr_number,
+        pr_url=str(pull_request.get("html_url") or f"{repository}#{pr_number}"),
+        head_sha=head_sha,
+        comments=comments,
+        repository=repository,
+        now=now,
+    )
+    reviewed_heads = codex_result_heads(
+        github, reviews, comments, codex_login, pr_number=pr_number
+    )
     if head_sha in reviewed_heads:
         # A reviewed head needs no reviewer, but its verdict may still be
         # standing unacted. The commit-age gate above is already satisfied
@@ -3513,8 +6060,8 @@ def _scan_open_pull(
             codex_login=codex_login,
             now=now,
         ):
-            return (0, 0, 1)
-        return (0, 0, 0)
+            return (0, 0, 1, chased)
+        return (0, 0, 0, chased)
     if len(reviewed_heads) >= MAX_REVIEW_ROUNDS:
         pr_url = str(pull_request.get("html_url") or f"{repository}#{pr_number}")
         gate = exhaustion_gate(
@@ -3542,15 +6089,46 @@ def _scan_open_pull(
                 action="exhaustion gate",
             )
             if pr_state is None:
-                return (0, 0, 0)
+                return (0, 0, 0, chased)
             github.post(f"issues/{pr_number}/comments", {"body": gate})
             print(f"exhausted PR #{pr_number}")
-        return (0, 0, 0)
+            belt().event(
+                "belt.exhaustion",
+                **{
+                    "logfire.msg": (
+                        f"#{pr_number} exhausted: no exact-head verdict after "
+                        f"{len(reviewed_heads)} rounds"
+                    ),
+                    "pull_request": pr_number,
+                    "head_sha": head_sha,
+                    "round": len(reviewed_heads),
+                    "max_review_rounds": MAX_REVIEW_ROUNDS,
+                    "gate_comment_state": gate_state,
+                    "reason": "unreviewed-head-past-bound",
+                },
+            )
+        return (0, 0, 0, chased)
+    # A seat-authored human gate holds this exact head.  An unreviewed head is
+    # the belt's only evidence of a stall, and a gate produces exactly that
+    # shape — no head change, no verdict — so without this the scheduled leg
+    # summons a reviewer and spends a round on a head the gate has already
+    # said cannot survive (sokrates#1107, round 5 of 7).
+    #
+    # Sited here on purpose: after the exhaustion branch and after the
+    # retrospective chase, before both summon routes.  The hold withholds a
+    # *reviewer*; it does not withhold the records that automation stopped,
+    # which cost no round and are what a human reads next.
+    if head_is_held(comments, head_sha):
+        print(
+            f"held head {repository}#{pr_number} (head={head_sha}): a "
+            "seat-authored human gate stands; no reviewer summoned"
+        )
+        return (0, 0, 0, chased)
     # A standing substitute summon owns the head in both directions: it is an
     # assignment to a seat, and recomputing ownership when the meter moves
     # would post a second reviewer against the same exact head.
     if substitute_summon_covers_head(comments, head_sha):
-        return (0, 0, 0)
+        return (0, 0, 0, chased)
     # A bare Codex nudge owns the head only while Codex has not refused it.
     # Treating the nudge marker as unconditional coverage is a permanent
     # stall: the refusal is (correctly) not a result, so the head never
@@ -3559,15 +6137,30 @@ def _scan_open_pull(
     if bare_nudge_covers_head(
         comments, head_sha
     ) and not quota_refusal_is_latest_codex_signal(reviews, comments, codex_login):
-        return (0, 0, 0)
+        return (0, 0, 0, chased)
     route, route_reason = find_half_route(
         reviews, comments, codex_login, usage_meter=usage_meter
+    )
+    meter = usage_meter if isinstance(usage_meter, Mapping) else None
+    belt().event(
+        "belt.find_half",
+        **{
+            "logfire.msg": f"#{pr_number} find half -> {route}",
+            "pull_request": pr_number,
+            "head_sha": head_sha,
+            "route": route,
+            "reason": route_reason,
+            "rounds_consumed": len(reviewed_heads),
+            "meter_utilization": meter["utilization"] if meter else None,
+            "meter_resets_at": str(meter["resets_at"]) if meter else "",
+            "codex_threshold": codex_threshold(),
+        },
     )
     if route == "codex":
         if bare_nudge_covers_head(comments, head_sha):
             # Codex's refusal was superseded by later Codex activity, but the
             # standing nudge for this head was already posted — do not repeat.
-            return (0, 0, 0)
+            return (0, 0, 0, chased)
         if (
             refresh_pr_at_head(
                 github,
@@ -3578,12 +6171,22 @@ def _scan_open_pull(
             )
             is None
         ):
-            return (0, 0, 0)
+            return (0, 0, 0, chased)
         github.post(
             f"issues/{pr_number}/comments", {"body": nudge_comment_body(head_sha)}
         )
         print(f"nudged PR #{pr_number} ({route_reason})")
-        return (1, 0, 0)
+        belt().event(
+            "belt.nudge",
+            **{
+                "logfire.msg": f"#{pr_number} nudged @codex at {head_sha[:12]}",
+                "pull_request": pr_number,
+                "head_sha": head_sha,
+                "rounds_consumed": len(reviewed_heads),
+                "reason": route_reason,
+            },
+        )
+        return (1, 0, 0, chased)
     if (
         refresh_pr_at_head(
             github,
@@ -3594,7 +6197,7 @@ def _scan_open_pull(
         )
         is None
     ):
-        return (0, 0, 0)
+        return (0, 0, 0, chased)
     actor = substitute_actor()
     review_round = result_round_for_head(reviewed_heads, head_sha)
     # Slack first, then the marker — the same publication rule as every
@@ -3628,7 +6231,19 @@ def _scan_open_pull(
         },
     )
     print(f"summoned substitute for PR #{pr_number} ({route_reason})")
-    return (0, 1, 0)
+    belt().event(
+        "belt.substitute.summon",
+        **{
+            "logfire.msg": f"#{pr_number} summoned substitute `{actor}`",
+            "pull_request": pr_number,
+            "head_sha": head_sha,
+            "substitute_actor": actor,
+            "round": review_round,
+            "max_review_rounds": MAX_REVIEW_ROUNDS,
+            "reason": route_reason,
+        },
+    )
+    return (0, 1, 0, chased)
 
 
 def nudge_stalled_reviews() -> None:
@@ -3644,14 +6259,40 @@ def nudge_stalled_reviews() -> None:
         )
     now = datetime.now(timezone.utc)
     usage_meter = usage_meter_reading()
+    belt().event(
+        "belt.meter",
+        **{
+            "logfire.msg": (
+                "AI-usage meter absent"
+                if usage_meter is None
+                else f"AI-usage Codex pool at {usage_meter['utilization']:.2f}"
+            ),
+            "meter_present": usage_meter is not None,
+            "meter_utilization": (
+                usage_meter["utilization"] if usage_meter is not None else None
+            ),
+            "meter_resets_at": (
+                str(usage_meter["resets_at"]) if usage_meter is not None else ""
+            ),
+            "codex_threshold": codex_threshold(),
+        },
+    )
     nudged = 0
     summoned = 0
     redelivered = 0
+    chased = 0
     errors: list[tuple[int, Exception]] = []
+    scanned = 0
     for pull_request in github.paginate("pulls", query={"state": "open"}):
         pr_number = int(pull_request.get("number") or 0)
+        scanned += 1
         try:
-            nudged_delta, summoned_delta, redelivered_delta = _scan_open_pull(
+            (
+                nudged_delta,
+                summoned_delta,
+                redelivered_delta,
+                chased_delta,
+            ) = _scan_open_pull(
                 github,
                 pull_request,
                 repository=repository,
@@ -3670,12 +6311,50 @@ def nudge_stalled_reviews() -> None:
         nudged += nudged_delta
         summoned += summoned_delta
         redelivered += redelivered_delta
+        chased += chased_delta
+    # The loop above is the only enumeration of open PRs, so it is also the only
+    # place a retrospective request can be seen — until the PR closes, which the
+    # exhaustion gate invites a human to do while the delivery window is running.
+    closed_chased = 0
+    try:
+        closed_chased, closed_errors = chase_closed_pull_retrospectives(
+            github, repository=repository, now=now
+        )
+        errors.extend(closed_errors)
+    except Exception as error:  # noqa: BLE001 - the open-PR pass is already done.
+        # Enumerating closures is the last thing this scan does, and failing it
+        # must not discard the summary and telemetry the pass above earned.
+        print(
+            f"closed-PR retrospective sweep failed for {repository}: "
+            f"{type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
+        errors.append((0, error))
+    chased += closed_chased
     print(
         f"nudge scan complete (nudged={nudged}, substitute={summoned}, "
-        f"redelivered={redelivered})"
+        f"redelivered={redelivered}, retrospectives chased={chased}, "
+        f"{closed_chased} on PRs closed in the last "
+        f"{RETROSPECTIVE_CLOSED_SWEEP_HOURS}h)"
+    )
+    belt().event(
+        "belt.scan.complete",
+        **{
+            "logfire.msg": (
+                f"scan: {scanned} open PR(s), {nudged} nudged, "
+                f"{summoned} summoned, {redelivered} re-delivered, "
+                f"{chased} retrospective(s) chased"
+            ),
+            "pull_requests_scanned": scanned,
+            "nudged": nudged,
+            "summoned": summoned,
+            "redelivered": redelivered,
+            "retrospectives_chased": chased,
+            "scan_errors": len(errors),
+        },
     )
     if errors:
-        raise ScanCompletedWithErrors(errors)
+        raise ScanCompletedWithErrors("nudge", errors)
 
 
 def send_canary() -> None:
@@ -3694,21 +6373,548 @@ def send_canary() -> None:
         f"Source: `{repository}` workflow run `{run_id}`."
     )
     print(f"posted review-loop canary for {repository} run {run_id}")
+    belt().event(
+        "belt.canary",
+        **{
+            "logfire.msg": f"canary woke `{actor}`",
+            "burn_actor": actor,
+            "github_run_id": run_id,
+        },
+    )
+
+
+def skill_audit_actor() -> str:
+    """The seat the weekly skill audit wakes; same grammar as every actor."""
+    raw = os.environ.get("SKILL_AUDIT_ACTOR", "").strip() or DEFAULT_SKILL_AUDIT_ACTOR
+    actor = normalize_substitute_actor(raw)
+    if actor is None:
+        raise ValueError(
+            f"SKILL_AUDIT_ACTOR={raw!r} is outside the actor grammar "
+            "[a-z0-9-]+ after normalization; refusing to wake an "
+            "unroutable audit seat"
+        )
+    return actor
+
+
+def skills_changed_since(github: GitHubApi, since: datetime) -> bool:
+    """True when any commit in the window touched a skill corpus root.
+
+    The commits API takes one ``path`` per query, so each root is asked
+    separately; the first non-empty answer suffices.
+    """
+    since_param = since.strftime("%Y-%m-%dT%H:%M:%SZ")
+    for root in SKILL_PATH_PREFIXES:
+        commits = github.get(
+            "commits",
+            query={"since": since_param, "path": root.rstrip("/"), "per_page": 1},
+        )
+        if isinstance(commits, list) and commits:
+            return True
+    return False
+
+
+def send_skill_audit() -> None:
+    """Post the weekly one-pass skill-audit wake, or say why not.
+
+    Skills are exempt from the per-PR review loop (Hákon's ruling,
+    2026-08-21); this single weekly pass is their entire quality gate. A
+    quiet week posts nothing — a wake with no possible work is noise.
+    """
+    repository = required_env("GITHUB_REPOSITORY")
+    github = GitHubApi(required_env("GITHUB_TOKEN"), repository)
+    since = datetime.now(timezone.utc) - timedelta(days=SKILL_AUDIT_WINDOW_DAYS)
+    if not skills_changed_since(github, since):
+        print(
+            f"no skill-corpus commits in {repository} since "
+            f"{since.date()} - skipping the audit wake"
+        )
+        return
+    slack = SlackApi(required_env("HIVE_BOT_TOKEN"), required_env("HIVE_CHANNEL"))
+    actor = skill_audit_actor()
+    roots = ", ".join(f"`{root}`" for root in SKILL_PATH_PREFIXES)
+    slack.post_message(
+        f"WAKE: {actor}\n\n"
+        "Weekly skill audit - one pass, no review loop. Skill files are "
+        "exempt from per-PR Codex review (Hákon's ruling, 2026-08-21); this "
+        "audit is their entire quality gate.\n\n"
+        f"Repo: `{repository}`. Audit every skill file under {roots} "
+        f"changed in the last {SKILL_AUDIT_WINDOW_DAYS} days "
+        "(`git log --since` over those roots on the default branch), judged "
+        "once against `writing-skills`. Land repairs as direct commits or "
+        "follow-up tickets. One pass means one pass: no re-review, no burn "
+        "rounds, no verdict comments.\n\n"
+        "Reply in this thread with the files audited and what changed."
+    )
+    print(f"posted weekly skill-audit wake for {repository} to {actor}")
+    belt().event(
+        "belt.skill_audit",
+        **{
+            "logfire.msg": f"weekly skill audit woke `{actor}`",
+            "audit_actor": actor,
+            "window_days": SKILL_AUDIT_WINDOW_DAYS,
+        },
+    )
+
+
+def at_closure(items: Sequence[Any], closed_at: str, *stamp_keys: str) -> list[Any]:
+    """Only the thread items that existed when the PR reached ``closed_at``.
+
+    One definition for both terminal readers.  The belt summary and the merge
+    digest each describe a moment the thread has since moved past, and a
+    disagreement about where that moment cuts would make them report different
+    histories for the same PR — which is the disagreement everything else here
+    is built to prevent.
+
+    An empty ``closed_at`` means there is no boundary to measure against — an
+    open PR is current, and every item is kept.  An item whose own timestamp is
+    missing or unparseable is kept for the same reason the result stream sorts
+    it first: an undated event is not evidence that it arrived after the
+    closure.  The first ``stamp_keys`` entry that parses is the item's time.
+    """
+    if not closed_at:
+        return list(items)
+    boundary = result_event_time(closed_at)
+    kept: list[Any] = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        stamps = [item.get(key) for key in stamp_keys]
+        when = next(
+            (
+                result_event_time(stamp)
+                for stamp in stamps
+                if isinstance(stamp, str) and stamp.strip()
+            ),
+            None,
+        )
+        if when is None or when <= boundary:
+            kept.append(item)
+    return kept
+
+
+def pr_belt_summary(
+    github: GitHubApi,
+    pull_request: Mapping[str, Any],
+    codex_login: str,
+) -> dict[str, Any]:
+    """The whole-PR belt outcome, read from the PR's own review thread.
+
+    One definition of a round serves both the live terminal emission and the
+    offline baseline (``bin/review_loop_backfill.py``), so history and
+    instrument cannot disagree about what they are counting.  Every field is
+    derived from the same parsers the router routes on.
+
+    This describes a CLOSURE, so it is measured as of ``closed_at`` rather than
+    as of now.  A review, clean comment, substitute marker or exhaustion gate
+    posted after a PR closed — a reopened thread, a rerun terminal workflow, a
+    queued Codex review that landed late, a backfill run months afterwards —
+    is a fact about the thread today, not about the belt state the closure
+    reached.  Folded in, it moves that closure's rounds, findings, CLEAN and
+    exhaustion after the event it claims to describe.  Every parser below is
+    therefore fed the thread as it stood at closure.
+
+    ``loop_exempt`` is the SNAPSHOT fact: every path the PR touches sits under
+    a loop-exempt corpus root today.  ``belt_exempt`` is the measurement
+    decision, and the two are not the same question.  Every routing path skips
+    a loop-exempt PR because the corpus's own gate owns its whole quality bar,
+    so such a PR has no rounds by design and, measured without the exemption,
+    reads as a belt failure — a never-reviewed, never-CLEAN outcome.  But a PR
+    that took real belt rounds and only then reverted its non-corpus files
+    closes with an exempt snapshot and a genuine history; exempting it on the
+    snapshot alone deletes rounds and findings the belt really spent.  Recorded
+    history is what settles it: the exemption holds only where there is none.
+    Both fields are reported rather than dropped so each consumer excludes
+    visibly.
+    """
+    pr_number = int(pull_request["number"])
+    head = pull_request.get("head")
+    head_sha = str(head["sha"]) if isinstance(head, Mapping) else ""
+    closed_at = str(pull_request.get("closed_at") or "")
+    reviews = at_closure(
+        github.paginate(f"pulls/{pr_number}/reviews"), closed_at, "submitted_at"
+    )
+    conversation = at_closure(
+        github.paginate(f"issues/{pr_number}/comments"), closed_at, "created_at"
+    )
+    # Inline comments carry their own clock.  Selecting them by their review's
+    # id excludes every comment of a post-closure *review*, but a late comment
+    # filed — or replied to — under a review submitted BEFORE closure passes
+    # that filter untouched, and then decides the verdict: ``codex_result_events``
+    # gives owned inline findings precedence over a clean summary, so one
+    # comment arriving after the PR closed retroactively turns the review that
+    # closed it into a findings round, and ``round_history`` publishes the late
+    # location and severity with it.  The merge digest already cuts this
+    # collection at ``merged_at``; both terminal readers cut it the same way.
+    review_comments = at_closure(
+        github.paginate(f"pulls/{pr_number}/comments"), closed_at, "created_at"
+    )
+    events = codex_result_events(
+        github,
+        reviews,
+        conversation,
+        codex_login,
+        pr_number=pr_number,
+        review_comments=review_comments,
+    )
+    reviewed_heads = result_heads_from_events(events)
+    history = round_history(
+        reviewed_heads,
+        reviews,
+        review_comments,
+        codex_login,
+        latest_results=latest_result_by_head(events),
+        issue_comments=conversation,
+    )
+    # ``closed_review``, not a CLEAN prefix on the rendered verdict: a clean
+    # comment whose reviewed commit no longer resolves renders as CLEAN and
+    # establishes no closure, so a prose test reports review as closed on a
+    # head the helper could not even identify.  The round still counts toward
+    # ``rounds`` — it was consumed — it just cannot be the one that closed.
+    rounds_to_clean = next(
+        (int(entry["round"]) for entry in history if entry["closed_review"]),
+        None,
+    )
+    # The files endpoint answers about the PR's diff TODAY; there is no
+    # as-of-closure file list to read.  That is why the snapshot alone cannot
+    # carry the exemption, and why ``history`` — which is measured at closure —
+    # is the half that decides it.
+    loop_exempt = loop_exempt_pr(github, pr_number, closed_at=closed_at)
+    resolved = author_for_pr(github, pr_number, head_sha) if head_sha else None
+    # The list endpoint carries ``merged_at`` but no ``merged`` field, and it
+    # keeps a ``merge_commit_sha`` for closed-unmerged PRs (the last test
+    # merge). Reading either one alone reports every backfilled PR as
+    # unmerged, or hands an abandoned PR a landed SHA.
+    merged = bool(pull_request.get("merged") or pull_request.get("merged_at"))
+    # Recurrence counts ROUNDS a site appeared in, so a site named twice in one
+    # round is one appearance, not a repeat.
+    rounds_by_site: dict[str, int] = {}
+    rounds_by_path: dict[str, int] = {}
+    for entry in history:
+        sites = {location_site(str(item)) for item in entry["locations"]}
+        for site in sites:
+            rounds_by_site[site] = rounds_by_site.get(site, 0) + 1
+        for path in {site.split(":", 1)[0] for site in sites}:
+            rounds_by_path[path] = rounds_by_path.get(path, 0) + 1
+    return {
+        "pull_request": pr_number,
+        "head_sha": head_sha,
+        "loop_exempt": loop_exempt,
+        # The exemption, not the snapshot: a PR the belt really reviewed keeps
+        # its rounds even if its final diff reverted to exempt-corpus files.
+        "belt_exempt": loop_exempt and not history,
+        "author": resolved[0] if resolved else "",
+        "author_seat": resolved[1] if resolved else "",
+        "rounds": len(history),
+        "rounds_to_clean": rounds_to_clean,
+        "findings_total": sum(int(entry["counts"]["total"]) for entry in history),
+        "findings_p1": sum(int(entry["counts"]["p1"]) for entry in history),
+        "findings_p2": sum(int(entry["counts"]["p2"]) for entry in history),
+        "findings_p3": sum(int(entry["counts"]["p3"]) for entry in history),
+        "round_heads": [str(entry["head"]) for entry in history],
+        "round_findings": [int(entry["counts"]["total"]) for entry in history],
+        "round_verdicts": [str(entry["verdict"]) for entry in history],
+        "round_locations": [
+            [str(item) for item in entry["locations"]] for entry in history
+        ],
+        # Recurrence, at two grains.  An exact SITE (path:line) repeating is
+        # repair that did not stick; a FILE repeating across rounds is the
+        # coarser signal that survives the line drift every burn causes, and it
+        # is the one "did the same file keep coming back" asks for.  Neither
+        # grain compares the rendered identity: Codex rewords a returning
+        # finding freely, and a reworded title is not a cured site.
+        "repeated_locations": sorted(
+            site for site, seen in rounds_by_site.items() if seen > 1
+        ),
+        "repeated_paths": sorted(
+            path for path, seen in rounds_by_path.items() if seen > 1
+        ),
+        # Any head's gate, at any policy: the PR reached the bound at least
+        # once.  The bound it reached is recorded by the marker itself and is
+        # absent when only a legacy unversioned marker gated it — today's
+        # MAX_REVIEW_ROUNDS is not evidence about a gate posted under an
+        # earlier policy.
+        "exhausted": marker_comment_exists(conversation, EXHAUSTED_MARKER_PREFIX),
+        "exhausted_max_rounds": exhaustion_marker_bound(conversation),
+        "merged": merged,
+        "merged_sha": str(pull_request.get("merge_commit_sha") or "") if merged else "",
+        "created_at": str(pull_request.get("created_at") or ""),
+        "closed_at": str(pull_request.get("closed_at") or ""),
+        "title": str(pull_request.get("title") or ""),
+        "url": str(pull_request.get("html_url") or ""),
+    }
+
+
+def closure_event_id(repository: str, summary: Mapping[str, Any]) -> str:
+    """The closure this span describes, independent of what emitted it.
+
+    OTLP mints a fresh trace and span id per export, so a rerun of the
+    ``belt-terminal`` job — after a sibling job failed, say — writes a second,
+    indistinguishable ``belt.terminal`` row for one closure and doubles that PR
+    in any ``count(*)`` convergence query.  This names the closure event
+    itself, so a dashboard reduces to one row per closure no matter how many
+    times the job ran.
+    """
+    return f"{repository}#{summary['pull_request']}@{summary['closed_at']}"
+
+
+def route_pull_request_closed(event: Mapping[str, Any] | None = None) -> None:
+    """Emit one terminal belt span when a seat-authored PR closes.
+
+    The per-round spans say what each round cost; this says what the whole PR
+    cost — rounds to CLEAN, findings burned, whether the bound was reached,
+    and the SHA that actually landed.  It routes nothing and wakes nobody.
+
+    The emission is not idempotent — a push exporter cannot be — so it carries
+    a stable ``closure_event`` id instead and the dashboard queries deduplicate
+    on it.
+
+    With no sink the command returns before reading anything.  Collecting the
+    summary costs several GitHub reads, and this job exists only to export
+    them: on the no-token path — the documented default for an adopting
+    repository — a transient 5xx or a token without the scope to read the
+    review thread would turn a job that measures nothing into a red one.
+    """
+    if not belt().enabled:
+        print("belt telemetry disabled: no terminal span, nothing collected")
+        return
+    event = event or load_event()
+    pull_request = event.get("pull_request")
+    if not isinstance(pull_request, Mapping):
+        raise TypeError("event does not contain a pull_request")
+    repository = required_env("GITHUB_REPOSITORY")
+    codex_login = os.environ.get("CODEX_LOGIN", CODEX_LOGIN)
+    github = GitHubApi(required_env("GITHUB_TOKEN"), repository)
+    emit_terminal_span(github, repository, pull_request, codex_login)
+
+
+def emit_terminal_span(
+    github: GitHubApi,
+    repository: str,
+    pull_request: Mapping[str, Any],
+    codex_login: str,
+) -> None:
+    """Export one closure's belt outcome, or record why it was not exported.
+
+    Shared by the closure event and the scheduled fork sweep so both emit the
+    same span from the same summary — an outcome that differed by which path
+    observed it would be a measurement of the paths, not of the belt.
+    """
+    summary = pr_belt_summary(github, pull_request, codex_login)
+    if not summary["author_seat"]:
+        print(f"non-seat author on closed {repository}#{summary['pull_request']}")
+        belt_ignored("non-seat-author", pull_request=summary["pull_request"])
+        return
+    if summary["belt_exempt"]:
+        # Every routing path exempts a loop-exempt PR, so it has no rounds by
+        # construction.  Emitting it here would enter a zero-round, no-CLEAN
+        # outcome into the convergence distribution for a PR the belt was
+        # never supposed to review.  Recorded as an ignored route, not dropped.
+        # An exempt snapshot over a real round history is NOT this case: the
+        # belt reviewed it, and its convergence outcome is the instrument's.
+        print(f"loop-exempt PR {repository}#{summary['pull_request']} - belt exempt")
+        belt_ignored("loop-exempt", pull_request=summary["pull_request"])
+        return
+    belt().event(
+        "belt.terminal",
+        **{
+            "logfire.msg": (
+                f"#{summary['pull_request']} closed after {summary['rounds']} "
+                f"round(s), {summary['findings_total']} finding(s)"
+            ),
+            "pull_request": summary["pull_request"],
+            # The closure, not the emission: a rerun of this job repeats the
+            # row and every convergence query groups on this to collapse it.
+            "closure_event": closure_event_id(repository, summary),
+            "closed_at": summary["closed_at"],
+            "head_sha": summary["head_sha"],
+            "author_seat": summary["author_seat"],
+            "rounds": summary["rounds"],
+            "rounds_to_clean": summary["rounds_to_clean"],
+            "findings_total": summary["findings_total"],
+            "findings_p1": summary["findings_p1"],
+            "findings_p2": summary["findings_p2"],
+            "findings_p3": summary["findings_p3"],
+            "round_findings": summary["round_findings"],
+            "repeated_locations": summary["repeated_locations"][:FINDING_SPAN_BUDGET],
+            "repeated_location_count": len(summary["repeated_locations"]),
+            "repeated_paths": summary["repeated_paths"][:FINDING_SPAN_BUDGET],
+            "repeated_path_count": len(summary["repeated_paths"]),
+            "exhausted": summary["exhausted"],
+            # The bound that produced the gate, read off the marker that posted
+            # it — not the bound configured today.  Absent when a legacy
+            # unversioned marker gated the PR: the policy it ran under was
+            # never recorded, and an unmeasured bound must stay unmeasured.
+            # The policy in force at emission rides the invocation root span in
+            # this same trace, which is the only place it is evidence.
+            "exhausted_max_rounds": summary["exhausted_max_rounds"],
+            "merged": summary["merged"],
+            "merged_sha": summary["merged_sha"],
+        },
+    )
+    print(
+        f"belt terminal for {repository}#{summary['pull_request']} "
+        f"(rounds={summary['rounds']}, findings={summary['findings_total']}, "
+        f"merged={summary['merged']})"
+    )
+
+
+def fork_originated(pull_request: Mapping[str, Any], repository: str) -> bool:
+    """True when this PR's head branch lives outside the base repository.
+
+    A deleted head repository reads as absent rather than as same-repo: the
+    branch is provably not in the base repo (the base repo's own branches are
+    never reported with a null ``repo``), and treating the unknown case as
+    same-repo is what would drop it from the sweep silently.
+    """
+    head = pull_request.get("head")
+    if not isinstance(head, Mapping):
+        return False
+    head_repo = head.get("repo")
+    if not isinstance(head_repo, Mapping):
+        return True
+    return str(head_repo.get("full_name") or "").lower() != repository.lower()
+
+
+def route_terminal_sweep() -> None:
+    """Emit terminal spans for closures the ``pull_request`` event cannot.
+
+    A ``pull_request`` event on a fork-originated PR carries no repository
+    secrets — the limitation ``announce-machine-merge`` already declares for
+    the merge digest — so ``belt-terminal`` runs with an empty ``LOGFIRE_TOKEN``
+    and exports nothing.  Without a backstop every fork closure is missing from
+    the distribution the belt advertises as live, and the gap is invisible: an
+    absent span and a PR that never closed read the same.  This leg runs on the
+    schedule, in the base repository's own context, where the token exists.
+
+    Re-emission is safe by construction.  The span carries ``closure_event`` —
+    the identity of the closure rather than of the export — and every
+    convergence query groups on it, so a sweep that overlaps a closure event
+    that did succeed collapses into one row instead of doubling the PR.  That
+    is why the sweep does not try to detect which closures were exported: the
+    detection would need a second store, and the dedup already holds.
+
+    The window is generous on purpose.  The schedule is throttled by GitHub
+    under load, and a leg that assumed its own cadence would silently skip
+    every closure that fell between two runs.
+    """
+    if not belt().enabled:
+        print("belt telemetry disabled: no terminal sweep, nothing collected")
+        return
+    repository = required_env("GITHUB_REPOSITORY")
+    codex_login = os.environ.get("CODEX_LOGIN", CODEX_LOGIN)
+    github = GitHubApi(required_env("GITHUB_TOKEN"), repository)
+    horizon = datetime.now(timezone.utc) - timedelta(hours=BELT_SWEEP_WINDOW_HOURS)
+    swept = 0
+    scanned = 0
+    errors: list[tuple[int, Exception]] = []
+    page = 1
+    # Paged by hand rather than through ``paginate``, which materializes every
+    # page before returning: the stop condition below is what bounds this scan
+    # to the window, and it can only bound a stream it is reading.
+    while True:
+        batch = github.get(
+            "pulls",
+            query={
+                "state": "closed",
+                "sort": "updated",
+                "direction": "desc",
+                "per_page": 100,
+                "page": page,
+            },
+        )
+        if not isinstance(batch, list) or not batch:
+            break
+        stop = False
+        for pull_request in batch:
+            scanned += 1
+            # Closing a PR updates it, so ``updated_at >= closed_at``: once the
+            # update stream has fallen past the horizon, no later row can be a
+            # closure inside the window.
+            if result_event_time(pull_request.get("updated_at")) < horizon:
+                stop = True
+                break
+            if result_event_time(
+                pull_request.get("closed_at")
+            ) < horizon or not fork_originated(pull_request, repository):
+                continue
+            # One unsummarizable closure — a deleted fork whose head commit
+            # 404s under ``author_for_pr``, say — must not abort the pass.
+            # The window is time-bounded, not cursor-bounded, so an abort
+            # re-skips every eligible closure *after* the poisoned row on
+            # every retry until that row ages out seven days later.
+            number = int(pull_request.get("number") or 0)
+            try:
+                emit_terminal_span(github, repository, pull_request, codex_login)
+            except Exception as error:  # noqa: BLE001 - one closure, not the pass.
+                print(
+                    f"terminal sweep failed for {repository}#{number}: "
+                    f"{type(error).__name__}: {error}",
+                    file=sys.stderr,
+                )
+                errors.append((number, error))
+                continue
+            swept += 1
+        if stop or len(batch) < 100:
+            break
+        page += 1
+    print(
+        f"belt terminal sweep for {repository}: {swept} fork closure(s) of "
+        f"{scanned} row(s) scanned in the last {BELT_SWEEP_WINDOW_HOURS}h"
+        + (f", {len(errors)} failed" if errors else "")
+    )
+    if errors:
+        raise ScanCompletedWithErrors("terminal", errors)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("route", "nudge", "canary"))
+    parser.add_argument(
+        "command",
+        choices=(
+            "route",
+            "nudge",
+            "canary",
+            "skill-audit",
+            "terminal",
+            "terminal-sweep",
+        ),
+    )
     args = parser.parse_args(argv)
+    telemetry = install_belt_telemetry(BeltTelemetry.from_env(args.command))
     try:
-        {
-            "route": route_codex_result,
-            "nudge": nudge_stalled_reviews,
-            "canary": send_canary,
-        }[args.command]()
+        with telemetry.span(
+            # Invocation roots live in their own namespace.  ``belt.nudge``,
+            # ``belt.canary`` and ``belt.terminal`` are also the names of the
+            # ACTIONS those commands emit, so sharing the root's name makes a
+            # scan that nudged nobody report one nudge, and a scan that nudged
+            # N report N+1.  One name, one grain.
+            f"belt.invocation.{args.command}",
+            **{
+                "logfire.msg": (
+                    f"belt {args.command} {telemetry.repository or 'unknown-repo'}"
+                ),
+                "belt_command": args.command,
+                "belt_fingerprint": script_fingerprint(),
+                "github_event": os.environ.get("GITHUB_EVENT_NAME", ""),
+                "github_run_id": telemetry.run_id,
+                "max_review_rounds": MAX_REVIEW_ROUNDS,
+            },
+        ):
+            {
+                "route": route_codex_result,
+                "nudge": nudge_stalled_reviews,
+                "canary": send_canary,
+                "skill-audit": send_skill_audit,
+                "terminal": route_pull_request_closed,
+                "terminal-sweep": route_terminal_sweep,
+            }[args.command]()
     except Exception as error:  # noqa: BLE001 - CLI boundary must terminalize visibly.
         print(f"review-loop {args.command} failed: {error}", file=sys.stderr)
         return 1
+    finally:
+        # After the root span closes, so the invocation's own duration and
+        # status ride the same export as the decisions inside it.
+        telemetry.flush()
     return 0
 
 
