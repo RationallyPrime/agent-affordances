@@ -1,0 +1,47 @@
+# Weekly one-pass skill audit. Skills are exempt from the per-PR review loop
+# (Hákon's ruling, 2026-08-21: prose review of a skill never converges — it
+# breeds finding streams, not quality). This wake is their entire quality
+# gate: one seat, one pass over the week's skill changes, repairs landed as
+# direct commits or follow-up tickets, no re-review and no burn rounds.
+#
+# Adopt alongside review-loop.yml (same HIVE_BOT_TOKEN secret). The audit
+# seat defaults to theoros; recast with the SKILL_AUDIT_ACTOR repository
+# variable, never a code edit. A week with no skill-corpus commits posts
+# nothing.
+name: skill-audit
+
+on:
+  schedule:
+    - cron: "0 9 * * 1"
+  workflow_dispatch: {}
+
+concurrency:
+  group: weave-skill-audit
+  cancel-in-progress: false
+
+env:
+  HIVE_CHANNEL: C0BGBEQQQHH
+  SKILL_AUDIT_ACTOR: ${{ vars.SKILL_AUDIT_ACTOR }}
+
+permissions:
+  contents: read
+
+jobs:
+  wake-skill-audit:
+    name: Wake the weekly skill audit (routing only — not a test gate)
+    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","cx53"]' || '["ubuntu-latest"]') }}
+    steps:
+      # The helper executes with a Slack credential. Always load it from the
+      # trusted default branch, never from a PR head.
+      - name: Checkout trusted review-loop helper
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Wake the audit seat if skills changed this week
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HIVE_BOT_TOKEN: ${{ secrets.HIVE_BOT_TOKEN }}
+          LOGFIRE_TOKEN: ${{ secrets.LOGFIRE_TOKEN }}
+        run: python3 .github/scripts/review_loop.py skill-audit
