@@ -45,8 +45,13 @@ paraphrase and never a span quietly reflowed to fit the packet. A span the
 default encoding cannot decode refuses the packet rather than shipping
 replacement characters as though they were the file. Coordinates are
 validated and spans extracted by streaming, so a one-line span from a large
-log costs a line, not the log. The telemetry record is written after that
-audit and carries the state the caller receives, not the model's claim.
+log costs a line, not the log. Each read is scanned once and validation never
+assembles a line it will not return, so a minified bundle — one line the size
+of the file — costs one linear pass, not a rescan per read. The telemetry
+record is written after that audit and carries the state the caller receives,
+not the model's claim: the engine's single transport selection, its
+classification of a failure, and the hash of a malformed response all reach
+that record rather than being re-derived or lost.
 
 Exit codes: `0` complete · `3` incomplete · `4` ambiguous · `5` refused ·
 `1` engine/pool failure (a throttled pool is a plain error, never a silent

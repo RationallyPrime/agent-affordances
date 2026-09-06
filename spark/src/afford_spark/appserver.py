@@ -243,7 +243,9 @@ class CodexAppServer:
             message = waiter.get(timeout=max(0.05, timeout_s))
         except queue.Empty as exc:
             self._pending.pop(ident, None)
-            raise SparkProtocolError(f"codex app-server {method} timed out") from exc
+            raise SparkProtocolError(
+                f"codex app-server {method} timed out", status="timeout"
+            ) from exc
         if message.get("error"):
             raise _rpc_error(method, message["error"])
         result = message.get("result")
@@ -268,11 +270,13 @@ class CodexAppServer:
             self._raise_if_dead()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise SparkProtocolError(f"timed out waiting for {method}")
+                raise SparkProtocolError(f"timed out waiting for {method}", status="timeout")
             try:
                 message = self._events.get(timeout=remaining)
             except queue.Empty as exc:
-                raise SparkProtocolError(f"timed out waiting for {method}") from exc
+                raise SparkProtocolError(
+                    f"timed out waiting for {method}", status="timeout"
+                ) from exc
             if message.get("method") != method:
                 continue
             if (turn_id or thread_id) and not (

@@ -172,9 +172,9 @@ def _dispatch(line: str, app_server: CodexAppServer, lock: threading.Lock) -> Da
             v=DAEMON_PROTOCOL, id=ident, ok=False, error=exc.kind, message=str(exc)
         )
     except SparkProtocolError as exc:
-        text = str(exc)
-        error = "timeout" if "timed out" in text.lower() else "protocol"
-        return DaemonResponse(v=DAEMON_PROTOCOL, id=ident, ok=False, error=error, message=text)
+        # The raiser's typed verdict — never re-derived from the prose.
+        error = "timeout" if exc.status == "timeout" else "protocol"
+        return DaemonResponse(v=DAEMON_PROTOCOL, id=ident, ok=False, error=error, message=str(exc))
     except Exception as exc:
         return DaemonResponse(
             v=DAEMON_PROTOCOL, id=ident, ok=False, error="protocol", message=str(exc)

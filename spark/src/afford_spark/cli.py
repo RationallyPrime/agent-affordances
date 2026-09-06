@@ -21,7 +21,6 @@ import typer
 from afford_spark.engine import (
     SparkProtocolError,
     SparkUnavailableError,
-    choose_transport,
     emit_invocation,
     invocation_record,
     run_spark,
@@ -67,7 +66,6 @@ def _wrapper_owned_record(
     writable: bool,
     allow: list[str],
     base_sha: str | None = None,
-    started: float,
 ) -> dict[str, object]:
     """The telemetry record a verb whose wrapper re-derives the result owns itself.
 
@@ -75,29 +73,25 @@ def _wrapper_owned_record(
     hash of its raw output. ``slice`` and ``transform`` audit that answer and
     can downgrade it, so both pass ``emit_telemetry=False`` and publish through
     ``_publish_invocation`` after the audit — one record, describing the result
-    the caller actually receives. A transport that will not resolve is recorded
-    here because no invocation will follow to record it.
+    the caller actually receives.
+
+    ``transport`` is left unresolved here on purpose. Resolving ``auto`` opens
+    a connection to the daemon socket as its liveness probe, and ``run_spark``
+    resolves it again for the call it actually makes; probing twice puts an
+    empty frame on the daemon before every real request. ``run_spark`` stamps
+    its single selection onto this record, and a transport that never resolves
+    leaves the field null on the refusal the wrapper publishes anyway.
     """
-
-    def _record(transport: str | None) -> dict[str, object]:
-        return invocation_record(
-            verb=verb,
-            prompt=prompt,
-            workdir=root,
-            writable=writable,
-            base_sha=base_sha,
-            allowed_paths=allow,
-            repo=root,
-            transport=transport,
-        )
-
-    try:
-        transport = choose_transport()
-    except SparkProtocolError as exc:
-        with contextlib.suppress(OSError):
-            emit_invocation(_record(None), started=started, status="protocol_error")
-        _die(str(exc))
-    return _record(transport)
+    return invocation_record(
+        verb=verb,
+        prompt=prompt,
+        workdir=root,
+        writable=writable,
+        base_sha=base_sha,
+        allowed_paths=allow,
+        repo=root,
+        transport=None,
+    )
 
 
 def _publish_invocation(
@@ -285,29 +279,69 @@ def locate(
     _emit(result)
 
 
-_READ_CHUNK = 1 << 20
+_READ_CHUNK: int = 1 << 20
+
+
+def _iter_line_pieces(path: Path) -> Generator[tuple[bytes, bool]]:
+    """Stream the file as ``(piece, ends_line)``, scanning each read once.
+
+    This is the file's line grammar and the only place that spells it:
+    ``bytes.splitlines(keepends=True)`` semantics — ``\\n``, ``\\r\\n`` and a
+    bare ``\\r`` all end a line — computed a megabyte at a time. One line is
+    the concatenation of the pieces up to and including the first flagged
+    ``ends_line``.
+
+    Emitting pieces rather than whole lines is what keeps the cost linear. A
+    minified bundle or single-line JSON document is one line the size of the
+    file; re-splitting an accumulating prefix would rescan those bytes once per
+    read, and a consumer that only counts lines would hold a line it never
+    reads. Only a chunk's own bytes are ever split, and only a trailing ``\\r``
+    is held back — one read of lookahead, because its ``\\n`` may be the next
+    read's first byte.
+    """
+    with path.open("rb") as fh:
+        held = b""
+        while chunk := fh.read(_READ_CHUNK):
+            if held:
+                if chunk.startswith(b"\n"):
+                    yield held + b"\n", True
+                    chunk = chunk[1:]
+                else:
+                    yield held, True
+                held = b""
+                if not chunk:
+                    continue
+            lines = chunk.splitlines(keepends=True)
+            tail = lines.pop()
+            if tail.endswith(b"\n"):
+                lines.append(tail)
+            for line in lines:
+                yield line, True
+            if tail.endswith(b"\r"):
+                held = tail
+            elif not tail.endswith(b"\n"):
+                yield tail, False
+        if held:
+            yield held, True
 
 
 def _iter_lines(path: Path) -> Generator[bytes]:
     """Stream the file's lines, each carrying its own terminator.
 
-    This is ``bytes.splitlines(keepends=True)`` semantics — ``\\n``, ``\\r\\n``
-    and a bare ``\\r`` all end a line — computed a megabyte at a time, so the
-    coordinates the wrapper audits are the ones a reader of the file sees
+    The coordinates the wrapper audits are the ones a reader of the file sees,
     without the file ever being resident. Terminators are kept because a span's
     bytes are the file's bytes: rejoining the lines of a span reproduces it
     exactly, CRLF included.
     """
-    with path.open("rb") as fh:
-        carry = b""
-        while chunk := fh.read(_READ_CHUNK):
-            lines = (carry + chunk).splitlines(keepends=True)
-            # The last element may be an unterminated tail, or a lone trailing
-            # ``\r`` whose ``\n`` is in the next read. Both re-split correctly.
-            carry = lines.pop() if lines else b""
-            yield from lines
-        if carry:
-            yield carry
+    pieces: list[bytes] = []
+    with contextlib.closing(_iter_line_pieces(path)) as stream:
+        for piece, ends_line in stream:
+            pieces.append(piece)
+            if ends_line:
+                yield b"".join(pieces)
+                pieces = []
+    if pieces:
+        yield b"".join(pieces)
 
 
 def _count_lines_upto(path: Path, limit: int) -> int:
@@ -315,15 +349,22 @@ def _count_lines_upto(path: Path, limit: int) -> int:
 
     Validating a one-line span from a 30 MB log must cost one line, not 30 MB:
     the count only has to distinguish "at least ``limit`` lines" from the real
-    length of a file that is shorter.
+    length of a file that is shorter. Counting off the piece stream rather than
+    ``_iter_lines`` means a file that is one enormous line is never assembled
+    to be discarded.
     """
     counted = 0
-    with contextlib.closing(_iter_lines(path)) as lines:
-        for _ in lines:
+    open_line = False
+    with contextlib.closing(_iter_line_pieces(path)) as stream:
+        for _piece, ends_line in stream:
+            if not ends_line:
+                open_line = True
+                continue
             counted += 1
+            open_line = False
             if counted >= limit:
-                break
-    return counted
+                return counted
+    return counted + 1 if open_line else counted
 
 
 def _span_bytes(root: Path, spans: Sequence[Span]) -> dict[int, bytes]:
@@ -465,16 +506,17 @@ def _render_slice(result: SliceResult, root: Path) -> tuple[SliceResult, str | N
             )
     lines = [f"# slice — seam: {result.seam}", ""]
     for sp, excerpt in zip(result.spans, excerpts, strict=True):
-        # Drop the last line's own terminator so the closing fence starts a
-        # line; every other byte of the span, ``\r`` included, is kept.
-        body = excerpt[:-1] if excerpt.endswith("\n") else excerpt
+        # The span's last line keeps its own terminator, and that terminator is
+        # what starts the closing fence on a new line. Joining the fence on with
+        # an unconditional LF instead would rewrite a bare ``\r`` ending as
+        # ``\r\n`` — the one line ending this render would not reproduce. Only a
+        # span ending at an unterminated end-of-file needs an LF supplied.
+        body = excerpt if excerpt.endswith(("\n", "\r")) else excerpt + "\n"
         fence = _fence(body)
         lines += [
             f"## {sp.path}:{sp.start_line}-{sp.end_line} [{sp.role}]",
             f"why: {sp.why}",
-            fence,
-            body,
-            fence,
+            f"{fence}\n{body}{fence}",
             "",
         ]
     if result.unresolved:
@@ -500,7 +542,7 @@ def slice(
     prompt = slice_prompt(task, files)
     started = time.monotonic()
     record = _wrapper_owned_record(
-        verb="slice", prompt=prompt, root=root, writable=False, allow=files, started=started
+        verb="slice", prompt=prompt, root=root, writable=False, allow=files
     )
     status: str | None = None
     raw: str | None = None
@@ -522,7 +564,12 @@ def slice(
             status = "unavailable"
             _die(str(exc))
         except SparkProtocolError as exc:
-            status = "protocol_error"
+            # The engine classified this failure and captured whatever the
+            # model did return; with its own emission disabled, taking both
+            # is what keeps a timeout logged as a timeout and a schema
+            # violation's output_hash non-null.
+            status = exc.status
+            raw = exc.raw
             _die(f"slice failed: {exc}")
         except Exception as exc:
             status = "error"
@@ -581,7 +628,6 @@ def transform(
         writable=True,
         allow=allow,
         base_sha=base_sha,
-        started=started,
     )
     status: str | None = None
     raw: str | None = None
@@ -620,7 +666,8 @@ def transform(
                 status = "unavailable"
                 _die(str(exc))
             except SparkProtocolError as exc:
-                status = "protocol_error"
+                status = exc.status
+                raw = exc.raw
                 _die(f"transform failed: {exc}")
             except Exception as exc:
                 status = "error"

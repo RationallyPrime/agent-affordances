@@ -55,7 +55,21 @@ class SparkUnavailableError(RuntimeError):
 
 
 class SparkProtocolError(RuntimeError):
-    """codex exec ran but its output did not honor the invocation contract."""
+    """codex exec ran but its output did not honor the invocation contract.
+
+    ``status`` is the telemetry classification decided by the raiser, and
+    ``raw`` the model's response when there was one — a schema violation has
+    a body worth hashing even though it never became a result. A wrapper that
+    owns its own record (``emit_telemetry=False``) reads both off the
+    exception; nothing re-derives them by substring-matching the message.
+    """
+
+    def __init__(
+        self, message: str, *, status: str = "protocol_error", raw: str | None = None
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.raw = raw
 
 
 def _hash(text: str) -> str:
@@ -239,7 +253,8 @@ def run_spark[M: BaseModel](
             status = "protocol_error"
             raise SparkProtocolError(
                 f"spark {verb} returned output violating its contract: "
-                f"{exc.error_count()} errors; first 400 chars: {raw[:400]}"
+                f"{exc.error_count()} errors; first 400 chars: {raw[:400]}",
+                raw=raw,
             ) from exc
 
         status = getattr(result, "status", None)
@@ -261,7 +276,7 @@ def run_spark[M: BaseModel](
                 transport=None,
             )
         if status is None:
-            status = "timeout" if "timed out" in str(exc).lower() else "protocol_error"
+            status = exc.status
         raise
     finally:
         if emit_telemetry and record is not None:
@@ -315,13 +330,15 @@ def _run_via_daemon(
     except ProtocolPinError as exc:
         raise SparkProtocolError(str(exc)) from exc
     except TimeoutError as exc:
-        raise SparkProtocolError(f"spark {verb} timed out after {timeout_s}s") from exc
+        raise SparkProtocolError(
+            f"spark {verb} timed out after {timeout_s}s", status="timeout"
+        ) from exc
     if not response.ok:
         message = response.message or "afford-sparkd refused the call"
         if response.error in {"unavailable", "auth"}:
             raise SparkUnavailableError(message, kind=response.error)
         if response.error == "timeout":
-            raise SparkProtocolError(f"spark {verb} timed out after {timeout_s}s")
+            raise SparkProtocolError(f"spark {verb} timed out after {timeout_s}s", status="timeout")
         raise SparkProtocolError(message)
     if not response.raw:
         raise SparkProtocolError("afford-sparkd returned ok with no payload")
@@ -373,7 +390,9 @@ def _run_via_exec(
                 "codex CLI not found on PATH — install codex and authenticate first"
             ) from exc
         except subprocess.TimeoutExpired as exc:
-            raise SparkProtocolError(f"spark {verb} timed out after {timeout_s}s") from exc
+            raise SparkProtocolError(
+                f"spark {verb} timed out after {timeout_s}s", status="timeout"
+            ) from exc
 
         stderr_tail = proc.stderr[-2000:] if proc.stderr else ""
         if proc.returncode != 0:

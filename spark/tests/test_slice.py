@@ -7,16 +7,19 @@ A widened path set or a span past end-of-file refuses the whole packet, and
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import stat
 import subprocess
 import tracemalloc
 from pathlib import Path
+from typing import Any
 
 import pytest
 from typer.testing import CliRunner
 
+from afford_spark import cli, protocol
 from afford_spark.cli import app
 from afford_spark.engine import _telemetry_path
 from afford_spark.models import SliceResult, Span
@@ -469,3 +472,126 @@ def test_a_span_past_eof_in_a_big_file_is_still_refused(fake_codex, tmp_path: Pa
     result = _run(repo)
     assert result.exit_code == 5
     assert "b.py:3-99" in json.loads(result.output)["reason"]
+
+
+def test_render_preserves_a_trailing_bare_cr(fake_codex, tmp_path: Path) -> None:
+    """A span whose last line ends in a bare ``\\r`` must not render as ``\\r\\n``.
+
+    The closing fence starts a new line off the span's own terminator; supplying
+    an LF for it instead rewrites the one line ending this render still claims.
+    """
+    repo = _repo(tmp_path)
+    (repo / "a.py").write_bytes(b"def owner():\r    return 1\r")
+    subprocess.run(["git", "add", "a.py"], cwd=repo, check=True)
+    fake_codex(_emit_last_message(_packet()))
+    result = _run(repo, "--render")
+    assert result.exit_code == 0, result.output
+    assert b"def owner():\r    return 1\r```" in result.stdout_bytes
+    assert b"return 1\r\n" not in result.stdout_bytes
+
+
+def test_render_supplies_a_newline_for_an_unterminated_last_line(
+    fake_codex, tmp_path: Path
+) -> None:
+    """The control for the bare-CR case: the fence still starts its own line."""
+    repo = _repo(tmp_path)
+    (repo / "a.py").write_bytes(b"def owner():\n    return 1")
+    subprocess.run(["git", "add", "a.py"], cwd=repo, check=True)
+    fake_codex(_emit_last_message(_packet()))
+    result = _run(repo, "--render")
+    assert result.exit_code == 0, result.output
+    assert b"    return 1\n```" in result.stdout_bytes
+
+
+def test_the_line_reader_is_bytes_splitlines_at_every_chunk_boundary(tmp_path: Path) -> None:
+    """The one line grammar, checked against the stdlib it claims to reproduce.
+
+    Every string over ``{a, \\n, \\r}`` up to length 5, at read sizes that put a
+    boundary inside a CRLF. This is what licenses scanning only the new chunk.
+    """
+    f = tmp_path / "f"
+    original = cli._READ_CHUNK
+    try:
+        for chunk in (1, 2, 3, 5, 1 << 20):
+            cli._READ_CHUNK = chunk
+            for n in range(6):
+                for combo in itertools.product([b"a", b"\n", b"\r"], repeat=n):
+                    data = b"".join(combo)
+                    f.write_bytes(data)
+                    want = data.splitlines(keepends=True)
+                    assert list(cli._iter_lines(f)) == want, (chunk, data)
+                    for limit in range(1, 7):
+                        assert cli._count_lines_upto(f, limit) == min(len(want), limit), (
+                            chunk,
+                            data,
+                            limit,
+                        )
+    finally:
+        cli._READ_CHUNK = original
+
+
+def test_validating_a_span_in_a_single_line_file_does_not_hold_the_line(tmp_path: Path) -> None:
+    """A minified bundle is one line the size of the file.
+
+    Counting must neither re-split an accumulating prefix nor assemble a line no
+    caller will read; both are what a growing ``carry`` costs.
+    """
+    big = tmp_path / "bundle.js"
+    big.write_bytes(b"x" * (16 << 20))
+    tracemalloc.start()
+    counted = cli._count_lines_upto(big, 2)
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert counted == 1
+    assert peak < big.stat().st_size // 4, f"peak {peak} against a {big.stat().st_size}B file"
+
+
+def test_a_timeout_is_recorded_as_a_timeout(
+    fake_codex, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wrapper-owned telemetry classifies a timeout the way the engine does."""
+    repo = _repo(tmp_path)
+    fake_codex("cat > /dev/null; sleep 30\n")
+    real = cli.run_spark
+
+    def _short_timeout(*args: Any, **kwargs: Any) -> Any:
+        kwargs["timeout_s"] = 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "run_spark", _short_timeout)
+    result = _run(repo)
+    assert result.exit_code == 1
+    assert _read_telemetry()[-1]["status"] == "timeout"
+
+
+def test_a_malformed_response_still_carries_an_output_hash(fake_codex, tmp_path: Path) -> None:
+    """The only content-free correlator for a protocol failure is its hash."""
+    repo = _repo(tmp_path)
+    fake_codex(_emit_last_message({"status": "complete", "spans": "not a list"}))
+    result = _run(repo)
+    assert result.exit_code == 1
+    rec = _read_telemetry()[-1]
+    assert rec["status"] == "protocol_error"
+    assert rec["output_hash"] is not None
+
+
+def test_the_transport_is_probed_once_per_invocation(
+    fake_codex, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``auto`` opens a connection to the daemon socket to decide.
+
+    The wrapper record takes the engine's single selection; probing again just
+    to stamp it puts an extra empty frame on the daemon before every request.
+    """
+    repo = _repo(tmp_path)
+    monkeypatch.setenv("AFFORD_SPARK_TRANSPORT", "auto")
+    monkeypatch.setenv("AFFORD_SPARK_SOCKET", str(tmp_path / "no-such.sock"))
+    probes: list[Path] = []
+    monkeypatch.setattr(
+        protocol, "socket_is_connectable", lambda path: bool(probes.append(path)) and False
+    )
+    fake_codex(_emit_last_message(_packet()))
+    result = _run(repo)
+    assert result.exit_code == 0, result.output
+    assert len(probes) == 1, probes
+    assert _read_telemetry()[-1]["transport"] == "oneshot"

@@ -143,8 +143,10 @@ Spark never touches a seat's live checkout.
   input hash, model, pool (`spark`), latency, output hash, changed files
   (wrapper-audited on `transform`; null otherwise), result state, subsequent
   verification outcome (always null this slice — a later correlator fills it),
-  `transport` (`oneshot` | `daemon`). A few hundred calls tell us empirically
-  which verbs Spark deserves.
+  `transport` (`oneshot` | `daemon`). Resolving `auto` is a connect to the
+  daemon socket, so it happens **once** per invocation: a verb whose wrapper
+  owns the record takes the engine's selection rather than probing again to
+  stamp it. A few hundred calls tell us empirically which verbs Spark deserves.
 
 ## Warm daemon (`afford-sparkd`) — second slice
 
