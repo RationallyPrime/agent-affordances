@@ -358,6 +358,21 @@ MARKER_INVENTORY: tuple[MarkerFamily, ...] = (
         ),
     ),
     MarkerFamily(
+        "skip",
+        SEAT_TYPED,
+        (
+            MarkerTemplate(
+                f"{MARKER_NAMESPACE}skip:{MARKER_SCHEMA_VERSION}:<head> -->",
+                "skip_marker",
+                ("<head>",),
+            ),
+        ),
+        (
+            MarkerReader("head_is_skipped", READER_HEAD_PREDICATE),
+            MarkerReader("head_disposed_at", READER_HEAD_TIME, ("skip",)),
+        ),
+    ),
+    MarkerFamily(
         "retrospective",
         SEAT_TYPED,
         (
@@ -495,6 +510,7 @@ EXHAUSTED_MARKER_RE = re.compile(
 PRODUCT_GATE_MARKER_PREFIX = marker_prefix("product-gate")
 NOISE_MARKER_PREFIX = marker_prefix("noise")
 HOLD_MARKER_PREFIX = marker_prefix("hold")
+SKIP_MARKER_PREFIX = marker_prefix("skip")
 # The head-disposition family: a trusted, once-per-head record that a seat
 # stopped deliberately and left HEAD unchanged.  All three have the same
 # shape, the same trust rule and the same meaning to the scheduled leg — the
@@ -505,6 +521,7 @@ HEAD_DISPOSITION_PREFIXES: dict[str, str] = {
     "product-gate": PRODUCT_GATE_MARKER_PREFIX,
     "noise": NOISE_MARKER_PREFIX,
     "hold": HOLD_MARKER_PREFIX,
+    "skip": SKIP_MARKER_PREFIX,
 }
 # The retrospective's own three markers.
 #
@@ -605,24 +622,33 @@ CODEX_COMMENT_UNKNOWN = "unknown"
 # produced). One constant, rendered at the top of the summon comment, the burn
 # wake, the substitute-review wake and the retrospective wake, so the test is
 # applied where the finding is born, not after it has cost a round.
+# The trailer a burn (or any seat) commit carries to say the next round is not
+# worth its hour: the push leg posts a `skip` disposition for that head instead
+# of `@codex review`, the scheduled leg honours it like a hold, and the merge
+# boundary reads the marker as the verdict limb (Hákon's ruling, 2026-09-06).
+REVIEW_SKIP_TRAILER = "Review-skip:"
 SCOPE_TEST = (
-    "Scope test — apply it before writing or patching any finding. Hold the "
-    "code to its purpose and use case: what is it for, who runs it, and where? "
-    "Ask of every defect: if it stays unpatched, does it surface the first time "
-    "this code runs — a script failing on its first invocation, a test "
-    "tripping, a request erroring — or does it only exist for an input, a "
-    "channel, a schedule or an adversary this product does not have yet? "
-    "Nothing here is live on a customer box and the product is still being "
-    "built. A defect that would announce itself on first execution is a "
-    "finding worth a round; one that needs a state, a source or a customer we "
-    "do not have is a ticket or noise, and patching it spends the Weave's time "
-    "for no value. Judge each finding by what it changes the next time this "
-    "code actually runs."
+    "Round test — before another review round is summoned or burned, ask what "
+    "the round buys. Hold the code to its purpose and use case: what is it for, "
+    "who runs it, and where? If a defect still in it would announce itself the "
+    "first time the code runs — a script failing on invocation, a test tripping, "
+    "a request erroring — then execution is the review: skip the round, merge at "
+    "green, run it. Spend a round only where a latent defect would stay silent — "
+    "durable state, data loss, a wrong answer that reads as right, a customer "
+    "boundary. Nothing here is live on a customer box and the product is still "
+    "being built; an hour of the Weave saved outweighs a finding the first run "
+    "would have found for free."
 )
-SCOPE_TEST_REVIEWER = f"{SCOPE_TEST} Raise only findings that pass this test."
+SCOPE_TEST_REVIEWER = (
+    f"{SCOPE_TEST} Raise only findings the first run would not have found."
+)
 SCOPE_TEST_BURNER = (
-    f"{SCOPE_TEST} A finding that fails it is `noise` or `ticket`, never a burn; "
-    "say which in the disposition."
+    f"{SCOPE_TEST} The convention: ask this once round two's verdict is in — "
+    "before round three is summoned — and at every round after; earlier, skip "
+    "only a trivial one-line repair. If every remaining defect would surface on "
+    f"first run, do not re-summon: end your burn commit with the trailer "
+    f"`{REVIEW_SKIP_TRAILER} <one line why>`; the push records the skip and the "
+    "head merges at green with zero threads."
 )
 
 MERGE_REGIME = (
@@ -3437,6 +3463,48 @@ def hold_comment_body(head_sha: str) -> str:
 def head_is_held(comments: Sequence[Mapping[str, Any]], head_sha: str) -> bool:
     """True when a trusted seat has held this exact head for a human."""
     return marker_comment_exists(comments, head_disposition_pattern("hold", head_sha))
+
+
+def skip_marker(head_sha: str) -> str:
+    return f"{SKIP_MARKER_PREFIX}{MARKER_SCHEMA_VERSION}:{head_sha} -->"
+
+
+def review_skip_reason(commit_message: str) -> str | None:
+    """The reason a commit gives for skipping the next review round, if it gives one.
+
+    A ``Review-skip: <why>`` trailer line anywhere in the message; the last one
+    wins. Absent, empty or whitespace-only means no skip was asked for.
+    """
+    reason: str | None = None
+    for line in commit_message.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith(REVIEW_SKIP_TRAILER.lower()):
+            candidate = stripped[len(REVIEW_SKIP_TRAILER) :].strip()
+            reason = candidate or None
+    return reason
+
+
+def skip_comment_body(head_sha: str, reason: str) -> str:
+    """The once-per-head record that the seat judged the next round not worth its hour.
+
+    Hákon's ruling (2026-09-06): when a defect still in the code would announce
+    itself the first time it runs, execution is the review. The burn commit says
+    so with a ``Review-skip:`` trailer; the push leg records it here instead of
+    summoning, the scheduled leg reads the head's stillness as a decision like a
+    hold, and the merge boundary takes this marker as the verdict limb — the
+    head merges at green with zero threads.
+    """
+    return (
+        "Review-loop: review round skipped for this head by the pushing seat — "
+        f"{reason}. No reviewer is to be summoned for this head; it merges at the "
+        "green boundary with zero open threads (Hákon's ruling, 2026-09-06).\n"
+        f"{skip_marker(head_sha)}"
+    )
+
+
+def head_is_skipped(comments: Sequence[Mapping[str, Any]], head_sha: str) -> bool:
+    """True when a trusted identity recorded that this exact head needs no round."""
+    return marker_comment_exists(comments, head_disposition_pattern("skip", head_sha))
 
 
 def head_disposed_at(
@@ -7096,7 +7164,7 @@ def _scan_open_pull(
     # retrospective chase, before both summon routes.  The hold withholds a
     # *reviewer*; it does not withhold the records that automation stopped,
     # which cost no round and are what a human reads next.
-    if head_is_held(comments, head_sha):
+    if head_is_held(comments, head_sha) or head_is_skipped(comments, head_sha):
         print(
             f"held head {repository}#{pr_number} (head={head_sha}): a "
             "seat-authored human gate stands; no reviewer summoned"
@@ -7302,6 +7370,13 @@ def summon_on_push() -> None:
         # the scan skips it regardless; name the reason rather than fail cold.
         print(f"ignored head move on fork PR #{pr_number}")
         return
+    head_sha = str(pull_request.get("head", {}).get("sha") or "")
+    if record_review_skip(github, pull_request, pr_number=pr_number, head_sha=head_sha):
+        # The seat has said this head needs no round. Nothing else the scan
+        # does on a fresh push applies (no verdict to redeliver, no chase), and
+        # the scheduled leg reads the marker as a disposition from here on.
+        print(f"push-routed PR #{pr_number} (skipped by the pushing seat's trailer)")
+        return
     codex_login = os.environ.get("CODEX_LOGIN", CODEX_LOGIN)
     # Read the meter here and hand it down, as the scheduled scan does: the
     # router would fetch it itself, but the scan only serialises a reading it
@@ -7321,6 +7396,38 @@ def summon_on_push() -> None:
         f"(nudged={nudged}, summoned={summoned}, redelivered={redelivered}, "
         f"chased={chased})"
     )
+
+
+def record_review_skip(
+    github: Any, pull_request: Mapping[str, Any], *, pr_number: int, head_sha: str
+) -> bool:
+    """Post the ``skip`` disposition when the pushed head asks for it; True when posted.
+
+    Read from the head commit's message on the push leg only — the one moment
+    the seat's decision and the head it applies to are the same object. The
+    scan that follows sees the marker and withholds the reviewer, exactly as it
+    does for a hold; a head already skipped is not re-marked.
+    """
+    if not head_sha:
+        return False
+    commit = github.get(f"commits/{head_sha}")
+    message = ""
+    if isinstance(commit, Mapping):
+        inner = commit.get("commit")
+        if isinstance(inner, Mapping):
+            message = str(inner.get("message") or "")
+    reason = review_skip_reason(message)
+    if reason is None:
+        return False
+    comments = github.paginate(f"issues/{pr_number}/comments")
+    if head_is_skipped(comments, head_sha):
+        print(f"PR #{pr_number}: head {head_sha[:8]} already carries a skip marker")
+        return False
+    github.post(
+        f"issues/{pr_number}/comments", {"body": skip_comment_body(head_sha, reason)}
+    )
+    print(f"PR #{pr_number}: review round skipped at {head_sha[:8]} — {reason}")
+    return True
 
 
 def nudge_stalled_reviews() -> None:
