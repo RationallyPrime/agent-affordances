@@ -38,7 +38,10 @@ install -d -m 700 ~/.claude/secrets
 umask 077 && pbpaste > ~/.claude/secrets/linear_api_key   # key on the clipboard
 ```
 
-The error for a missing key names every path that was consulted.
+The error for a missing key names every path that was consulted. A file the
+process cannot read at all (mode `000` or `200` passes the group/world check)
+or whose bytes are not UTF-8 is refused the same way — every key-file problem
+is an authentication error with exit code 2, never a traceback.
 
 ## Commands
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -60,6 +61,24 @@ def test_a_group_or_world_readable_key_file_is_refused(tmp_path: Path, mode: int
         resolve_api_key({}, home=tmp_path)
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a file whatever its mode says")
+@pytest.mark.parametrize("mode", [0o000, 0o200])
+def test_a_key_file_its_own_owner_cannot_read_is_an_error(tmp_path: Path, mode: int) -> None:
+    """No group or world bits, no owner-read bit either: the mode check lets it through."""
+    write_key(tmp_path / ".claude" / KEY_FILE_RELATIVE, mode=mode)
+    with pytest.raises(MissingAPIKeyError, match="cannot be read"):
+        resolve_api_key({}, home=tmp_path)
+
+
+def test_a_key_file_that_is_not_utf8_is_an_error(tmp_path: Path) -> None:
+    path = tmp_path / ".claude" / KEY_FILE_RELATIVE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"lin_api_\xff\xfe\n")
+    path.chmod(0o600)
+    with pytest.raises(MissingAPIKeyError, match="cannot be read"):
+        resolve_api_key({}, home=tmp_path)
+
+
 def test_an_empty_key_file_is_an_error(tmp_path: Path) -> None:
     write_key(tmp_path / ".claude" / KEY_FILE_RELATIVE, "   ")
     with pytest.raises(MissingAPIKeyError, match="is empty"):
@@ -104,3 +123,16 @@ def test_the_cli_error_names_the_key_file_convention(runner) -> None:
     assert result.exit_code == 2
     assert "LINEAR_API_KEY is not set" in result.stderr
     assert "secrets/linear_api_key" in result.stderr
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a file whatever its mode says")
+def test_the_cli_fails_actionably_on_an_unreadable_key_file(runner, monkeypatch, tmp_path) -> None:
+    """An unreadable key file exits 2 with an error line, not a PermissionError traceback."""
+    profile = tmp_path / "profiles" / "gnomon"
+    path = write_key(profile / KEY_FILE_RELATIVE, mode=0o200)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+    result = runner.invoke(app, ["teams"])
+    assert result.exit_code == 2
+    assert result.exception.__class__ is SystemExit
+    assert str(path) in result.stderr
+    assert "cannot be read" in result.stderr

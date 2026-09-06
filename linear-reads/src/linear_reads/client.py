@@ -66,7 +66,8 @@ def resolve_api_key(
     An explicit ``LINEAR_API_KEY_FILE`` that does not exist is an error, not a
     fallthrough: a stated path that is wrong should say so. A key file readable
     by group or world is refused rather than used — the file is a real secret
-    and 600 is the contract.
+    and 600 is the contract. Every refusal is a ``MissingAPIKeyError``, which is
+    what the CLI translates into its actionable exit 2.
     """
     env = os.environ if environ is None else environ
     key = env.get(KEY_ENV)
@@ -80,13 +81,21 @@ def resolve_api_key(
             if explicit and path == Path(explicit).expanduser():
                 raise MissingAPIKeyError(f"{KEY_FILE_ENV}={path} does not exist")
             continue
-        mode = path.stat().st_mode
-        if mode & _LOOSE_MODE_BITS:
-            raise MissingAPIKeyError(
-                f"{path} is {stat.filemode(mode)}; a Linear key file must be readable by its "
-                "owner only (chmod 600)"
-            )
-        key = path.read_text(encoding="utf-8").strip()
+        try:
+            mode = path.stat().st_mode
+            if mode & _LOOSE_MODE_BITS:
+                raise MissingAPIKeyError(
+                    f"{path} is {stat.filemode(mode)}; a Linear key file must be readable by its "
+                    "owner only (chmod 600)"
+                )
+            key = path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError) as exc:
+            # Mode 600 is the ceiling, not the floor: 000 and 200 also carry no
+            # group or world bits, so the check above passes and the read raises
+            # PermissionError. Bytes that are not UTF-8 raise too. Both are
+            # configuration mistakes, and only a LinearError reaches the CLI's
+            # actionable exit 2.
+            raise MissingAPIKeyError(f"{path} cannot be read: {exc}") from exc
         if not key:
             raise MissingAPIKeyError(f"{path} is empty")
         return key
