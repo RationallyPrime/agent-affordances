@@ -503,6 +503,25 @@ def test_render_supplies_a_newline_for_an_unterminated_last_line(
     assert b"    return 1\n```" in result.stdout_bytes
 
 
+def _lines_from_pieces(path: Path) -> list[bytes]:
+    """Whole lines, rejoined from the piece stream the way a consumer would.
+
+    Production code never assembles a line it has not been asked for, so the
+    grammar is checked here: this asserts the piece bytes *and* the ``ends_line``
+    flags, since only the flags decide where one line stops and the next begins.
+    """
+    out: list[bytes] = []
+    pieces: list[bytes] = []
+    for piece, ends_line in cli._iter_line_pieces(path):
+        pieces.append(piece)
+        if ends_line:
+            out.append(b"".join(pieces))
+            pieces = []
+    if pieces:
+        out.append(b"".join(pieces))
+    return out
+
+
 def test_the_line_reader_is_bytes_splitlines_at_every_chunk_boundary(tmp_path: Path) -> None:
     """The one line grammar, checked against the stdlib it claims to reproduce.
 
@@ -519,7 +538,7 @@ def test_the_line_reader_is_bytes_splitlines_at_every_chunk_boundary(tmp_path: P
                     data = b"".join(combo)
                     f.write_bytes(data)
                     want = data.splitlines(keepends=True)
-                    assert list(cli._iter_lines(f)) == want, (chunk, data)
+                    assert _lines_from_pieces(f) == want, (chunk, data)
                     for limit in range(1, 7):
                         assert cli._count_lines_upto(f, limit) == min(len(want), limit), (
                             chunk,
@@ -544,6 +563,63 @@ def test_validating_a_span_in_a_single_line_file_does_not_hold_the_line(tmp_path
     tracemalloc.stop()
     assert counted == 1
     assert peak < big.stat().st_size // 4, f"peak {peak} against a {big.stat().st_size}B file"
+
+
+def test_span_bytes_is_splitlines_slicing_at_every_chunk_boundary(tmp_path: Path) -> None:
+    """The cost guard's control: reading pieces must still cut spans exactly.
+
+    Every string over ``{a, \\n, \\r}`` up to length 4, at read sizes that put a
+    boundary inside a CRLF, against the stdlib slicing the spans are defined by.
+    Each span is read alone (its own end line is the deepest) and again in one
+    shared pass (where a shallower span must not be truncated by a deeper one).
+    """
+    root = tmp_path / "root"
+    root.mkdir()
+    f = root / "f"
+    bounds = [(s, e) for s in range(1, 6) for e in range(s, 6)]
+    original = cli._READ_CHUNK
+    try:
+        for chunk in (1, 2, 3, 1 << 20):
+            cli._READ_CHUNK = chunk
+            for n in range(5):
+                for combo in itertools.product([b"a", b"\n", b"\r"], repeat=n):
+                    data = b"".join(combo)
+                    f.write_bytes(data)
+                    lines = data.splitlines(keepends=True)
+                    want = [b"".join(lines[s - 1 : e]) for s, e in bounds]
+                    spans = [
+                        Span(path="f", start_line=s, end_line=e, role="owner", why="w")
+                        for s, e in bounds
+                    ]
+                    shared = cli._span_bytes(root, spans)
+                    assert [shared[i] for i in range(len(bounds))] == want, (chunk, data)
+                    for i, span in enumerate(spans):
+                        assert cli._span_bytes(root, [span]) == {0: want[i]}, (
+                            chunk,
+                            data,
+                            bounds[i],
+                        )
+    finally:
+        cli._READ_CHUNK = original
+
+
+def test_reading_a_span_does_not_assemble_the_lines_around_it(tmp_path: Path) -> None:
+    """A span costs its own bytes, not its neighbours'.
+
+    A minified line *before* the span is skipped a piece at a time, and the pass
+    ends on the deepest requested terminator, so the line *after* it is never
+    pulled. Both are lines a whole-line reader assembles only to discard.
+    """
+    huge = b"x" * (16 << 20)
+    big = tmp_path / "bundle.js"
+    big.write_bytes(b"head\n" + huge + b"\nwanted\n" + huge + b"\n")
+    span = Span(path="bundle.js", start_line=3, end_line=3, role="owner", why="w")
+    tracemalloc.start()
+    bodies = cli._span_bytes(tmp_path, [span])
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert bodies == {0: b"wanted\n"}
+    assert peak < len(huge) // 4, f"peak {peak} against a {len(huge)}B neighbouring line"
 
 
 def test_a_timeout_is_recorded_as_a_timeout(

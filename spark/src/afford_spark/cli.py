@@ -325,33 +325,13 @@ def _iter_line_pieces(path: Path) -> Generator[tuple[bytes, bool]]:
             yield held, True
 
 
-def _iter_lines(path: Path) -> Generator[bytes]:
-    """Stream the file's lines, each carrying its own terminator.
-
-    The coordinates the wrapper audits are the ones a reader of the file sees,
-    without the file ever being resident. Terminators are kept because a span's
-    bytes are the file's bytes: rejoining the lines of a span reproduces it
-    exactly, CRLF included.
-    """
-    pieces: list[bytes] = []
-    with contextlib.closing(_iter_line_pieces(path)) as stream:
-        for piece, ends_line in stream:
-            pieces.append(piece)
-            if ends_line:
-                yield b"".join(pieces)
-                pieces = []
-    if pieces:
-        yield b"".join(pieces)
-
-
 def _count_lines_upto(path: Path, limit: int) -> int:
     """Lines in ``path``, counted no further than ``limit``.
 
     Validating a one-line span from a 30 MB log must cost one line, not 30 MB:
     the count only has to distinguish "at least ``limit`` lines" from the real
-    length of a file that is shorter. Counting off the piece stream rather than
-    ``_iter_lines`` means a file that is one enormous line is never assembled
-    to be discarded.
+    length of a file that is shorter. Counting off the piece stream means a file
+    that is one enormous line is never assembled to be discarded.
     """
     counted = 0
     open_line = False
@@ -370,8 +350,15 @@ def _count_lines_upto(path: Path, limit: int) -> int:
 def _span_bytes(root: Path, spans: Sequence[Span]) -> dict[int, bytes]:
     """Exact bytes of every span, one streaming pass per path (span index -> bytes).
 
-    Spans sharing a path share the pass, and the pass stops at the deepest end
-    line any of them names.
+    Spans sharing a path share the pass, and the pass stops on the terminator of
+    the deepest end line any of them names.
+
+    Keeping the pass on pieces rather than lines is what bounds the cost to the
+    spans themselves. A piece belongs to the line being read, so span membership
+    is decided before it is retained: a minified line outside every span is
+    skipped a megabyte at a time, and the line *after* the deepest one is never
+    pulled at all. Terminators are kept because a span's bytes are the file's
+    bytes — rejoining a span's pieces reproduces it exactly, CRLF included.
     """
     by_path: dict[str, list[int]] = {}
     for index, span in enumerate(spans):
@@ -380,13 +367,16 @@ def _span_bytes(root: Path, spans: Sequence[Span]) -> dict[int, bytes]:
     for rel, indexes in by_path.items():
         deepest = max(spans[i].end_line for i in indexes)
         parts: dict[int, list[bytes]] = {i: [] for i in indexes}
-        with contextlib.closing(_iter_lines(root / rel)) as lines:
-            for number, line in enumerate(lines, start=1):
-                if number > deepest:
-                    break
+        number = 1
+        with contextlib.closing(_iter_line_pieces(root / rel)) as stream:
+            for piece, ends_line in stream:
                 for i in indexes:
                     if spans[i].start_line <= number <= spans[i].end_line:
-                        parts[i].append(line)
+                        parts[i].append(piece)
+                if ends_line:
+                    if number >= deepest:
+                        break
+                    number += 1
         out.update({i: b"".join(chunks) for i, chunks in parts.items()})
     return out
 
