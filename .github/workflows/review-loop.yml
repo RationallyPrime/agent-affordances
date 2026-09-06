@@ -56,9 +56,12 @@ on:
 # write disjoint GitHub state. Sweep and verdict-<pr> both publish wakes
 # for the same PR: the previous constant group serialised them, so dropping
 # that without a write guard lets the scan post a stale snapshot after the
-# event route has already published a newer verdict. `redeliver_standing_wake`
-# therefore re-fetches the standing verdict immediately before publication
-# and refuses unless it is still the latest at the head.
+# event route has already published a newer verdict. Every sweep-side
+# publication — nudge, substitute summon, exhaustion gate, wake redelivery —
+# therefore passes `verdict_state_held`, which re-fetches the head's verdict
+# immediately before publication and refuses unless the snapshot it was
+# computed from is still the latest at the head — compared by GitHub's own
+# record id, not by its whole-second timestamp (KRA-1368).
 #
 #   verdict-<pr>   pull_request_review, issue_comment -> wake-on-codex-result
 #   closure-<pr>   pull_request (closed)              -> announce-machine-merge,
