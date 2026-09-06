@@ -7,12 +7,14 @@ Exit codes: 0 complete · 3 incomplete · 4 ambiguous · 5 refused ·
 from __future__ import annotations
 
 import contextlib
+import re
 import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Generator, Sequence
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, NoReturn
 
 import typer
 
@@ -29,6 +31,7 @@ from afford_spark.models import (
     LocateResult,
     ResultStatus,
     SliceResult,
+    Span,
     TransformResult,
     TriageResult,
 )
@@ -46,14 +49,76 @@ def _emit(result: LocateResult | SliceResult | TransformResult | TriageResult) -
     raise typer.Exit(EXIT_CODES[result.status])
 
 
-def _die(message: str) -> None:
+def _die(message: str) -> NoReturn:
     typer.echo(f"afford spark: {message}", err=True)
     raise typer.Exit(1)
 
 
-def _usage(message: str) -> None:
+def _usage(message: str) -> NoReturn:
     typer.echo(f"afford spark: {message}", err=True)
     raise typer.Exit(2)
+
+
+def _wrapper_owned_record(
+    *,
+    verb: str,
+    prompt: str,
+    root: Path,
+    writable: bool,
+    allow: list[str],
+    base_sha: str | None = None,
+    started: float,
+) -> dict[str, object]:
+    """The telemetry record a verb whose wrapper re-derives the result owns itself.
+
+    ``run_spark``'s own emission carries the model's self-reported status and a
+    hash of its raw output. ``slice`` and ``transform`` audit that answer and
+    can downgrade it, so both pass ``emit_telemetry=False`` and publish through
+    ``_publish_invocation`` after the audit — one record, describing the result
+    the caller actually receives. A transport that will not resolve is recorded
+    here because no invocation will follow to record it.
+    """
+
+    def _record(transport: str | None) -> dict[str, object]:
+        return invocation_record(
+            verb=verb,
+            prompt=prompt,
+            workdir=root,
+            writable=writable,
+            base_sha=base_sha,
+            allowed_paths=allow,
+            repo=root,
+            transport=transport,
+        )
+
+    try:
+        transport = choose_transport()
+    except SparkProtocolError as exc:
+        with contextlib.suppress(OSError):
+            emit_invocation(_record(None), started=started, status="protocol_error")
+        _die(str(exc))
+    return _record(transport)
+
+
+def _publish_invocation(
+    record: dict[str, object],
+    *,
+    started: float,
+    status: str | None,
+    raw: str | None = None,
+    changed_files: list[str] | None = None,
+) -> None:
+    """Emit the audited record. A write failure is loud, and terminal on its own,
+    but it never masks an exit already in flight."""
+    inflight = sys.exc_info()[0]
+    try:
+        emit_invocation(
+            record, started=started, status=status, raw=raw, changed_files=changed_files
+        )
+    except OSError as exc:
+        typer.echo(f"afford spark: telemetry write failed: {exc}", err=True)
+        if inflight is None:
+            raise typer.Exit(1) from exc
 
 
 def _under_root(path: Path, root: Path) -> Path:
@@ -220,8 +285,69 @@ def locate(
     _emit(result)
 
 
-def _line_count(root: Path, rel: str) -> int:
-    return len((root / rel).read_bytes().splitlines())
+_READ_CHUNK = 1 << 20
+
+
+def _iter_lines(path: Path) -> Generator[bytes]:
+    """Stream the file's lines, each carrying its own terminator.
+
+    This is ``bytes.splitlines(keepends=True)`` semantics — ``\\n``, ``\\r\\n``
+    and a bare ``\\r`` all end a line — computed a megabyte at a time, so the
+    coordinates the wrapper audits are the ones a reader of the file sees
+    without the file ever being resident. Terminators are kept because a span's
+    bytes are the file's bytes: rejoining the lines of a span reproduces it
+    exactly, CRLF included.
+    """
+    with path.open("rb") as fh:
+        carry = b""
+        while chunk := fh.read(_READ_CHUNK):
+            lines = (carry + chunk).splitlines(keepends=True)
+            # The last element may be an unterminated tail, or a lone trailing
+            # ``\r`` whose ``\n`` is in the next read. Both re-split correctly.
+            carry = lines.pop() if lines else b""
+            yield from lines
+        if carry:
+            yield carry
+
+
+def _count_lines_upto(path: Path, limit: int) -> int:
+    """Lines in ``path``, counted no further than ``limit``.
+
+    Validating a one-line span from a 30 MB log must cost one line, not 30 MB:
+    the count only has to distinguish "at least ``limit`` lines" from the real
+    length of a file that is shorter.
+    """
+    counted = 0
+    with contextlib.closing(_iter_lines(path)) as lines:
+        for _ in lines:
+            counted += 1
+            if counted >= limit:
+                break
+    return counted
+
+
+def _span_bytes(root: Path, spans: Sequence[Span]) -> dict[int, bytes]:
+    """Exact bytes of every span, one streaming pass per path (span index -> bytes).
+
+    Spans sharing a path share the pass, and the pass stops at the deepest end
+    line any of them names.
+    """
+    by_path: dict[str, list[int]] = {}
+    for index, span in enumerate(spans):
+        by_path.setdefault(span.path, []).append(index)
+    out: dict[int, bytes] = {}
+    for rel, indexes in by_path.items():
+        deepest = max(spans[i].end_line for i in indexes)
+        parts: dict[int, list[bytes]] = {i: [] for i in indexes}
+        with contextlib.closing(_iter_lines(root / rel)) as lines:
+            for number, line in enumerate(lines, start=1):
+                if number > deepest:
+                    break
+                for i in indexes:
+                    if spans[i].start_line <= number <= spans[i].end_line:
+                        parts[i].append(line)
+        out.update({i: b"".join(chunks) for i, chunks in parts.items()})
+    return out
 
 
 def _owned_slice(model: SliceResult, *, allow: list[str], root: Path) -> SliceResult:
@@ -249,7 +375,10 @@ def _owned_slice(model: SliceResult, *, allow: list[str], root: Path) -> SliceRe
             searched_paths=model.searched_paths,
             reason=f"packet references paths outside the allowlist: {', '.join(widened)}",
         )
-    lengths = {rel: _line_count(root, rel) for rel in {sp.path for sp in model.spans}}
+    deepest: dict[str, int] = {}
+    for sp in model.spans:
+        deepest[sp.path] = max(deepest.get(sp.path, 0), sp.end_line)
+    lengths = {rel: _count_lines_upto(root / rel, need) for rel, need in deepest.items()}
     invalid = [
         f"{sp.path}:{sp.start_line}-{sp.end_line}"
         for sp in model.spans
@@ -273,26 +402,84 @@ def _owned_slice(model: SliceResult, *, allow: list[str], root: Path) -> SliceRe
             searched_paths=model.searched_paths,
             reason="model claimed completion without a seam and at least one span",
         )
+    # The seam is the path that owns the behavior, and the prompt defines the
+    # ``owner`` role as the seam itself. A packet of consumers and tests around
+    # a seam whose code is not in it fails the command's whole contract, so a
+    # completion needs one span that is both.
+    if model.status == "complete" and not any(
+        sp.role == "owner" and sp.path == model.seam for sp in model.spans
+    ):
+        return SliceResult(
+            status="incomplete",
+            seam=model.seam,
+            spans=model.spans,
+            unresolved=model.unresolved,
+            searched_paths=model.searched_paths,
+            reason=f"no owner span for the declared seam: {model.seam}",
+        )
     return model
 
 
-def _render_slice(result: SliceResult, root: Path) -> str:
-    """Deterministic packet text: the real bytes of every audited span."""
+def _fence(excerpt: str) -> str:
+    """A fence longer than the longest backtick run inside ``excerpt``.
+
+    A ``contract`` span is routinely a docstring or a Markdown rule that itself
+    contains a triple-backtick block. A fixed fence closes inside such an
+    excerpt, and everything after it reads as packet markup rather than file
+    content — the structural separation between spans is exactly what the
+    packet is for.
+    """
+    longest = max((len(run) for run in re.findall(r"`+", excerpt)), default=0)
+    return "`" * max(3, longest + 1)
+
+
+def _render_slice(result: SliceResult, root: Path) -> tuple[SliceResult, str | None]:
+    """Deterministic packet text: the exact bytes of every audited span.
+
+    Returns the packet with its rendered text, or a refusal with no text when a
+    span cannot be reproduced losslessly. The excerpt is the file's own bytes —
+    no encoding substitution, no line-ending normalization — because a caller
+    reading the packet to make an edit gets the coordinates wrong if the text
+    is not what is on disk. A span the default encoding cannot decode refuses
+    the packet rather than shipping U+FFFD as though it were the file.
+    """
+    bodies = _span_bytes(root, result.spans)
+    excerpts: list[str] = []
+    for index, sp in enumerate(result.spans):
+        try:
+            excerpts.append(bodies[index].decode())
+        except UnicodeDecodeError:
+            return (
+                SliceResult(
+                    status="refused",
+                    seam=result.seam,
+                    spans=result.spans,
+                    unresolved=result.unresolved,
+                    searched_paths=result.searched_paths,
+                    reason=(
+                        "span cannot be rendered losslessly (not valid UTF-8): "
+                        f"{sp.path}:{sp.start_line}-{sp.end_line}"
+                    ),
+                ),
+                None,
+            )
     lines = [f"# slice — seam: {result.seam}", ""]
-    for sp in result.spans:
-        body = (root / sp.path).read_text(errors="replace").splitlines()
-        excerpt = "\n".join(body[sp.start_line - 1 : sp.end_line])
+    for sp, excerpt in zip(result.spans, excerpts, strict=True):
+        # Drop the last line's own terminator so the closing fence starts a
+        # line; every other byte of the span, ``\r`` included, is kept.
+        body = excerpt[:-1] if excerpt.endswith("\n") else excerpt
+        fence = _fence(body)
         lines += [
             f"## {sp.path}:{sp.start_line}-{sp.end_line} [{sp.role}]",
             f"why: {sp.why}",
-            "```",
-            excerpt,
-            "```",
+            fence,
+            body,
+            fence,
             "",
         ]
     if result.unresolved:
         lines += ["## unresolved", *[f"- {u}" for u in result.unresolved], ""]
-    return "\n".join(lines)
+    return result, "\n".join(lines)
 
 
 @spark.command()
@@ -310,22 +497,48 @@ def slice(
     """Smallest sufficient context packet: seam + spans + why, never a summary."""
     root = (root or Path.cwd()).resolve()
     files = _resolve_paths(paths, root)
+    prompt = slice_prompt(task, files)
+    started = time.monotonic()
+    record = _wrapper_owned_record(
+        verb="slice", prompt=prompt, root=root, writable=False, allow=files, started=started
+    )
+    status: str | None = None
+    raw: str | None = None
+    result: SliceResult | None = None
+    text: str | None = None
     try:
-        model = run_spark(
-            slice_prompt(task, files),
-            verb="slice",
-            workdir=root,
-            schema=SliceResult,
-            allowed_paths=files,
-            repo=root,
-        )
-    except SparkUnavailableError as exc:
-        _die(str(exc))
-    except Exception as exc:
-        _die(f"slice failed: {exc}")
-    result = _owned_slice(model, allow=files, root=root)
-    if render and result.status == "complete":
-        typer.echo(_render_slice(result, root))
+        try:
+            model = run_spark(
+                prompt,
+                verb="slice",
+                workdir=root,
+                schema=SliceResult,
+                allowed_paths=files,
+                repo=root,
+                emit_telemetry=False,
+                telemetry_record=record,
+            )
+        except SparkUnavailableError as exc:
+            status = "unavailable"
+            _die(str(exc))
+        except SparkProtocolError as exc:
+            status = "protocol_error"
+            _die(f"slice failed: {exc}")
+        except Exception as exc:
+            status = "error"
+            _die(f"slice failed: {exc}")
+        result = _owned_slice(model, allow=files, root=root)
+        # Rendering is part of the audit: a span that cannot be reproduced
+        # losslessly refuses the packet, and that is the state the caller and
+        # the telemetry both have to carry.
+        if render and result.status == "complete":
+            result, text = _render_slice(result, root)
+        status = result.status
+        raw = result.model_dump_json()
+    finally:
+        _publish_invocation(record, started=started, status=status, raw=raw)
+    if text is not None:
+        typer.echo(text)
         raise typer.Exit(EXIT_CODES[result.status])
     _emit(result)
 
@@ -361,31 +574,14 @@ def transform(
 
     prompt = transform_prompt(rule, allow, base_sha)
     started = time.monotonic()
-    try:
-        transport = choose_transport()
-    except SparkProtocolError as exc:
-        record = invocation_record(
-            verb="transform",
-            prompt=prompt,
-            workdir=root,
-            writable=True,
-            base_sha=base_sha,
-            allowed_paths=allow,
-            repo=root,
-            transport=None,
-        )
-        with contextlib.suppress(OSError):
-            emit_invocation(record, started=started, status="protocol_error")
-        _die(str(exc))
-    record = invocation_record(
+    record = _wrapper_owned_record(
         verb="transform",
         prompt=prompt,
-        workdir=root,
+        root=root,
         writable=True,
+        allow=allow,
         base_sha=base_sha,
-        allowed_paths=allow,
-        repo=root,
-        transport=transport,
+        started=started,
     )
     status: str | None = None
     raw: str | None = None
@@ -445,15 +641,9 @@ def transform(
                     check=False,
                 )
             finally:
-                inflight = sys.exc_info()[0]
-                try:
-                    emit_invocation(
-                        record, started=started, status=status, raw=raw, changed_files=changed
-                    )
-                except OSError as exc:
-                    typer.echo(f"afford spark: telemetry write failed: {exc}", err=True)
-                    if inflight is None:
-                        raise typer.Exit(1) from exc
+                _publish_invocation(
+                    record, started=started, status=status, raw=raw, changed_files=changed
+                )
     if result is None:
         _die("transform produced no result")
     _emit(result)

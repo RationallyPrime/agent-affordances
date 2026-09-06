@@ -37,8 +37,16 @@ pytest -q 2>&1 | afford spark triage --kind pytest
 (`owner` · `producer` · `consumer` · `test` · `contract`) and a one-line
 loss statement, and `unresolved` for references outside the path set. The
 wrapper refuses the whole packet if any span names a path outside the
-allowlist or a line past the end of its file, and `--render` reads the bytes
-from disk, so the packet is never the model's paraphrase.
+allowlist or a line past the end of its file, and downgrades a completion
+that carries no `owner` span at its own seam. `--render` reads the bytes from
+disk — exact bytes, line endings included, inside a fence sized past the
+longest backtick run in the excerpt — so the packet is never the model's
+paraphrase and never a span quietly reflowed to fit the packet. A span the
+default encoding cannot decode refuses the packet rather than shipping
+replacement characters as though they were the file. Coordinates are
+validated and spans extracted by streaming, so a one-line span from a large
+log costs a line, not the log. The telemetry record is written after that
+audit and carries the state the caller receives, not the model's claim.
 
 Exit codes: `0` complete · `3` incomplete · `4` ambiguous · `5` refused ·
 `1` engine/pool failure (a throttled pool is a plain error, never a silent

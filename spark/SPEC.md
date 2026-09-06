@@ -52,9 +52,10 @@ triage     structured compression of logs, diffs, and findings
 but these three establish whether Spark deserves the rest.)
 
 Status 2026-09-06: the three are shipped and working. `slice` followed as the
-fourth verb — coordinate-audited by the wrapper (allowlist + end-of-file),
-`--render` emits the real span bytes. Remaining five verbs, the quota
-scavenger, and the eval corpus are unbuilt.
+fourth verb — coordinate-audited by the wrapper (allowlist, end-of-file, and
+an `owner` span at the declared seam), `--render` emits the real span bytes
+losslessly or refuses. Remaining five verbs, the quota scavenger, and the eval
+corpus are unbuilt.
 
 ### Output contracts (primitive on the model side, typed on ours)
 

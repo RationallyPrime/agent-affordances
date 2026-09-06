@@ -11,6 +11,7 @@ import json
 import os
 import stat
 import subprocess
+import tracemalloc
 from pathlib import Path
 
 import pytest
@@ -245,3 +246,226 @@ def test_render_refuses_a_span_that_became_a_symlink(fake_codex, tmp_path: Path)
     assert result.exit_code == 5
     assert "TOP SECRET" not in result.output
     assert "b.py" in json.loads(result.output)["reason"]
+
+
+def _submodule_repo(tmp_path: Path) -> Path:
+    """A superproject with a tracked submodule at ``sub``."""
+    inner = tmp_path / "inner"
+    inner.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=inner, check=True)
+    (inner / "lib.py").write_text("def lib():\n    return 2\n")
+    subprocess.run(["git", "add", "."], cwd=inner, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"],
+        cwd=inner,
+        check=True,
+    )
+    repo = _repo(tmp_path)
+    subprocess.run(
+        ["git", "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(inner), "sub"],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "sub"],
+        cwd=repo,
+        check=True,
+    )
+    return repo
+
+
+def test_submodule_only_path_set_is_a_usage_error(fake_codex, tmp_path: Path) -> None:
+    """`git ls-files` answers a submodule with the gitlink, which is a directory."""
+    repo = _submodule_repo(tmp_path)
+    fake_codex(_emit_last_message(_packet()))
+    result = runner.invoke(app, ["spark", "slice", "t", "sub", "--root", str(repo)])
+    assert result.exit_code == 2
+    assert "path set is empty" in result.output
+
+
+def test_submodule_gitlink_never_reaches_the_prompt(fake_codex, tmp_path: Path) -> None:
+    repo = _submodule_repo(tmp_path)
+    captured = tmp_path / "prompt.txt"
+    fake_codex(f'cat > "{captured}"\n' + _emit_last_message(_packet()))
+    assert _run(repo).exit_code == 0
+    assert "- sub\n" not in captured.read_text()
+
+
+def test_span_naming_a_submodule_gitlink_is_refused(fake_codex, tmp_path: Path) -> None:
+    """Never `read_bytes()` on a directory: the gitlink is outside the allowlist."""
+    repo = _submodule_repo(tmp_path)
+    fake_codex(
+        _emit_last_message(
+            _packet(
+                seam="sub",
+                spans=[
+                    {"path": "sub", "start_line": 1, "end_line": 1, "role": "owner", "why": "w"}
+                ],
+            )
+        )
+    )
+    result = _run(repo)
+    assert result.exit_code == 5
+    assert "sub" in json.loads(result.output)["reason"]
+
+
+def test_completion_without_an_owner_span_for_the_seam_is_incomplete(
+    fake_codex, tmp_path: Path
+) -> None:
+    """Consumers and tests around a seam whose own code is missing is not a packet."""
+    repo = _repo(tmp_path)
+    fake_codex(
+        _emit_last_message(
+            _packet(
+                spans=[
+                    {"path": "b.py", "start_line": 3, "end_line": 3, "role": "consumer", "why": "w"}
+                ]
+            )
+        )
+    )
+    result = _run(repo)
+    assert result.exit_code == 3
+    payload = json.loads(result.output)
+    assert payload["status"] == "incomplete"
+    assert payload["reason"] == "no owner span for the declared seam: a.py"
+
+
+def test_owner_span_belonging_to_another_path_is_incomplete(fake_codex, tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    fake_codex(
+        _emit_last_message(
+            _packet(
+                spans=[
+                    {"path": "b.py", "start_line": 1, "end_line": 1, "role": "owner", "why": "w"}
+                ]
+            )
+        )
+    )
+    result = _run(repo)
+    assert result.exit_code == 3
+    assert json.loads(result.output)["reason"] == "no owner span for the declared seam: a.py"
+
+
+def test_telemetry_records_the_wrapper_audited_status(fake_codex, tmp_path: Path) -> None:
+    """A packet the audit downgrades must not be logged with the model's claim."""
+    repo = _repo(tmp_path)
+    (repo / "c.py").write_text("x = 1\n")
+    fake_codex(
+        _emit_last_message(
+            _packet(
+                spans=[
+                    *_packet()["spans"],
+                    {"path": "c.py", "start_line": 1, "end_line": 1, "role": "test", "why": "w"},
+                ]
+            )
+        )
+    )
+    result = runner.invoke(app, ["spark", "slice", "t", "a.py", "b.py", "--root", str(repo)])
+    assert result.exit_code == 5
+    rec = _read_telemetry()[-1]
+    assert rec["status"] == "refused"
+    assert rec["transport"] == "oneshot"
+
+
+def test_render_refuses_a_span_it_cannot_reproduce(fake_codex, tmp_path: Path) -> None:
+    """Undecodable bytes refuse the packet — U+FFFD is not the file."""
+    repo = _repo(tmp_path)
+    (repo / "a.py").write_bytes(b"# caf\xe9 latin-1\ndef owner():\n    return 1\n")
+    subprocess.run(["git", "add", "a.py"], cwd=repo, check=True)
+    fake_codex(_emit_last_message(_packet()))
+    result = _run(repo, "--render")
+    assert result.exit_code == 5
+    assert "�" not in result.output
+    assert "a.py:1-2" in json.loads(result.output)["reason"]
+    assert _read_telemetry()[-1]["status"] == "refused"
+
+
+def test_render_preserves_crlf_line_endings(fake_codex, tmp_path: Path) -> None:
+    """`.output` is normalized by the test harness; the wire bytes are not."""
+    repo = _repo(tmp_path)
+    (repo / "a.py").write_bytes(b"def owner():\r\n    return 1\r\n")
+    subprocess.run(["git", "add", "a.py"], cwd=repo, check=True)
+    fake_codex(_emit_last_message(_packet()))
+    result = _run(repo, "--render")
+    assert result.exit_code == 0, result.output
+    assert b"def owner():\r\n    return 1" in result.stdout_bytes
+
+
+def test_render_fence_outlives_a_backtick_run_in_the_excerpt(fake_codex, tmp_path: Path) -> None:
+    """A `contract` span is routinely a docstring holding its own fenced block."""
+    repo = _repo(tmp_path)
+    (repo / "a.py").write_text('"""\n```\nfenced\n```\n"""\n')
+    subprocess.run(["git", "add", "a.py"], cwd=repo, check=True)
+    fake_codex(
+        _emit_last_message(
+            _packet(
+                spans=[
+                    {"path": "a.py", "start_line": 1, "end_line": 5, "role": "owner", "why": "w"}
+                ]
+            )
+        )
+    )
+    result = _run(repo, "--render")
+    assert result.exit_code == 0, result.output
+    tail = result.output[result.output.index("## a.py:1-5 [owner]") :].splitlines()
+    fence = tail[2]
+    assert set(fence) == {"`"} and len(fence) == 4, tail
+    closes = [i for i, line in enumerate(tail[3:], start=3) if line.rstrip() == fence]
+    assert closes[0] == 8, f"fence closed inside the excerpt at {closes}: {tail}"
+
+
+def test_a_one_line_span_does_not_load_the_whole_file(fake_codex, tmp_path: Path) -> None:
+    """Validation and render both stream: a tiny packet from a big log stays tiny."""
+    repo = _repo(tmp_path)
+    big = repo / "big.log"
+    with big.open("w") as fh:
+        for i in range(200_000):
+            fh.write(f"line {i} " + "x" * 60 + "\n")
+    subprocess.run(["git", "add", "big.log"], cwd=repo, check=True)
+    fake_codex(
+        _emit_last_message(
+            _packet(
+                spans=[
+                    {"path": "a.py", "start_line": 1, "end_line": 2, "role": "owner", "why": "w"},
+                    {
+                        "path": "big.log",
+                        "start_line": 5,
+                        "end_line": 5,
+                        "role": "producer",
+                        "why": "w",
+                    },
+                ]
+            )
+        )
+    )
+    tracemalloc.start()
+    result = _run(repo, "--render")
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert result.exit_code == 0, result.output
+    assert "line 4 " in result.output
+    assert peak < big.stat().st_size // 4, f"peak {peak} against a {big.stat().st_size}B file"
+
+
+def test_a_span_past_eof_in_a_big_file_is_still_refused(fake_codex, tmp_path: Path) -> None:
+    """The early-stopping count must not turn a short file into a long one."""
+    repo = _repo(tmp_path)
+    fake_codex(
+        _emit_last_message(
+            _packet(
+                spans=[
+                    {"path": "a.py", "start_line": 1, "end_line": 2, "role": "owner", "why": "w"},
+                    {
+                        "path": "b.py",
+                        "start_line": 3,
+                        "end_line": 99,
+                        "role": "consumer",
+                        "why": "w",
+                    },
+                ]
+            )
+        )
+    )
+    result = _run(repo)
+    assert result.exit_code == 5
+    assert "b.py:3-99" in json.loads(result.output)["reason"]
