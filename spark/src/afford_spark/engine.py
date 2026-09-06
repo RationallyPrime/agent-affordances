@@ -72,6 +72,26 @@ class SparkProtocolError(RuntimeError):
         self.raw = raw
 
 
+def error_status(text: str) -> str:
+    """The telemetry ``status`` for a failure the underlying codex reported.
+
+    One predicate for both transports, so a deadline the app-server reports as
+    a JSON-RPC error and one ``codex exec`` prints on stderr are recorded the
+    same way. The raiser calls it on the *raw* report; nothing re-runs it on
+    the rendered message, which is the rule ``check_auth`` already keeps for
+    the refusal axis.
+
+    Exactly the token the pre-carrier derivation in ``run_spark`` matched, and
+    deliberately no wider: bare ``timeout`` is a parameter name, so ``timeout
+    must be a positive integer`` is a contract violation, not a deadline.
+    There is no structured arm to prefer over the text — the app-server
+    publishes an unconstrained ``int64`` error code and a turn status
+    vocabulary of ``inProgress|completed|failed|interrupted`` with no timeout
+    member (``codex app-server generate-json-schema``, codex-cli 0.153.4).
+    """
+    return "timeout" if "timed out" in text.lower() else "protocol_error"
+
+
 def _hash(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
@@ -396,13 +416,20 @@ def _run_via_exec(
 
         stderr_tail = proc.stderr[-2000:] if proc.stderr else ""
         if proc.returncode != 0:
-            kind = classify_refusal(f"{proc.stderr}{proc.stdout}")
+            # One haystack, both axes, and it is the whole output rather than
+            # the 2000-char tail we render: a deadline announced before the
+            # last page of stderr is still a deadline.
+            reported = f"{proc.stderr}{proc.stdout}"
+            kind = classify_refusal(reported)
             if kind is not None:
                 raise SparkUnavailableError(
                     f"{refusal_message(kind)} (exit {proc.returncode}): {stderr_tail}",
                     kind=kind,
                 )
-            raise SparkProtocolError(f"codex exec failed (exit {proc.returncode}): {stderr_tail}")
+            raise SparkProtocolError(
+                f"codex exec failed (exit {proc.returncode}): {stderr_tail}",
+                status=error_status(reported),
+            )
 
         if not out_path.exists():
             raise SparkProtocolError("codex exec exited 0 but wrote no last message")

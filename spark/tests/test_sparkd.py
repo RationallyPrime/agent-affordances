@@ -755,6 +755,93 @@ def test_socket_path_honors_override(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert socket_path() == tmp_path / "custom.sock"
 
 
+def test_rpc_error_rules_on_the_deadline_axis_too() -> None:
+    """A deadline the server *reports* is a timeout, not a protocol error.
+
+    The typed carrier moved the verdict from ``run_spark``'s substring pass
+    over the rendered message to the raiser. ``_rpc_error`` is the raiser for
+    every app-server error response, so a deadline it never rules on is one
+    the whole chain below it — wire kind, telemetry status — loses.
+    """
+    reported = _rpc_error(
+        "turn/start", {"code": -32000, "message": "upstream request timed out after 60s"}
+    )
+    assert isinstance(reported, SparkProtocolError)
+    assert not isinstance(reported, SparkUnavailableError)
+    assert reported.status == "timeout"
+
+    unstructured = _rpc_error("turn/start", "stream error: request timed out")
+    assert isinstance(unstructured, SparkProtocolError)
+    assert unstructured.status == "timeout"
+
+    # The token is exactly the one the old derivation used, and no wider:
+    # ``timeout`` names a parameter, so this is a contract violation.
+    param = _rpc_error(
+        "turn/start", {"code": -32602, "message": "timeout must be a positive integer"}
+    )
+    assert isinstance(param, SparkProtocolError)
+    assert param.status == "protocol_error"
+
+    # Neighbouring control: an ordinary protocol error keeps the default.
+    ordinary = _rpc_error("thread/start", {"code": -403, "message": "cwd is not a directory"})
+    assert isinstance(ordinary, SparkProtocolError)
+    assert ordinary.status == "protocol_error"
+
+    # A turn that ends ``interrupted`` is not a deadline either — that status
+    # is raised by ``invoke``, and the app-server's turn vocabulary carries no
+    # timeout member at all.
+    assert SparkProtocolError("codex turn ended interrupted").status == "protocol_error"
+
+    # Refusal outranks deadline: terminal, with a named remedy.
+    both = _rpc_error(
+        "turn/start", {"code": 429, "message": "rate limit reached; request timed out"}
+    )
+    assert isinstance(both, SparkUnavailableError)
+    assert both.kind == "unavailable"
+
+
+def test_server_reported_deadline_survives_the_wire(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end: ``turn/start`` reports the deadline, nothing else expires.
+
+    The daemon's own queue wait and the client's socket timeout both stay
+    unspent here — the only timeout signal in the call is the one the server
+    sent — so ``error="timeout"`` on the wire and ``status="timeout"`` in
+    telemetry can only have come from the raiser's verdict.
+    """
+    error = json.dumps({"code": -32000, "message": "upstream request timed out after 60s"})
+    proc, _ = _start_daemon(tmp_path, monkeypatch, extra_env={"AFFORD_FAKE_TURN_ERROR": error})
+    try:
+        with pytest.raises(SparkProtocolError) as caught:
+            run_spark("q", verb="locate", workdir=tmp_path, schema=LocateResult, timeout_s=10)
+        assert not isinstance(caught.value, SparkUnavailableError)
+        assert caught.value.status == "timeout"
+        rec = _read_telemetry()[-1]
+        assert rec["status"] == "timeout"
+        assert rec["transport"] == "daemon"
+        assert proc.poll() is None
+    finally:
+        _stop(proc)
+
+
+def test_server_reported_protocol_error_is_not_a_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control arm for the test above, over the same wire."""
+    error = json.dumps({"code": -32000, "message": "cwd is not a directory"})
+    proc, _ = _start_daemon(tmp_path, monkeypatch, extra_env={"AFFORD_FAKE_TURN_ERROR": error})
+    try:
+        with pytest.raises(SparkProtocolError) as caught:
+            run_spark("q", verb="locate", workdir=tmp_path, schema=LocateResult, timeout_s=10)
+        assert caught.value.status == "protocol_error"
+        assert "cwd is not a directory" in str(caught.value)
+        rec = _read_telemetry()[-1]
+        assert rec["status"] == "protocol_error"
+    finally:
+        _stop(proc)
+
+
 def test_appserver_protocol_pin_refuses_mismatch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

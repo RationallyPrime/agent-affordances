@@ -21,6 +21,9 @@ Env knobs (all optional):
   verbatim by ``account/read`` once ``AFFORD_FAKE_AUTH_AFTER`` successes are
   spent, so the wrapper's classification of a non-refusal auth-hop error can
   be witnessed without failing the daemon's boot check
+* ``AFFORD_FAKE_TURN_ERROR`` — JSON ``{"code": …, "message": …}`` returned
+  verbatim by ``turn/start``, so an error the server *reports* can be told
+  apart from a deadline the client's own queue wait hits
 """
 
 from __future__ import annotations
@@ -59,6 +62,8 @@ def main() -> None:
     drop_sleep_s = float(os.environ.get("AFFORD_FAKE_DROP_SLEEP", "0"))
     raw_auth_error = os.environ.get("AFFORD_FAKE_AUTH_ERROR")
     auth_error = json.loads(raw_auth_error) if raw_auth_error else None
+    raw_turn_error = os.environ.get("AFFORD_FAKE_TURN_ERROR")
+    turn_error = json.loads(raw_turn_error) if raw_turn_error else None
     threads: dict[str, list[str]] = {}
     pending_turns: dict[str, threading.Event] = {}
     stripped_ids: set[str] = set()
@@ -130,6 +135,9 @@ def main() -> None:
             _send({"method": "thread/started", "params": {"thread": {"id": thread_id}}})
             continue
         if method == "turn/start":
+            if turn_error is not None:
+                _send({"id": ident, "error": turn_error})
+                continue
             if usage_limit:
                 _send(
                     {
