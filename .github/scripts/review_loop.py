@@ -62,10 +62,15 @@ import urllib.request
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, NamedTuple
 
 CODEX_LOGIN = "chatgpt-codex-connector[bot]"
 WORKFLOW_LOGIN = "github-actions[bot]"
+# The Codex-connected account the scheduled path and every seat's ``gh``
+# authenticate as (KRA-1032).  The workflow sets ``CODEX_REVIEW_AUTHOR`` to
+# this same login; the default is here so a seat running the helper from a
+# shell (readiness limb 2) reads the belt's trust rule, not a narrower one.
+CODEX_REVIEW_AUTHOR = "RationallyPrime"
 MAX_REVIEW_ROUNDS = 7
 REVIEW_STALL_SECONDS = 20 * 60
 # Deliberately separate from REVIEW_STALL_SECONDS: that window bounds how long a
@@ -105,10 +110,6 @@ RETROSPECTIVE_CHASE_ATTEMPTS = 2
 # work: it is sized for the schedule, which GitHub throttles to a fire every
 # ten hours or so under load, and which must still find the row when it runs.
 RETROSPECTIVE_CLOSED_SWEEP_HOURS = 48
-EXHAUSTED_MARKER_PREFIX = "<!-- weave-review-loop:exhausted:"
-NUDGE_MARKER_PREFIX = "<!-- weave-review-loop:nudge:"
-REDELIVERY_MARKER_PREFIX = "<!-- weave-review-loop:redelivered:"
-HEAD_BASE_MARKER_PREFIX = "<!-- weave-review-loop:head-base:"
 # Machine markers are versioned (KRA-1122 class): writers emit the ``v2:``
 # forms below, and every reader also accepts the unversioned legacy form so
 # markers already standing on open PRs keep suppressing what they suppressed.
@@ -116,6 +117,371 @@ HEAD_BASE_MARKER_PREFIX = "<!-- weave-review-loop:head-base:"
 # in force when it was written; a reader whose current policy differs must
 # not treat it as terminal — the stale-three-round-marker incident.
 MARKER_SCHEMA_VERSION = "v2"
+# The retrospective receipt's version is ``v1`` rather than
+# MARKER_SCHEMA_VERSION because verdict files already carry that form
+# (sokrates#1113); see RETROSPECTIVE_MARKER_RE for the reader's leniency.
+RETROSPECTIVE_MARKER_VERSION = "v1"
+MARKER_NAMESPACE = "<!-- weave-review-loop:"
+# Who writes a marker family.  ``seat-typed``: a seat writes it by hand from a
+# doctrine template, so the template the doctrine shows, the writer here and
+# the reader here must agree.  ``helper-minted``: only the helper writes it;
+# doctrine may describe it but never asks a seat to type it.
+SEAT_TYPED = "seat-typed"
+HELPER_MINTED = "helper-minted"
+
+
+class MarkerTemplate(NamedTuple):
+    """One canonical marker string and the writer that emits it.
+
+    ``template`` is the string with ``<slot>`` placeholders for what the writer
+    takes as arguments; ``writer_args`` are those placeholders in the writer's
+    positional order, so ``writer(*writer_args) == template`` is checkable.
+    """
+
+    template: str
+    writer: str
+    writer_args: tuple[str, ...]
+
+
+# How a declared reader is applied, so a test can drive the PRODUCTION reader
+# — the function the loop itself calls on the path that consumes the marker —
+# rather than an adapter written for the test.  Every family declares at
+# least one, and a family whose reader parses fields declares the parser, so
+# a swapped or dropped field fails the round trip, not only a missed prefix.
+#   ``head-forms``      ``reader(*args, head)`` returns the forms (a pattern,
+#                       a literal, or a sequence) ``marker_comment_exists``
+#                       consumes.
+#   ``head-predicate``  ``reader(*args, comments, head)`` is the verdict.
+#   ``slot-forms``      ``reader(*args, head, *slots)`` returns the forms
+#                       ``marker_comment_exists`` consumes, ``slots`` being
+#                       the instantiated values of ``fields`` (a chase's
+#                       attempt, whose timestamp restarts the window).
+#   ``slot-predicate``  ``reader(comments, head, *slots)`` is the verdict,
+#                       ``slots`` being the instantiated values of ``fields``
+#                       (the redelivery marker's verdict time).
+#   ``head-map``        ``reader(*args, comments)`` maps head → the parsed
+#                       value of ``fields[0]`` (a head-base pin's ref or SHA).
+#   ``head-value``      ``reader(*args, comments, head)`` returns the parsed
+#                       value of ``fields[0]`` (a chase's attempt), or the
+#                       literal ``expect`` when the marker carries no slot
+#                       (an exhaustion gate reads ``terminal``).
+#   ``value``           ``reader(*args, comments)`` returns one PR-level
+#                       value — the policy the exhaustion gate recorded —
+#                       compared to the literal ``expect``; nothing to
+#                       return without the marker.
+#   ``verdict-parser``  ``reader(*args, comments)`` yields ``(comment,
+#                       parsed)`` pairs; ``parsed["head"]`` is the exact head
+#                       and the parsed fields are checked by name.
+READER_VALUE = "value"
+READER_HEAD_FORMS = "head-forms"
+READER_SLOT_FORMS = "slot-forms"
+READER_HEAD_PREDICATE = "head-predicate"
+READER_SLOT_PREDICATE = "slot-predicate"
+READER_HEAD_MAP = "head-map"
+READER_HEAD_VALUE = "head-value"
+# ``reader(*args, comments, head)`` → the trusted comment's timestamp, or None.
+READER_HEAD_TIME = "head-time"
+# ``reader(*args, comments, head, *slots)`` → the trusted comment's timestamp, or None.
+READER_SLOT_TIME = "slot-time"
+READER_VERDICT_PARSER = "verdict-parser"
+# The placeholders doctrine may use for the head slot; every other placeholder
+# keeps its own identity, so a template that swaps two roles is not the
+# canonical one.  A real 40-hex head in an example is the head slot too.
+MARKER_HEAD_ALIASES = ("<head>", "<40-hex-head>", "<sha>")
+
+
+class MarkerReader(NamedTuple):
+    """One production reader of a family and how the round trip applies it.
+
+    ``name`` is the function the loop calls on the path that consumes the
+    marker — never a wrapper added for the inventory; ``kind`` is one of the
+    ``READER_*`` constants; ``args`` are positional arguments before the
+    comments/head (the disposition kind for the shared head-disposition
+    reader); ``fields`` names the template slots the reader parses, in the
+    order the kind expects them; ``expect`` is the literal a slotless
+    ``head-value`` reader must return.
+    """
+
+    name: str
+    kind: str
+    args: tuple[str, ...] = ()
+    fields: tuple[str, ...] = ()
+    expect: str | None = None
+
+
+class MarkerFamily(NamedTuple):
+    """One declared marker family: classification, templates, and its readers."""
+
+    family: str
+    classification: str
+    templates: tuple[MarkerTemplate, ...]
+    readers: tuple[MarkerReader, ...]
+
+
+# THE marker inventory (KRA-1363).  Every family the helper writes or reads is
+# declared here exactly once, with its classification, the canonical string a
+# writer emits (and, for a seat-typed family, the string a seat types) and the
+# production reader that accepts it.  The ``*_MARKER_PREFIX`` constants below
+# are derived from it, so a family cannot exist in code without a
+# classification, and the doctrine tests read this table rather than
+# discovering templates in prose: writer, reader and prose are each checked
+# against the one declaration, never against each other's spelling.
+MARKER_INVENTORY: tuple[MarkerFamily, ...] = (
+    MarkerFamily(
+        "exhausted",
+        HELPER_MINTED,
+        (
+            MarkerTemplate(
+                f"{MARKER_NAMESPACE}exhausted:{MARKER_SCHEMA_VERSION}:<head>"
+                f":max-rounds={MAX_REVIEW_ROUNDS} -->",
+                "exhaustion_marker",
+                ("<head>",),
+            ),
+        ),
+        (
+            MarkerReader(
+                "exhaustion_marker_state", READER_HEAD_VALUE, expect="terminal"
+            ),
+            MarkerReader(
+                "exhaustion_marker_bound", READER_VALUE, expect=str(MAX_REVIEW_ROUNDS)
+            ),
+            MarkerReader("exhaustion_gate_recorded", READER_VALUE, expect="True"),
+        ),
+    ),
+    MarkerFamily(
+        "nudge",
+        HELPER_MINTED,
+        (
+            MarkerTemplate(
+                f"{MARKER_NAMESPACE}nudge:{MARKER_SCHEMA_VERSION}:<head> -->",
+                "nudge_marker",
+                ("<head>",),
+            ),
+            # The form a workflow run actually posts: stamped with its numeric
+            # run id.  A literal id, because the writer drops anything that is
+            # not digits — a placeholder would test the fallback, not the stamp.
+            MarkerTemplate(
+                f"{MARKER_NAMESPACE}nudge:{MARKER_SCHEMA_VERSION}:<head>:run-12345 -->",
+                "nudge_marker",
+                ("<head>", "12345"),
+            ),
+        ),
+        (
+            MarkerReader("nudge_marker_pattern", READER_HEAD_FORMS),
+            MarkerReader("bare_nudge_covers_head", READER_HEAD_PREDICATE),
+        ),
+    ),
+    MarkerFamily(
+        "redelivered",
+        HELPER_MINTED,
+        (
+            MarkerTemplate(
+                f"{MARKER_NAMESPACE}redelivered:{MARKER_SCHEMA_VERSION}"
+                ":<head>:<verdict-at> -->",
+                "redelivery_marker",
+                ("<head>", "<verdict-at>"),
+            ),
+        ),
+        (
+            MarkerReader(
+                "redelivery_recorded", READER_SLOT_PREDICATE, fields=("<verdict-at>",)
+            ),
+        ),
+    ),
+    MarkerFamily(
+        "head-base",
+        HELPER_MINTED,
+        (
+            MarkerTemplate(
+                f"{MARKER_NAMESPACE}head-base:{MARKER_SCHEMA_VERSION}"
+                ":<head>:<base-ref>:<base-sha> -->",
+                "head_base_marker",
+                ("<head>", "<base-ref>", "<base-sha>"),
+            ),
+        ),
+        (
+            MarkerReader("head_base_marker_for", READER_HEAD_FORMS),
+            MarkerReader("head_base_recorded", READER_HEAD_PREDICATE),
+            MarkerReader(
+                "recorded_head_bases", READER_HEAD_MAP, fields=("<base-sha>",)
+            ),
+            MarkerReader(
+                "recorded_head_base_refs", READER_HEAD_MAP, fields=("<base-ref>",)
+            ),
+        ),
+    ),
+    MarkerFamily(
+        "product-gate",
+        SEAT_TYPED,
+        (
+            MarkerTemplate(
+                f"{MARKER_NAMESPACE}product-gate:{MARKER_SCHEMA_VERSION}:<head> -->",
+                "product_gate_marker",
+                ("<head>",),
+            ),
+        ),
+        (
+            MarkerReader(
+                "head_disposition_pattern", READER_HEAD_FORMS, ("product-gate",)
+            ),
+            MarkerReader("head_disposed_at", READER_HEAD_TIME, ("product-gate",)),
+        ),
+    ),
+    MarkerFamily(
+        "noise",
+        SEAT_TYPED,
+        (
+            MarkerTemplate(
+                f"{MARKER_NAMESPACE}noise:{MARKER_SCHEMA_VERSION}:<head> -->",
+                "noise_marker",
+                ("<head>",),
+            ),
+        ),
+        (
+            MarkerReader("head_disposition_pattern", READER_HEAD_FORMS, ("noise",)),
+            MarkerReader("head_disposed_at", READER_HEAD_TIME, ("noise",)),
+        ),
+    ),
+    MarkerFamily(
+        "hold",
+        SEAT_TYPED,
+        (
+            MarkerTemplate(
+                f"{MARKER_NAMESPACE}hold:{MARKER_SCHEMA_VERSION}:<head> -->",
+                "hold_marker",
+                ("<head>",),
+            ),
+        ),
+        (
+            MarkerReader("head_is_held", READER_HEAD_PREDICATE),
+            MarkerReader("head_disposed_at", READER_HEAD_TIME, ("hold",)),
+        ),
+    ),
+    MarkerFamily(
+        "retrospective",
+        SEAT_TYPED,
+        (
+            MarkerTemplate(
+                f"{MARKER_NAMESPACE}retrospective:{RETROSPECTIVE_MARKER_VERSION}"
+                ":<head> -->",
+                "retrospective_marker",
+                ("<head>",),
+            ),
+        ),
+        (MarkerReader("retrospective_delivered", READER_HEAD_PREDICATE),),
+    ),
+    MarkerFamily(
+        "retrospective-wake",
+        HELPER_MINTED,
+        (
+            MarkerTemplate(
+                f"{MARKER_NAMESPACE}retrospective-wake:{MARKER_SCHEMA_VERSION}"
+                ":<head> -->",
+                "retrospective_wake_marker",
+                ("<head>",),
+            ),
+        ),
+        (
+            MarkerReader("retrospective_wake_marker_pattern", READER_HEAD_FORMS),
+            MarkerReader("retrospective_requested", READER_HEAD_PREDICATE),
+            MarkerReader("retrospective_requested_at", READER_HEAD_TIME),
+        ),
+    ),
+    MarkerFamily(
+        "retrospective-chase",
+        HELPER_MINTED,
+        (
+            MarkerTemplate(
+                f"{MARKER_NAMESPACE}retrospective-chase:{MARKER_SCHEMA_VERSION}"
+                ":<head>:attempt=<attempt> -->",
+                "retrospective_chase_marker",
+                ("<head>", "<attempt>"),
+            ),
+        ),
+        (
+            MarkerReader(
+                "retrospective_chase_attempts", READER_HEAD_VALUE, fields=("<attempt>",)
+            ),
+            MarkerReader(
+                "retrospective_chase_marker_pattern",
+                READER_SLOT_FORMS,
+                fields=("<attempt>",),
+            ),
+            MarkerReader(
+                "retrospective_chased_at", READER_SLOT_TIME, fields=("<attempt>",)
+            ),
+        ),
+    ),
+    MarkerFamily(
+        "substitute-summon",
+        HELPER_MINTED,
+        (
+            MarkerTemplate(
+                f"{MARKER_NAMESPACE}substitute-summon:<head> -->",
+                "substitute_summon_marker",
+                ("<head>",),
+            ),
+        ),
+        (MarkerReader("substitute_summon_covers_head", READER_HEAD_PREDICATE),),
+    ),
+    MarkerFamily(
+        "substitute-verdict",
+        SEAT_TYPED,
+        (
+            MarkerTemplate(
+                f"{MARKER_NAMESPACE}substitute-verdict:<head>:<actor>:clean -->",
+                "substitute_verdict_clean_marker",
+                ("<head>", "<actor>"),
+            ),
+            MarkerTemplate(
+                f"{MARKER_NAMESPACE}substitute-verdict:<head>:<actor>"
+                ":findings:<p1>:<p2>:<p3> -->",
+                "substitute_verdict_findings_marker",
+                ("<head>", "<actor>", "<p1>", "<p2>", "<p3>"),
+            ),
+        ),
+        (
+            MarkerReader(
+                "substitute_verdicts",
+                READER_VERDICT_PARSER,
+                fields=("<head>", "<actor>", "<p1>", "<p2>", "<p3>"),
+            ),
+            MarkerReader(
+                "substitute_verdict_marker_state", READER_VALUE, expect="present"
+            ),
+        ),
+    ),
+)
+
+
+def index_marker_families(
+    inventory: Sequence[MarkerFamily],
+) -> dict[str, MarkerFamily]:
+    """Family → declaration; a family declared twice is refused, not last-wins."""
+    families: dict[str, MarkerFamily] = {}
+    for entry in inventory:
+        if entry.family in families:
+            raise ValueError(
+                f"marker family {entry.family!r} is declared twice in the inventory"
+            )
+        families[entry.family] = entry
+    return families
+
+
+MARKER_FAMILIES: dict[str, MarkerFamily] = index_marker_families(MARKER_INVENTORY)
+
+
+def marker_prefix(family: str) -> str:
+    """The comment-marker prefix of a DECLARED family; an undeclared one is an error."""
+    if family not in MARKER_FAMILIES:
+        raise KeyError(f"marker family {family!r} is not declared in MARKER_INVENTORY")
+    return f"{MARKER_NAMESPACE}{family}:"
+
+
+EXHAUSTED_MARKER_PREFIX = marker_prefix("exhausted")
+NUDGE_MARKER_PREFIX = marker_prefix("nudge")
+REDELIVERY_MARKER_PREFIX = marker_prefix("redelivered")
+HEAD_BASE_MARKER_PREFIX = marker_prefix("head-base")
 HEAD_BASE_MARKER_RE = re.compile(
     r"<!-- weave-review-loop:head-base:([^:\s]+):([^:\s]+) -->"
 )
@@ -126,9 +492,9 @@ EXHAUSTED_MARKER_RE = re.compile(
     r"<!-- weave-review-loop:exhausted:"
     r"(?:v2:([^:\s]+):max-rounds=(\d+)|([^:\s]+)) -->"
 )
-PRODUCT_GATE_MARKER_PREFIX = "<!-- weave-review-loop:product-gate:"
-NOISE_MARKER_PREFIX = "<!-- weave-review-loop:noise:"
-HOLD_MARKER_PREFIX = "<!-- weave-review-loop:hold:"
+PRODUCT_GATE_MARKER_PREFIX = marker_prefix("product-gate")
+NOISE_MARKER_PREFIX = marker_prefix("noise")
+HOLD_MARKER_PREFIX = marker_prefix("hold")
 # The head-disposition family: a trusted, once-per-head record that a seat
 # stopped deliberately and left HEAD unchanged.  All three have the same
 # shape, the same trust rule and the same meaning to the scheduled leg — the
@@ -152,8 +518,7 @@ HEAD_DISPOSITION_PREFIXES: dict[str, str] = {
 # silence it is not guilty of.  Unlike every other marker here it is trusted
 # from ANY author: the retrospective is testimony a seat posts under its own
 # credential, and there is no configured retrospective identity to check.
-RETROSPECTIVE_MARKER_PREFIX = "<!-- weave-review-loop:retrospective:"
-RETROSPECTIVE_MARKER_VERSION = "v1"
+RETROSPECTIVE_MARKER_PREFIX = marker_prefix("retrospective")
 RETROSPECTIVE_MARKER_RE = re.compile(
     r"<!-- weave-review-loop:retrospective:(?:v\d+:)?([0-9a-fA-F]{7,40}) -->"
 )
@@ -161,10 +526,10 @@ RETROSPECTIVE_MARKER_RE = re.compile(
 # head.  Without it the chase leg cannot tell an undelivered verdict from one
 # nobody ever requested — the scheduled exhaustion path posts a gate and wakes
 # nobody, and chasing that head would invent an obligation.
-RETROSPECTIVE_WAKE_MARKER_PREFIX = "<!-- weave-review-loop:retrospective-wake:"
+RETROSPECTIVE_WAKE_MARKER_PREFIX = marker_prefix("retrospective-wake")
 # ``retrospective-chase:`` is the durable attempt counter.  Comments are the
 # loop's only durable state, so the attempt bound has to live in one.
-RETROSPECTIVE_CHASE_MARKER_PREFIX = "<!-- weave-review-loop:retrospective-chase:"
+RETROSPECTIVE_CHASE_MARKER_PREFIX = marker_prefix("retrospective-chase")
 # Every reader in this family accepts ``v<n>:`` rather than the one version its
 # writer currently emits.  The writers below derive their version from
 # MARKER_SCHEMA_VERSION, so a reader pinned to today's value stops recognising
@@ -180,8 +545,8 @@ RETROSPECTIVE_CHASE_MARKER_RE = re.compile(
     r"<!-- weave-review-loop:retrospective-chase:"
     rf"{_RETROSPECTIVE_MARKER_VERSION_RE}([^:\s]+):attempt=(\d+) -->"
 )
-SUBSTITUTE_SUMMON_MARKER_PREFIX = "<!-- weave-review-loop:substitute-summon:"
-SUBSTITUTE_VERDICT_MARKER_PREFIX = "<!-- weave-review-loop:substitute-verdict:"
+SUBSTITUTE_SUMMON_MARKER_PREFIX = marker_prefix("substitute-summon")
+SUBSTITUTE_VERDICT_MARKER_PREFIX = marker_prefix("substitute-verdict")
 # head : actor : clean | findings:<p1>:<p2>:<p3>.  The marker — not the prose
 # around it — is the machine contract: substitute reviewers are seats, their
 # prose formats drift, and parsing prose is the defect class the belt audit
@@ -946,6 +1311,7 @@ def publishable_at_head(
     repository: str,
     *,
     decision: str,
+    require_open: bool = True,
 ) -> bool:
     """Decide liveness at the publication itself, not at the route's first read.
 
@@ -958,6 +1324,12 @@ def publishable_at_head(
     same argument that put liveness in the chokepoint rather than in per-path
     guards (KRA-1226) — applied to *where* the chokepoint is called from.
 
+    ``require_open`` forwards the chokepoint's one documented waiver and
+    defaults the same way, so a publication that waives closure at its route's
+    first read can be re-decided here rather than falling back to a hand-rolled
+    refresh — the head half of the decision is the half every publication
+    needs, and it is the half a waiving caller would otherwise lose (KRA-1374).
+
     This narrows the window to one HTTP round trip; it does not close it.  A
     merge landing between this read and the post still publishes, and no
     check-then-act over a resource this process does not hold can do better.
@@ -969,6 +1341,7 @@ def publishable_at_head(
             head_sha,
             repository,
             action=f"{decision} publication",
+            require_open=require_open,
             on_ignored=lambda reason: belt_ignored(
                 reason,
                 pull_request=pr_number,
@@ -1447,7 +1820,13 @@ def loop_exempt_pr(github: GitHubApi, pr_number: int, *, closed_at: str = "") ->
     Renames contribute both names: a file moved out of (or into) a corpus
     makes the PR mixed, and a mixed PR rides the review loop like any other.
     An empty file list is not an exempt PR — exemption is never inferred from
-    absence.
+    absence, and neither is it inferred from an incomplete list: the files
+    endpoint stops at 3,000 entries and ``paginate`` reads that short final
+    page as the whole diff, so a >3,000-file PR whose first 3,000 paths all
+    sit under a corpus root would otherwise skip summon, burn, exhaustion and
+    the belt's terminal telemetry with nothing else gating it.  The listed
+    count is therefore checked against the PR object's ``changed_files``
+    before exemption is granted, and a short list fails closed.
 
     ``closed_at`` dates the question: a closed PR is judged under the roots in
     force when it closed, so a corpus declared after the closure does not
@@ -1461,12 +1840,46 @@ def loop_exempt_pr(github: GitHubApi, pr_number: int, *, closed_at: str = "") ->
         if since is not None and parse_github_time(closed_at) < since:
             prefixes = SKILL_PATH_PREFIXES
     paths: list[str] = []
+    listed = 0
     for entry in github.paginate(f"pulls/{pr_number}/files"):
+        listed += 1
         for key in ("filename", "previous_filename"):
             value = entry.get(key)
             if value:
                 paths.append(str(value))
-    return bool(paths) and all(path.startswith(prefixes) for path in paths)
+    if not paths or not all(path.startswith(prefixes) for path in paths):
+        return False
+    return pr_files_are_complete(github, pr_number, listed)
+
+
+def pr_files_are_complete(github: GitHubApi, pr_number: int, listed: int) -> bool:
+    """True when ``listed`` file entries are the PR's whole diff.
+
+    Asked only where a short list would grant something — exemption is the
+    load-bearing side, so it is the side that must be proven — which is also
+    why the extra read is not paid on the PRs that ride the loop anyway.
+    One entry is one file (a rename is a single entry carrying two names),
+    so the count compares against ``changed_files`` on the PR object, which
+    is not capped the way the files listing is.  A PR object without an
+    integer ``changed_files`` is a broken read, not a complete list: it
+    raises rather than answering, because both answers would be a guess.
+    """
+    detail = github.get(f"pulls/{pr_number}")
+    if not isinstance(detail, Mapping):
+        raise TypeError(f"GET pulls/{pr_number} did not return an object")
+    changed = detail.get("changed_files")
+    if not isinstance(changed, int) or isinstance(changed, bool):
+        raise TypeError(
+            f"pulls/{pr_number} carries no integer changed_files "
+            f"({changed!r}); the file list cannot be proven complete"
+        )
+    if listed < changed:
+        print(
+            f"pulls/{pr_number}/files listed {listed} of {changed} changed "
+            "files — the truncated list cannot prove loop exemption"
+        )
+        return False
+    return True
 
 
 def is_quota_refusal_body(body: str) -> bool:
@@ -1885,6 +2298,36 @@ def clean_comment_head(
     return resolved
 
 
+# One entry of the result stream: ``(time, order, head, kind, source, identity)``.
+# ``order`` is the event's index within ONE fetch and breaks same-second ties
+# deterministically; ``identity`` is GitHub's own id for the record and is the
+# only field that survives a second fetch, which is what a publication-time
+# re-read has to compare (KRA-1368).
+ResultEvent = tuple[datetime, int, str, str, str, str]
+
+
+def result_event_identity(channel: str, record: Mapping[str, Any]) -> str:
+    """Name one result event by the record GitHub published it as.
+
+    ``review:<id>`` or ``comment:<id>``.  Time cannot name an event: GitHub's
+    ``submitted_at``/``created_at`` are whole seconds, so a second verdict of
+    the same kind landing in the same second is indistinguishable from the
+    first by timestamp alone.  ``order`` cannot either — it is the index within
+    one fetch, and appending a review shifts every comment event's index, so
+    two fetches of the same PR disagree about it the moment anything lands.
+
+    A record whose id is missing or unusable yields ``""``, which
+    ``result_state_unchanged`` refuses to match against anything, including
+    another ``""``.  An event the loop cannot name must never be able to
+    certify that the verdict state has not moved.
+    """
+    raw = record.get("id")
+    if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+        return ""
+    text = str(raw).strip()
+    return f"{channel}:{text}" if text else ""
+
+
 def codex_result_events(
     github: GitHubApi,
     reviews: Sequence[Mapping[str, Any]],
@@ -1893,8 +2336,8 @@ def codex_result_events(
     *,
     pr_number: int,
     review_comments: Sequence[Mapping[str, Any]] | None = None,
-) -> list[tuple[datetime, int, str, str, str]]:
-    """Return time-ordered results as ``(time, order, head, kind, source)``.
+) -> list[ResultEvent]:
+    """Return time-ordered results as ``(time, order, head, kind, source, identity)``.
 
     ``kind`` is ``clean`` for a verdict that binds this head and ``findings``
     otherwise.  Both channels are retained — including a later CLEAN on a head
@@ -1943,7 +2386,7 @@ def codex_result_events(
     a later findings head before an earlier CLEAN. Merge by timestamp before
     treating the list as round order.
     """
-    events: list[tuple[datetime, int, str, str, str]] = []
+    events: list[ResultEvent] = []
     inline_comments = review_comments
 
     def review_kind(review: Mapping[str, Any], body: str, head_sha: str) -> str:
@@ -1977,6 +2420,7 @@ def codex_result_events(
                 head_sha,
                 review_kind(review, body, head_sha),
                 "codex",
+                result_event_identity("review", review),
             )
         )
     for comment in comments:
@@ -1992,9 +2436,10 @@ def codex_result_events(
                 result_head,
                 "clean",
                 "codex",
+                result_event_identity("comment", comment),
             )
         )
-    for _, verdict in substitute_verdicts(comments):
+    for comment, verdict in substitute_verdicts(comments):
         events.append(
             (
                 verdict["at"],
@@ -2002,10 +2447,34 @@ def codex_result_events(
                 verdict["head"],
                 verdict["kind"],
                 "substitute",
+                result_event_identity("comment", comment),
             )
         )
     events.sort()
     return events
+
+
+def substitute_verdict_marker_state(comments: Sequence[Mapping[str, Any]]) -> str:
+    """``present``, ``malformed`` or ``absent``: does any comment carry a
+    substitute verdict marker, trust aside?
+
+    Trust is not read here: a forged marker is ``present`` and is refused,
+    loudly, by ``route_substitute_verdict``.  ``malformed`` is a body that
+    names the family without a marker that parses — the shape a substitute
+    who mistyped the grammar posts.  A summon comment quotes the grammar
+    and is excluded by its own marker, so it is ``absent``.
+    """
+    state = "absent"
+    for comment in comments:
+        body = str(comment.get("body") or "")
+        if SUBSTITUTE_VERDICT_MARKER_RE.search(body):
+            return "present"
+        if (
+            SUBSTITUTE_VERDICT_MARKER_PREFIX.removeprefix("<!-- ") in body
+            and SUBSTITUTE_SUMMON_MARKER_PREFIX not in body
+        ):
+            state = "malformed"
+    return state
 
 
 def substitute_verdicts(
@@ -2050,6 +2519,87 @@ def substitute_verdicts(
     return verdicts
 
 
+def substitute_verdict_line(parsed: Mapping[str, Any]) -> str:
+    """``<actor> clean`` or ``<actor> findings:<p1>:<p2>:<p3>`` — the line a
+    merging seat reads (readiness limb 2)."""
+    if parsed["kind"] == "clean":
+        return f"{parsed['actor']} clean"
+    counts = parsed["counts"]
+    return f"{parsed['actor']} findings:{counts['p1']}:{counts['p2']}:{counts['p3']}"
+
+
+def substitute_verdict_report(
+    head_sha: str, comments: Sequence[Mapping[str, Any]]
+) -> str:
+    """The line a merging seat reads for ``head_sha``: the latest accepted
+    verdict, a refusal, or nothing.
+
+    The reader is ``substitute_verdicts`` — the belt's own grammar and trust
+    rule — so this cannot accept a marker the loop refuses: the readiness
+    reference used to re-spell the grammar in jq, and three review rounds each
+    found that copy wider than the helper (no author filter; a loose verdict
+    token).  One reader.
+
+    A trusted comment posted AFTER the last accepted verdict that names the
+    family but does not parse is the shape ``route_comment_event`` fails
+    loudly as malformed: a seat tried to change the verdict and mistyped the
+    marker.  The older verdict does not stand behind it — the answer is the
+    refusal, until the marker is reposted verbatim.
+
+    Reposting IS the remedy, so the malformed comment cannot be the end of the
+    read: the whole list is walked, and an accepted verdict for this head that
+    lands after a malformed attempt supersedes it.  The refusal is the answer
+    only when the LAST trusted marker-shaped comment for this head is the
+    malformed one — otherwise a seat that corrected its marker would keep
+    reading the refusal until it edited or deleted the mistyped comment,
+    which is not what the remedy says.
+    """
+    head = head_sha.lower()
+    trusted = trusted_control_logins()
+    latest: dict[str, Any] | None = None
+    refused: Mapping[str, Any] | None = None
+    for comment in comments:
+        user = comment.get("user")
+        if not isinstance(user, Mapping) or user.get("login") not in trusted:
+            continue
+        accepted = [parsed for _, parsed in substitute_verdicts([comment])]
+        if accepted:
+            if accepted[0]["head"] == head:
+                # The repost the refusal asks for: it replaces both the older
+                # verdict and the malformed attempt standing between them.
+                latest = accepted[0]
+                refused = None
+            continue
+        if (
+            latest is not None
+            and substitute_verdict_marker_state([comment]) == "malformed"
+        ):
+            refused = comment
+    if refused is not None:
+        return (
+            "MALFORMED SUBSTITUTE VERDICT after the last accepted one "
+            f"(comment {refused.get('id', '?')}); the marker must be reposted "
+            "verbatim before this head has a verdict"
+        )
+    return substitute_verdict_line(latest) if latest is not None else ""
+
+
+def report_substitute_verdict(head_sha: str, pages: Any, out: Any) -> None:
+    """Print ``substitute_verdict_report`` for the comment pages on stdin.
+
+    ``pages`` is what ``gh api …/comments --paginate --slurp`` emits (a list
+    of pages) or a flat list of comments.
+    """
+    comments = [
+        comment
+        for page in pages
+        for comment in (page if isinstance(page, list) else [page])
+    ]
+    line = substitute_verdict_report(head_sha, comments)
+    if line:
+        print(line, file=out)
+
+
 def standing_substitute_findings(
     comments: Sequence[Mapping[str, Any]], head_sha: str
 ) -> tuple[Mapping[str, Any], dict[str, Any]] | None:
@@ -2069,20 +2619,20 @@ def standing_substitute_findings(
 
 
 def result_heads_from_events(
-    events: Sequence[tuple[datetime, int, str, str, str]],
+    events: Sequence[ResultEvent],
 ) -> list[str]:
     """Distinct heads in first-seen time order; a later event does not add a round."""
     heads: list[str] = []
-    for _, _, head, _, _ in events:
+    for _, _, head, _, _, _ in events:
         if head not in heads:
             heads.append(head)
     return heads
 
 
 def latest_result_by_head(
-    events: Sequence[tuple[datetime, int, str, str, str]],
+    events: Sequence[ResultEvent],
 ) -> dict[str, dict[str, Any]]:
-    """The result that won each head: its ``kind``, its ``source``, its time.
+    """The result that won each head: its ``kind``, ``source``, time and identity.
 
     Latest-wins across both channels and both producers.  The winner's SOURCE
     is carried out with its kind, because that is what decides where the head's
@@ -2090,15 +2640,22 @@ def latest_result_by_head(
     substitute marker's own verdict comment.  A consumer handed the kind alone
     has to infer the producer from whichever record happens to exist, which
     picks the superseded one whenever both do.
+
+    The winner's IDENTITY travels with it for a different consumer: a
+    publication computed from one read of this map has to prove, immediately
+    before it posts, that a second read still names the same event.  Kind and
+    time cannot carry that proof on their own — GitHub stamps whole seconds, so
+    a newer verdict of the same kind in the same second is invisible to both
+    (KRA-1368).
     """
-    latest: dict[str, tuple[datetime, int, str, str]] = {}
-    for at, order, head, kind, source in events:
+    latest: dict[str, tuple[datetime, int, str, str, str]] = {}
+    for at, order, head, kind, source, identity in events:
         previous = latest.get(head)
         if previous is None or (at, order) >= (previous[0], previous[1]):
-            latest[head] = (at, order, kind, source)
+            latest[head] = (at, order, kind, source, identity)
     return {
-        head: {"kind": kind, "source": source, "at": at}
-        for head, (at, _order, kind, source) in latest.items()
+        head: {"kind": kind, "source": source, "at": at, "identity": identity}
+        for head, (at, _order, kind, source, identity) in latest.items()
     }
 
 
@@ -2380,10 +2937,6 @@ def exhaustion_marker(head_sha: str) -> str:
     )
 
 
-def legacy_exhaustion_marker(head_sha: str) -> str:
-    return f"{EXHAUSTED_MARKER_PREFIX}{head_sha} -->"
-
-
 def exhaustion_marker_state(
     comments: Sequence[Mapping[str, Any]], head_sha: str
 ) -> str:
@@ -2416,6 +2969,16 @@ def exhaustion_marker_state(
                 )
                 return "terminal"
     return state
+
+
+def exhaustion_gate_recorded(comments: Sequence[Mapping[str, Any]]) -> bool:
+    """A trusted gate was posted at some head, under any policy.
+
+    Any version counts, the legacy unversioned form included: the question is
+    whether the PR ever reached the bound, not which bound (that is
+    ``exhaustion_marker_bound``).
+    """
+    return marker_comment_exists(comments, EXHAUSTED_MARKER_PREFIX)
 
 
 def exhaustion_marker_bound(comments: Sequence[Mapping[str, Any]]) -> int | None:
@@ -2487,6 +3050,20 @@ def retrospective_wake_marker_pattern(head_sha: str) -> re.Pattern[str]:
     )
 
 
+def retrospective_requested(
+    comments: Sequence[Mapping[str, Any]], head_sha: str
+) -> bool:
+    """True when a wake receipt for this exact head stands, dated or not."""
+    return marker_comment_exists(comments, retrospective_wake_marker_pattern(head_sha))
+
+
+def retrospective_requested_at(
+    comments: Sequence[Mapping[str, Any]], head_sha: str
+) -> datetime | None:
+    """When the wake receipt for this exact head was posted, if it was and is dated."""
+    return trusted_marker_time(comments, retrospective_wake_marker_pattern(head_sha))
+
+
 def retrospective_wake_receipt_body(head_sha: str, actor: str) -> str:
     """The PR-visible record that testimony was asked for and is now outstanding.
 
@@ -2500,8 +3077,8 @@ def retrospective_wake_receipt_body(head_sha: str, actor: str) -> str:
         f"Review-loop: the exhaustion retrospective for head `{head_sha}` was "
         f"requested from `{actor}` in #hive. The verdict is expected back here "
         "as a PR comment ending with its "
-        f"`{RETROSPECTIVE_MARKER_PREFIX.removeprefix('<!-- ')}"
-        f"{RETROSPECTIVE_MARKER_VERSION}:<head>` marker. It is testimony only: "
+        f"`{retrospective_marker('<head>').removeprefix('<!-- ').removesuffix(' -->')}`"
+        " marker. It is testimony only: "
         "it gates nothing, repairs nothing and merges nothing.\n"
         f"{retrospective_wake_marker(head_sha)}"
     )
@@ -2520,6 +3097,15 @@ def retrospective_chase_marker_pattern(head_sha: str, attempt: int) -> re.Patter
         re.escape(RETROSPECTIVE_CHASE_MARKER_PREFIX)
         + _RETROSPECTIVE_MARKER_VERSION_RE
         + re.escape(f"{head_sha}:attempt={attempt} -->")
+    )
+
+
+def retrospective_chased_at(
+    comments: Sequence[Mapping[str, Any]], head_sha: str, attempt: int
+) -> datetime | None:
+    """When this head's chase of this attempt number was posted, if it was and is dated."""
+    return trusted_marker_time(
+        comments, retrospective_chase_marker_pattern(head_sha, attempt)
     )
 
 
@@ -2630,6 +3216,13 @@ def head_is_held(comments: Sequence[Mapping[str, Any]], head_sha: str) -> bool:
     return marker_comment_exists(comments, head_disposition_pattern("hold", head_sha))
 
 
+def head_disposed_at(
+    kind: str, comments: Sequence[Mapping[str, Any]], head_sha: str
+) -> datetime | None:
+    """When a trusted seat last recorded this disposition for this exact head."""
+    return trusted_marker_time(comments, head_disposition_pattern(kind, head_sha))
+
+
 def current_run_id() -> str:
     """The workflow run posting this comment, when the process is one."""
     return os.environ.get("GITHUB_RUN_ID", "").strip()
@@ -2678,6 +3271,19 @@ def legacy_redelivery_marker(head_sha: str, verdict_at: str) -> str:
     return f"{REDELIVERY_MARKER_PREFIX}{head_sha}:{verdict_at} -->"
 
 
+def redelivery_recorded(
+    comments: Sequence[Mapping[str, Any]], head_sha: str, verdict_at: str
+) -> bool:
+    """True when this verdict on this head was already re-delivered (any vintage)."""
+    return marker_comment_exists(
+        comments,
+        (
+            redelivery_marker(head_sha, verdict_at),
+            legacy_redelivery_marker(head_sha, verdict_at),
+        ),
+    )
+
+
 def head_base_marker(head_sha: str, base_ref: str, base_sha: str) -> str:
     """v2 pins carry the base *ref* too: the closure predicate reads it."""
     return (
@@ -2692,6 +3298,11 @@ def head_base_marker_for(head_sha: str) -> tuple[str, str]:
         f"{HEAD_BASE_MARKER_PREFIX}{MARKER_SCHEMA_VERSION}:{head_sha}:",
         f"{HEAD_BASE_MARKER_PREFIX}{head_sha}:",
     )
+
+
+def head_base_recorded(comments: Sequence[Mapping[str, Any]], head_sha: str) -> bool:
+    """True when the loop has already pinned this exact head's base, any vintage."""
+    return marker_comment_exists(comments, head_base_marker_for(head_sha))
 
 
 def head_base_comment_body(head_sha: str, base_ref: str, base_sha: str) -> str:
@@ -2817,7 +3428,7 @@ def record_reviewed_head_base(
     existing = comments
     if existing is None:
         existing = github.paginate(f"issues/{pr_number}/comments")
-    if marker_comment_exists(existing, head_base_marker_for(head_sha)):
+    if head_base_recorded(existing, head_sha):
         return "existing"
     return ensure_comment_at_head(
         github,
@@ -2982,10 +3593,10 @@ def trusted_control_logins() -> frozenset[str]:
     marker re-posts it, giving one head two nudges or two exhaustion gates. Both
     halves therefore read this one set rather than each naming its own author.
     """
-    logins = [os.environ.get("WORKFLOW_LOGIN", WORKFLOW_LOGIN)]
-    author = os.environ.get("CODEX_REVIEW_AUTHOR")
-    if author:
-        logins.append(author)
+    logins = [
+        os.environ.get("WORKFLOW_LOGIN", WORKFLOW_LOGIN),
+        os.environ.get("CODEX_REVIEW_AUTHOR", CODEX_REVIEW_AUTHOR),
+    ]
     return frozenset(login for login in logins if login)
 
 
@@ -3618,9 +4229,8 @@ def publish_exhaustion_retrospective(
     # window from the latest receipt, so every retry would silently push the
     # window forward and a never-delivered verdict could go unchased forever.
     # The request happened once; the receipt records that once.
-    if marker_comment_exists(
-        github.paginate(f"issues/{pr_number}/comments"),
-        retrospective_wake_marker_pattern(head_sha),
+    if retrospective_requested(
+        github.paginate(f"issues/{pr_number}/comments"), head_sha
     ):
         print(
             f"retrospective request already recorded for {repository}#{pr_number} "
@@ -4784,15 +5394,14 @@ def route_comment_event(event: Mapping[str, Any]) -> None:
     codex_login = os.environ.get("CODEX_LOGIN", CODEX_LOGIN)
     user = comment.get("user")
     author = user.get("login") if isinstance(user, Mapping) else None
-    body = str(comment.get("body") or "")
-    if author != codex_login and SUBSTITUTE_VERDICT_MARKER_RE.search(body):
+    marker_state = substitute_verdict_marker_state([comment])
+    if author != codex_login and marker_state == "present":
         route_substitute_verdict(event)
         return
     if (
         author != codex_login
         and author in trusted_control_logins()
-        and "weave-review-loop:substitute-verdict:" in body
-        and SUBSTITUTE_SUMMON_MARKER_PREFIX not in body
+        and marker_state == "malformed"
     ):
         # A trusted substitute tried to post a verdict and the marker
         # does not parse. Falling through to the clean-comment path
@@ -4954,7 +5563,7 @@ def standing_findings(
 
 def same_head_findings_reviews_since_clean(
     reviews: Sequence[Mapping[str, Any]],
-    result_events: Sequence[tuple[datetime, int, str, str, str]],
+    result_events: Sequence[ResultEvent],
     head_sha: str,
     codex_login: str,
 ) -> list[Mapping[str, Any]]:
@@ -4966,7 +5575,7 @@ def same_head_findings_reviews_since_clean(
     """
     wanted = head_sha.lower()
     last_clean_at: datetime | None = None
-    for at, _order, head, kind, _source in result_events:
+    for at, _order, head, kind, _source, _identity in result_events:
         if kind == "clean" and str(head).lower() == wanted:
             last_clean_at = at
     standing: list[Mapping[str, Any]] = []
@@ -5124,15 +5733,16 @@ def chase_undelivered_retrospective(
     ends the chase.  That is deliberate and it is the same rule the standing
     verdict follows: the moved head starts a fresh cycle, and asking for
     testimony about evidence the PR has left is asking for the wrong verdict.
+    Which is why the head is re-decided at the publication too, and not only at
+    the refresh: a snapshot head and a snapshot comment list go stale by the
+    same push, and re-reading one of them was reading half the race (KRA-1374).
 
     It never gates, repairs, re-reviews, merges, or summons a reviewer
     (KRA-1029's charter); it asks only whether the verdict was delivered.
     """
     if retrospective_delivered(comments, head_sha):
         return 0
-    requested_at = trusted_marker_time(
-        comments, retrospective_wake_marker_pattern(head_sha)
-    )
+    requested_at = retrospective_requested_at(comments, head_sha)
     if requested_at is None:
         # No receipt, or one with no usable timestamp.  Either way there is no
         # window to measure, and an unmeasured window is not an elapsed one.
@@ -5147,9 +5757,7 @@ def chase_undelivered_retrospective(
     # re-wake is what restarts the clock, so measuring both attempts off one
     # anchor would fire them on consecutive scans.
     if spent:
-        last_chase_at = trusted_marker_time(
-            comments, retrospective_chase_marker_pattern(head_sha, spent)
-        )
+        last_chase_at = retrospective_chased_at(comments, head_sha, spent)
         if last_chase_at is None:
             print(
                 f"undated retrospective chase marker on {repository}#{pr_number} "
@@ -5174,26 +5782,34 @@ def chase_undelivered_retrospective(
         is None
     ):
         return 0
+
+    def receipt_still_missing(comments: Sequence[Mapping[str, Any]]) -> bool:
+        if retrospective_delivered(comments, head_sha):
+            print(
+                f"retrospective for {repository}#{pr_number} arrived while the chase "
+                f"was being prepared (head={head_sha}); not chasing"
+            )
+            return False
+        if retrospective_chase_attempts(comments, head_sha) >= attempt:
+            print(
+                f"retrospective chase attempt {attempt} for {repository}#{pr_number} "
+                f"was already recorded (head={head_sha}); not chasing"
+            )
+            return False
+        return True
+
     # ``comments`` was read at the top of the scan, and the seat this leg is
     # about to chase can post the retrospective at any moment inside that pass —
     # including while the head refresh above is in flight.  Acting on the stale
     # list costs a needless wake on attempt 1 and, on attempt 2, publicly states
-    # that testimony was never delivered when it was.  So the decision is
-    # re-taken here, on freshly fetched comments, immediately before the first
-    # act: the accusation is public and irreversible, and the one input that
-    # falsifies it is the cheapest thing in this pass to read again.
+    # that testimony was never delivered when it was.  The cheap re-read here
+    # refuses that before the exemption file list and the publication-head GET;
+    # those two requests reopen the same race, so the receipt is taken again
+    # after them.  Pagination can span many HTTP requests, so a push during
+    # that later call is a SHA the GET already accepted: the head is
+    # re-decided after it, and the pair is what authorizes the acts.
     live = github.paginate(f"issues/{pr_number}/comments")
-    if retrospective_delivered(live, head_sha):
-        print(
-            f"retrospective for {repository}#{pr_number} arrived while the chase "
-            f"was being prepared (head={head_sha}); not chasing"
-        )
-        return 0
-    if retrospective_chase_attempts(live, head_sha) >= attempt:
-        print(
-            f"retrospective chase attempt {attempt} for {repository}#{pr_number} "
-            f"was already recorded (head={head_sha}); not chasing"
-        )
+    if not receipt_still_missing(live):
         return 0
     # Last, and only here: a corpus declared exempt after the request leaves
     # every review-loop path, this chase included.  Asked after every cheap
@@ -5204,6 +5820,48 @@ def chase_undelivered_retrospective(
             f"loop-exempt PR {repository}#{pr_number} - retrospective chase "
             f"withdrawn (head={head_sha})"
         )
+        return 0
+    # The head is the other half of the same race as the comments above: a
+    # push landing after the refresh ends the retrospective obligation by this
+    # function's own contract, and the chase would then wake the seat for a
+    # SHA the PR has left and, on the terminal attempt, state on the PR that
+    # testimony is missing for evidence nobody owes testimony about.  Both
+    # acts below take one head gate because they are one publication — the
+    # marker records the wake, so a second head decision between them could
+    # withhold the record of a wake already sent.
+    if not publishable_at_head(
+        github,
+        pr_number,
+        head_sha,
+        repository,
+        decision="retrospective chase",
+        # The same waiver, for the same reason, as the refresh above: this
+        # leg's subject survives closure, so only head exactness refuses here.
+        require_open=False,
+    ):
+        return 0
+    # The GET above sat between the last comments snapshot and the acts, so a
+    # retrospective arriving while it is in flight would make an unchanged
+    # head pass and the terminal attempt claim testimony was never delivered.
+    # The receipt is taken after that call.  Pagination can span many HTTP
+    # requests, widening the race past the single request
+    # ``publishable_at_head`` documents, so a push during it is a SHA that GET
+    # already accepted.  Re-deciding the head after the pagination binds the
+    # pair: disagreement (a moved head) does not authorize.  A retrospective
+    # that arrives during that last GET is the one-request residual the
+    # chokepoint already names; another receipt read would reopen the push
+    # window this closes.
+    live = github.paginate(f"issues/{pr_number}/comments")
+    if not receipt_still_missing(live):
+        return 0
+    if not publishable_at_head(
+        github,
+        pr_number,
+        head_sha,
+        repository,
+        decision="retrospective chase",
+        require_open=False,
+    ):
         return 0
     if attempt < RETROSPECTIVE_CHASE_ATTEMPTS:
         # Slack first, then the marker: a marker written before a failed wake
@@ -5339,47 +5997,107 @@ def chase_closed_pull_retrospectives(
     return chased, errors
 
 
-def snapshotted_verdict_is_still_latest(
+def result_state_unchanged(
+    snapshot: Mapping[str, Any] | None, live: Mapping[str, Any] | None
+) -> bool:
+    """Do two reads of one head's latest result describe the same event?
+
+    Both sides are a ``latest_result_by_head`` entry, or ``None`` for a head
+    that carries no result at all — which is precisely the state a nudge, a
+    substitute summon and an exhaustion gate are computed from, so ``None`` on
+    both sides is a match rather than an unknown.
+
+    Every field must agree, and an event with no identity agrees with nothing,
+    including another identity-less event: a record the loop cannot name cannot
+    testify that the verdict state has not moved.  Comparing time alone is what
+    made a same-second re-verdict invisible (KRA-1368); identity alone would
+    miss an edited record, so both are checked, with the kind.
+    """
+    if snapshot is None or live is None:
+        return snapshot is None and live is None
+    identity = str(snapshot.get("identity") or "")
+    if not identity or identity != str(live.get("identity") or ""):
+        return False
+    return snapshot.get("at") == live.get("at") and snapshot.get("kind") == live.get(
+        "kind"
+    )
+
+
+def describe_result_state(state: Mapping[str, Any] | None) -> str:
+    """One phrase naming a head's verdict state, for a refusal line."""
+    if state is None:
+        return "no verdict"
+    at = state.get("at")
+    stamp = (
+        at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if isinstance(at, datetime)
+        else "undated"
+    )
+    return f"{state.get('kind') or 'unknown'} at {stamp} ({state.get('identity') or 'unnamed'})"
+
+
+def live_result_at_head(
     github: GitHubApi,
     *,
     pr_number: int,
     head_sha: str,
     codex_login: str,
-    verdict_at: datetime,
-    latest_kind: str,
-) -> bool:
-    """Re-read the standing verdict at the publication itself.
+) -> dict[str, Any] | None:
+    """Re-read this head's latest result event straight from GitHub."""
+    return latest_result_by_head(
+        codex_result_events(
+            github,
+            github.paginate(f"pulls/{pr_number}/reviews"),
+            github.paginate(f"issues/{pr_number}/comments"),
+            codex_login,
+            pr_number=pr_number,
+        )
+    ).get(head_sha)
 
-    ``redeliver_standing_wake`` is handed reviews and comments snapshotted at
-    the start of the scheduled scan.  Under the (family, subject) concurrency
-    key, that scan shares no group with ``verdict-<pr>``, so a new review or
-    clean comment can land and be published by the event route while this
-    snapshot is still in hand.  ``publishable_at_head`` only re-checks PR and
-    head liveness; posting the snapshot after that live verdict is how an old
-    CLEAN wake reaches the author after a findings wake and incorrectly
-    invites a merge.  Re-fetch here and refuse unless the live latest is
-    still the one we snapshotted.
+
+def verdict_state_held(
+    github: GitHubApi,
+    *,
+    pr_number: int,
+    head_sha: str,
+    codex_login: str,
+    snapshot: Mapping[str, Any] | None,
+    repository: str,
+    action: str,
+) -> bool:
+    """Re-read the verdict at the publication itself; the one sweep-side gate.
+
+    Every scheduled-leg publication — nudge, substitute summon, exhaustion
+    gate, wake redelivery — is computed from reviews and comments snapshotted
+    at the top of ``_scan_open_pull``.  Under the (event family, subject)
+    concurrency key those runs share no group with ``verdict-<pr>``
+    (KRA-1325), which is deliberate: serialising them would let one PR's
+    comments evict another PR's verdict.  Revalidation, not serialisation, is
+    the cure, and it belongs here rather than in each branch, because the
+    branches disagreed about whether they needed it at all.
+
+    ``refresh_pr_at_head`` / ``publishable_at_head`` re-check PR liveness and
+    head equality only.  A head that stands still while a verdict lands on it
+    passes both, so the snapshot was published anyway: a redundant ``@codex
+    review`` or substitute summon spending a round on a head Codex had just
+    answered, an exhaustion gate stopping automation on a head that had just
+    gone CLEAN, or a stale digest re-delivered after the event route delivered
+    the live one.
+
+    Called immediately before the liveness chokepoint at each site, so the two
+    reads that decide a publication are adjacent.
     """
-    live_reviews = list(github.paginate(f"pulls/{pr_number}/reviews"))
-    live_comments = list(github.paginate(f"issues/{pr_number}/comments"))
-    live_at = standing_verdict_time(
-        github, live_reviews, live_comments, head_sha, codex_login
+    live = live_result_at_head(
+        github, pr_number=pr_number, head_sha=head_sha, codex_login=codex_login
     )
-    if live_at != verdict_at:
-        return False
-    live_kind = (
-        latest_result_by_head(
-            codex_result_events(
-                github,
-                live_reviews,
-                live_comments,
-                codex_login,
-                pr_number=pr_number,
-            )
-        ).get(head_sha)
-        or {}
-    ).get("kind")
-    return live_kind == latest_kind
+    if result_state_unchanged(snapshot, live):
+        return True
+    print(
+        f"refused {action} for {repository}#{pr_number} (head={head_sha}): the "
+        f"live verdict is {describe_result_state(live)}, not the "
+        f"{describe_result_state(snapshot)} this publication was computed from"
+    )
+    return False
 
 
 def redeliver_standing_wake(
@@ -5439,9 +6157,7 @@ def redeliver_standing_wake(
     # shows can still arrive at a held head.  Suppressing the *summon* is what
     # stops the round being spent; that is sited in ``_scan_open_pull``.
     for kind in HEAD_DISPOSITION_PREFIXES:
-        disposed_at = trusted_marker_time(
-            comments, head_disposition_pattern(kind, head_sha)
-        )
+        disposed_at = head_disposed_at(kind, comments, head_sha)
         if disposed_at is not None and verdict_at <= disposed_at:
             print(
                 f"{kind} recorded for {repository}#{pr_number} "
@@ -5451,13 +6167,7 @@ def redeliver_standing_wake(
     if (now - verdict_at).total_seconds() < WAKE_REDELIVERY_SECONDS:
         return False
     verdict_stamp = verdict_at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    if marker_comment_exists(
-        comments,
-        (
-            redelivery_marker(head_sha, verdict_stamp),
-            legacy_redelivery_marker(head_sha, verdict_stamp),
-        ),
-    ):
+    if redelivery_recorded(comments, head_sha, verdict_stamp):
         return False
 
     # The later same-head *kind* is authoritative: CLEAN clears the standing
@@ -5467,7 +6177,8 @@ def redeliver_standing_wake(
     result_events = codex_result_events(
         github, reviews, comments, codex_login, pr_number=pr_number
     )
-    latest_kind = (latest_result_by_head(result_events).get(head_sha) or {}).get("kind")
+    snapshot_result = latest_result_by_head(result_events).get(head_sha)
+    latest_kind = (snapshot_result or {}).get("kind")
     latest_review = latest_exact_head_review(reviews, head_sha, codex_login)
     clean_verdict = latest_kind == "clean"
     if clean_verdict:
@@ -5615,19 +6326,15 @@ def redeliver_standing_wake(
     # ``sweep``.  Re-validate the standing verdict immediately before the
     # liveness check, or a stale CLEAN follows a live findings wake and
     # invites a merge.
-    if not snapshotted_verdict_is_still_latest(
+    if not verdict_state_held(
         github,
         pr_number=pr_number,
         head_sha=head_sha,
         codex_login=codex_login,
-        verdict_at=verdict_at,
-        latest_kind=str(latest_kind),
+        snapshot=snapshot_result,
+        repository=repository,
+        action="wake redelivery",
     ):
-        print(
-            f"refused stale redelivery for {repository}#{pr_number}: "
-            f"head {head_sha} no longer carries the snapshotted standing "
-            f"verdict ({verdict_stamp} {latest_kind})"
-        )
         return False
     if not publishable_at_head(
         github, pr_number, head_sha, repository, decision="redelivery"
@@ -5907,13 +6614,27 @@ def substitute_summon_covers_head(
     return marker_comment_exists(comments, substitute_summon_marker(head_sha))
 
 
+def substitute_verdict_clean_marker(head_sha: str, actor: str) -> str:
+    """The exact-head CLEAN verdict a substitute reviewer types."""
+    return f"{SUBSTITUTE_VERDICT_MARKER_PREFIX}{head_sha}:{actor}:clean -->"
+
+
+def substitute_verdict_findings_marker(
+    head_sha: str, actor: str, p1: int | str, p2: int | str, p3: int | str
+) -> str:
+    """The exact-head findings verdict a substitute reviewer types, counts by severity."""
+    return (
+        f"{SUBSTITUTE_VERDICT_MARKER_PREFIX}{head_sha}:{actor}"
+        f":findings:{p1}:{p2}:{p3} -->"
+    )
+
+
 def substitute_verdict_marker_line(head_sha: str, actor: str) -> str:
     """The marker contract quoted verbatim in the summon, so the substitute
     can copy it rather than reconstruct it."""
-    prefix = f"{SUBSTITUTE_VERDICT_MARKER_PREFIX}{head_sha}:{actor}"
     return (
-        f"CLEAN: `{prefix}:clean -->`\n"
-        f"Findings: `{prefix}:findings:<p1>:<p2>:<p3> -->` "
+        f"CLEAN: `{substitute_verdict_clean_marker(head_sha, actor)}`\n"
+        f"Findings: `{substitute_verdict_findings_marker(head_sha, actor, '<p1>', '<p2>', '<p3>')}` "
         "(counts by severity), plus the findings themselves in the same comment."
     )
 
@@ -6039,9 +6760,22 @@ def _scan_open_pull(
         repository=repository,
         now=now,
     )
-    reviewed_heads = codex_result_heads(
+    result_events = codex_result_events(
         github, reviews, comments, codex_login, pr_number=pr_number
     )
+    reviewed_heads = result_heads_from_events(result_events)
+    # The verdict state every branch below publishes from, read off the same
+    # event stream that decides which branch runs.  Today it is always None on
+    # the three publishing branches — they are reached only past the
+    # ``head_sha in reviewed_heads`` return — so this derivation and a literal
+    # ``None`` are behaviourally identical.  It is derived anyway: a change to
+    # that branch condition would otherwise leave three publications silently
+    # asserting a premise nothing re-establishes, and the equivalence the
+    # literal would depend on is a property of two other functions
+    # (``result_heads_from_events`` and ``latest_result_by_head`` key one
+    # stream the same way), not of this one.  Each publication then re-reads
+    # the state live at the post itself (KRA-1368).
+    snapshot_result = latest_result_by_head(result_events).get(head_sha)
     if head_sha in reviewed_heads:
         # A reviewed head needs no reviewer, but its verdict may still be
         # standing unacted. The commit-age gate above is already satisfied
@@ -6081,6 +6815,16 @@ def _scan_open_pull(
                     f"#{pr_number} (head={head_sha}): the prior gate "
                     "recorded a different policy"
                 )
+            if not verdict_state_held(
+                github,
+                pr_number=pr_number,
+                head_sha=head_sha,
+                codex_login=codex_login,
+                snapshot=snapshot_result,
+                repository=repository,
+                action="exhaustion gate",
+            ):
+                return (0, 0, 0, chased)
             pr_state = refresh_pr_at_head(
                 github,
                 pr_number,
@@ -6161,6 +6905,16 @@ def _scan_open_pull(
             # Codex's refusal was superseded by later Codex activity, but the
             # standing nudge for this head was already posted — do not repeat.
             return (0, 0, 0, chased)
+        if not verdict_state_held(
+            github,
+            pr_number=pr_number,
+            head_sha=head_sha,
+            codex_login=codex_login,
+            snapshot=snapshot_result,
+            repository=repository,
+            action="review nudge",
+        ):
+            return (0, 0, 0, chased)
         if (
             refresh_pr_at_head(
                 github,
@@ -6187,6 +6941,16 @@ def _scan_open_pull(
             },
         )
         return (1, 0, 0, chased)
+    if not verdict_state_held(
+        github,
+        pr_number=pr_number,
+        head_sha=head_sha,
+        codex_login=codex_login,
+        snapshot=snapshot_result,
+        repository=repository,
+        action="substitute review summon",
+    ):
+        return (0, 0, 0, chased)
     if (
         refresh_pr_at_head(
             github,
@@ -6633,7 +7397,7 @@ def pr_belt_summary(
         # absent when only a legacy unversioned marker gated it — today's
         # MAX_REVIEW_ROUNDS is not evidence about a gate posted under an
         # earlier policy.
-        "exhausted": marker_comment_exists(conversation, EXHAUSTED_MARKER_PREFIX),
+        "exhausted": exhaustion_gate_recorded(conversation),
         "exhausted_max_rounds": exhaustion_marker_bound(conversation),
         "merged": merged,
         "merged_sha": str(pull_request.get("merge_commit_sha") or "") if merged else "",
@@ -6877,9 +7641,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             "skill-audit",
             "terminal",
             "terminal-sweep",
+            "substitute-verdict",
         ),
     )
+    parser.add_argument(
+        "--head",
+        help="substitute-verdict: the full head SHA to read the verdict for; "
+        "comment pages arrive on stdin",
+    )
     args = parser.parse_args(argv)
+    if args.command == "substitute-verdict":
+        # A seat's read, not a belt invocation: no telemetry root, no event.
+        if not args.head:
+            parser.error("substitute-verdict requires --head <sha>")
+        report_substitute_verdict(args.head, json.load(sys.stdin), sys.stdout)
+        return 0
     telemetry = install_belt_telemetry(BeltTelemetry.from_env(args.command))
     try:
         with telemetry.span(
