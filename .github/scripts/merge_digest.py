@@ -46,7 +46,7 @@ import tempfile
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 REPOS_FILE = REPO_ROOT / "weave-repos.json"
@@ -576,6 +576,241 @@ def gate_line(report: Mapping[str, Any]) -> str:
     return " · ".join(parts)
 
 
+class MergeSpan(NamedTuple):
+    """The commits a merged pull actually placed on the default branch.
+
+    GitHub reports one ``merge_commit_sha`` for all three merge strategies and
+    publishes the strategy nowhere.  For a squash that sha is the whole change;
+    for a merge commit it is the whole change under ``-m 1``; for a **rebase**
+    merge it is only the *last* of the pull's replayed commits.  Measuring or
+    anchoring on that sha alone therefore reports a partial reversal as a
+    complete one — the one claim this file promises never to make.  The span
+    carries the commit count so the probe and the anchor both speak about
+    everything the merge landed.
+
+    ``undetermined`` is the refusal: a non-empty reason means the span could not
+    be derived, and no cost may be claimed from it.
+    """
+
+    sha: str
+    count: int
+    is_merge: bool
+    undetermined: str = ""
+
+    def target(self) -> str:
+        """The revert argument covering the whole merge, short-sha rendered."""
+        short = self.sha[:12]
+        return f"{short}~{self.count}..{short}" if self.count > 1 else short
+
+    def diff_spec(self) -> list[str]:
+        """``git diff`` arguments spanning every commit the merge landed."""
+        if self.is_merge:
+            return [f"{self.sha}^1", self.sha]
+        if self.count > 1:
+            return [f"{self.sha}~{self.count}", self.sha]
+        return [f"{self.sha}^!"]
+
+    def revert_args(self) -> list[str]:
+        """``git revert`` arguments spanning every commit the merge landed."""
+        if self.is_merge:
+            return ["-m", "1", self.sha]
+        if self.count > 1:
+            return [f"{self.sha}~{self.count}..{self.sha}"]
+        return [self.sha]
+
+
+def revert_anchor(span: MergeSpan) -> str:
+    """The exact revert command covering everything this merge landed.
+
+    ``-m 1`` belongs on a merge commit and breaks on a squash commit, and a
+    rebase merge needs the whole replayed range rather than its tip — all three
+    come off the span rather than an assumption about how the repository merges.
+    An underivable span says so in the anchor instead of rendering a command
+    that may cover only part of the merge.
+    """
+    if not span.sha:
+        return "git revert <merge commit unknown>"
+    if span.undetermined:
+        return (
+            f"git revert {span.sha[:12]} (span undetermined — {span.undetermined}; "
+            "confirm by hand whether this sha carries the whole merge)"
+        )
+    mainline = "-m 1 " if span.is_merge else ""
+    return f"git revert {mainline}{span.target()}"
+
+
+def _commit_identity(commit: Mapping[str, Any]) -> tuple[str, str, str]:
+    """Subject, author email and author date — what a rebase preserves.
+
+    A rebase replays a commit under a new sha and a new committer but keeps the
+    message and the authorship untouched, so this triple is the same on both
+    sides of the replay.  A squash commit shares none of it: GitHub authors it
+    as the merger, at merge time, under the pull's title.
+
+    Measured against GitHub itself rather than assumed, 2026-09-05, on a scratch
+    repository (``RationallyPrime/kra1372-rebase-probe``, private).  A three-commit
+    pull merged with ``gh pr merge --rebase`` produced ``merge_commit_sha`` with one
+    parent, subject ``commit number 3``, author ``gnomon@sokrates.is`` at the
+    *original* ``2020-01-03T00:00:00Z`` — only the committer was rewritten to the
+    merger — and its first-parent chain reproduced all three of the pull's commits
+    on this triple, in order.  A two-commit pull merged with ``--squash`` differed
+    on all three at once: subject ``squash probe: two commits (#2)``, author the
+    merger, date the merge instant.  Both directions therefore rest on a receipt,
+    which matters because the author *date* is the leg a rebase could plausibly
+    have rewritten and did not.
+    """
+    payload = commit.get("commit")
+    payload = payload if isinstance(payload, Mapping) else {}
+    author = payload.get("author")
+    author = author if isinstance(author, Mapping) else {}
+    lines = str(payload.get("message") or "").splitlines()
+    return (
+        lines[0].strip() if lines else "",
+        str(author.get("email") or "").strip().lower(),
+        str(author.get("date") or "").strip(),
+    )
+
+
+def _first_parent_sha(commit: Mapping[str, Any]) -> str:
+    parents = commit.get("parents")
+    if not isinstance(parents, list) or not parents:
+        return ""
+    first = parents[0]
+    return str(first.get("sha") or "") if isinstance(first, Mapping) else ""
+
+
+def merge_span(github: GitHubApi, pull: Mapping[str, Any]) -> MergeSpan:
+    """How many commits this pull put on the default branch, and under which shape.
+
+    The strategy is read off the history rather than assumed: a rebase merge is
+    exactly the case where the merge commit and its first-parent chain reproduce
+    the pull's own commits, authorship for authorship.  How many commits there
+    are to reproduce comes from the pull's own ``commits`` count rather than
+    from the length of the listing, because the listing is capped and the count
+    is not — a short list is then a *detected* truncation instead of a silently
+    shorter span.  Anything that cannot be read is refused by name — never
+    folded into "one commit", which is the silent under-count this function
+    exists to prevent.
+    """
+    merge_sha = str(pull.get("merge_commit_sha") or "").lower()
+    if not merge_sha:
+        return MergeSpan("", 1, False, "no merge commit is recorded on this pull")
+    try:
+        merge_commit = github.get(f"commits/{merge_sha}")
+    except ApiHttpError:
+        return MergeSpan(merge_sha, 1, False, "the merge commit could not be read")
+    if not isinstance(merge_commit, Mapping):
+        return MergeSpan(merge_sha, 1, False, "the merge commit could not be read")
+    parents = merge_commit.get("parents")
+    if isinstance(parents, list) and len(parents) > 1:
+        # A merge commit holds the pull's whole change against its first parent,
+        # so ``-m 1`` reverts all of it however many commits the pull carried.
+        return MergeSpan(merge_sha, 1, True)
+    declared = pull.get("commits")
+    if not isinstance(declared, int) or declared < 1:
+        # Only ``GET /pulls/{n}`` carries this count; the list endpoint omits it,
+        # as does a detail read that failed and fell back to its list row. Without
+        # it a truncated commit listing cannot be told from a complete one, which
+        # is exactly the under-count this function exists to prevent.
+        return MergeSpan(
+            merge_sha, 1, False, "the pull does not report how many commits it carried"
+        )
+    if declared == 1:
+        # One commit lands as one commit under every strategy.
+        return MergeSpan(merge_sha, 1, False)
+    try:
+        number = int(pull["number"])
+    except (KeyError, TypeError, ValueError):
+        return MergeSpan(merge_sha, 1, False, "the pull carries no usable number")
+    try:
+        listed = github.paginate(f"pulls/{number}/commits")
+    except ApiHttpError:
+        return MergeSpan(
+            merge_sha, 1, False, "the pull's own commit list could not be read"
+        )
+    commits = [item for item in listed if isinstance(item, Mapping)]
+    if len(commits) != declared:
+        # ``GET /pulls/{n}/commits`` stops at 250 however many the pull carries,
+        # so a short list is a truncated one. Holding it against the pull's own
+        # count catches that without hard-coding the cap, and refuses rather than
+        # deriving a span from commits it cannot see.
+        return MergeSpan(
+            merge_sha,
+            1,
+            False,
+            f"the pull reports {declared} commits and the API lists "
+            f"{len(commits)}, so a rebased span could not be derived",
+        )
+    if _commit_identity(merge_commit) != _commit_identity(commits[-1]):
+        # Not the replayed twin of the pull's last commit: a squash commit, whose
+        # single sha already carries the whole pull.
+        return MergeSpan(merge_sha, 1, False)
+    walked: Mapping[str, Any] = merge_commit
+    for index in range(len(commits) - 2, -1, -1):
+        parent_sha = _first_parent_sha(walked)
+        if not parent_sha:
+            return MergeSpan(
+                merge_sha,
+                1,
+                False,
+                f"rebase merge, {len(commits)} commits — the first-parent chain "
+                "ends before the pull's first commit",
+            )
+        try:
+            walked = github.get(f"commits/{parent_sha}")
+        except ApiHttpError:
+            return MergeSpan(
+                merge_sha,
+                1,
+                False,
+                f"rebase merge, {len(commits)} commits — the first-parent chain "
+                f"could not be read at {parent_sha[:12]}",
+            )
+        if not isinstance(walked, Mapping) or _commit_identity(
+            walked
+        ) != _commit_identity(commits[index]):
+            return MergeSpan(
+                merge_sha,
+                1,
+                False,
+                f"rebase merge, {len(commits)} commits — the first-parent chain "
+                f"diverges from the pull's commits at {parent_sha[:12]}",
+            )
+    return MergeSpan(merge_sha, len(commits), False)
+
+
+class GitStepFailed(RuntimeError):
+    """A git step that never produced an exit status at all.
+
+    Every reader of ``_git`` branches on a return code, which is what git
+    answers with when it runs and fails.  A step that times out or cannot be
+    started answers with an exception instead, and that exception used to
+    leave ``run_digest`` entirely: one slow clone suppressed the digest for
+    every other repository, and since a failed run never becomes the
+    watermark, the next run re-probed the same repository and blocked the
+    same way.
+
+    Converting at the single point that runs git closes the class rather than
+    the instance — a git call added later cannot re-open it.  This is a
+    ``RuntimeError``, so the per-repository boundary in ``run_digest``
+    contains it by construction and reports that repository UNREAD.  The
+    repository, not the pull, is the unit: a timeout is a statement about the
+    runner or the network, and continuing would pay the same timeout again
+    for every remaining merge in that repository.
+
+    The message is composed rather than inherited from the underlying
+    exception: ``TimeoutExpired`` stringifies its whole argv, and this text is
+    rendered into the digest.
+    """
+
+    def __init__(self, step: str, reason: str, subject: str = "") -> None:
+        self.step = step
+        self.reason = reason
+        self.subject = subject
+        tail = f" while probing {subject}" if subject else ""
+        super().__init__(f"git {step} {reason}{tail}")
+
+
 class RevertProbe:
     """Measure reversal cost by attempting the revert, not by proxy.
 
@@ -613,14 +848,26 @@ class RevertProbe:
             "user.email=digest@sokrates.is",
             *args,
         ]
-        return subprocess.run(
-            command,
-            cwd=str(cwd) if cwd else None,
-            capture_output=True,
-            text=True,
-            timeout=600,
-            check=False,
-        )
+        step = str(args[0]) if args else "(no subcommand)"
+        try:
+            return subprocess.run(
+                command,
+                cwd=str(cwd) if cwd else None,
+                capture_output=True,
+                text=True,
+                timeout=600,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise GitStepFailed(step, f"exceeded {error.timeout:.0f}s") from error
+        except (subprocess.SubprocessError, OSError) as error:
+            # The whole family, not today's member: a later call passing
+            # ``check=True`` raises ``CalledProcessError``, and a runner
+            # without git raises ``OSError``.  Both are the same defect —
+            # a git step with no exit status to read.
+            raise GitStepFailed(
+                step, f"could not be run ({type(error).__name__})"
+            ) from error
 
     def clone(self, slug: str) -> Path | None:
         if slug in self.clones:
@@ -638,7 +885,36 @@ class RevertProbe:
         self.clones[slug] = target if result.returncode == 0 else None
         return self.clones[slug]
 
-    def cost(self, slug: str, merge_sha: str, default_branch: str) -> dict[str, Any]:
+    def cost(self, slug: str, span: MergeSpan, default_branch: str) -> dict[str, Any]:
+        """Measure the revert, naming what the measurement was about if it dies.
+
+        The failure a caller sees carries the step and the merge it was
+        probing; ``run_digest`` prefixes the repository, so the digest line
+        names all three.
+        """
+        if span.undetermined:
+            # An underivable span is not a one-commit span. Measuring the tip
+            # alone would price a partial reversal as the whole merge.
+            return {
+                "tier": "unmeasured",
+                "dependents": 0,
+                "detail": (
+                    f"`{revert_anchor(span)}` — the commits this merge landed "
+                    "could not be derived, so no reversal cost is claimed"
+                ),
+            }
+        try:
+            return self._measure(slug, span, default_branch)
+        except GitStepFailed as error:
+            raise GitStepFailed(
+                error.step, error.reason, f"the revert of `{span.sha[:12]}`"
+            ) from error
+
+    def _measure(
+        self, slug: str, span: MergeSpan, default_branch: str
+    ) -> dict[str, Any]:
+        anchor = revert_anchor(span)
+        merge_sha = span.sha
         repo = self.clone(slug)
         if repo is None:
             return {
@@ -666,12 +942,7 @@ class RevertProbe:
             }
         self._git(["reset", "--hard"], cwd=repo)
         self._git(["clean", "-ffdq"], cwd=repo)
-        parents = self._git(["rev-list", "--parents", "-n", "1", merge_sha], cwd=repo)
-        is_merge = len(parents.stdout.split()) > 2
-        revert_args = ["revert", "--no-commit"]
-        if is_merge:
-            revert_args += ["-m", "1"]
-        attempt = self._git([*revert_args, merge_sha], cwd=repo)
+        attempt = self._git(["revert", "--no-commit", *span.revert_args()], cwd=repo)
         clean = attempt.returncode == 0
         # A revert of an already-reverted merge "succeeds" while staging nothing;
         # reporting that as an applicable revert promises work that would fail
@@ -682,13 +953,12 @@ class RevertProbe:
         self._git(["revert", "--quit"], cwd=repo)
         self._git(["reset", "--hard"], cwd=repo)
         self._git(["clean", "-ffdq"], cwd=repo)
-        paths = self._changed_paths(repo, merge_sha, is_merge)
+        paths = self._changed_paths(repo, span)
         dependents = (
             None
             if paths is None
             else self._dependent_commits(repo, merge_sha, default_branch, paths)
         )
-        anchor = f"git revert {'-m 1 ' if is_merge else ''}{merge_sha[:12]}"
         if dependents is None:
             # A failed probe is not "0 later commits". Folding the failure
             # into zero would report a clean revert the evidence does not
@@ -732,11 +1002,8 @@ class RevertProbe:
             "detail": f"clean revert — `{anchor}` applies with no conflict and nothing stacked on it",
         }
 
-    def _changed_paths(
-        self, repo: Path, merge_sha: str, is_merge: bool
-    ) -> list[str] | None:
-        spec = [f"{merge_sha}^1", merge_sha] if is_merge else [f"{merge_sha}^!"]
-        result = self._git(["diff", "--name-only", *spec], cwd=repo)
+    def _changed_paths(self, repo: Path, span: MergeSpan) -> list[str] | None:
+        result = self._git(["diff", "--name-only", *span.diff_spec()], cwd=repo)
         if result.returncode != 0:
             return None
         return [line for line in result.stdout.splitlines() if line.strip()]
@@ -886,27 +1153,6 @@ def _deployment_succeeded(
     return str(latest.get("state") or "") == "success"
 
 
-def revert_anchor(github: GitHubApi, merge_sha: str) -> str:
-    """The exact revert command for this commit.
-
-    ``-m 1`` belongs on a merge commit and breaks on a squash commit, so the
-    parent count decides it rather than an assumption about how the repository
-    merges.
-    """
-    if not merge_sha:
-        return "git revert <merge commit unknown>"
-    try:
-        commit = github.get(f"commits/{merge_sha}")
-    except ApiHttpError:
-        return (
-            f"git revert {merge_sha[:12]} (commit lookup failed — parent count "
-            "unknown; check whether this is a merge commit and add -m 1 by hand)"
-        )
-    parents = commit.get("parents") if isinstance(commit, Mapping) else None
-    mainline = "-m 1 " if isinstance(parents, list) and len(parents) > 1 else ""
-    return f"git revert {mainline}{merge_sha[:12]}"
-
-
 def build_entry(
     github: GitHubApi,
     *,
@@ -920,7 +1166,8 @@ def build_entry(
     body = str(pull.get("body") or "")
     title = str(pull.get("title") or "")
     merged_at = parse_time(pull.get("merged_at"))
-    merge_sha = str(pull.get("merge_commit_sha") or "").lower()
+    span = merge_span(github, pull)
+    merge_sha = span.sha
     files = github.paginate(f"pulls/{number}/files")
     account, thin = substance(body)
     gate = gate_report(github, pull, codex_login)
@@ -930,7 +1177,7 @@ def build_entry(
         else {"counts": {"total": 0}, "failed": []}
     )
     if probe is not None and merge_sha:
-        reversal = probe.cost(slug, merge_sha, default_branch)
+        reversal = probe.cost(slug, span, default_branch)
         shipped = deployment_note(
             github,
             merged_at,
@@ -950,7 +1197,7 @@ def build_entry(
             "tier": "unmeasured",
             "dependents": 0,
             "detail": (
-                f"`{revert_anchor(github, merge_sha)}` — the anchor only. "
+                f"`{revert_anchor(span)}` — the anchor only. "
                 "Nothing has been measured at merge time, and an unmeasured "
                 "cost is never reported as a cheap one; the scheduled digest "
                 "measures it."
@@ -1085,7 +1332,7 @@ def seat_for_pull(github: GitHubApi, pull: Mapping[str, Any]) -> tuple[str, str]
     review loop's seat identity — so it stays one implementation.
     """
     head_sha = str((pull.get("head") or {}).get("sha") or "")
-    return review_loop.author_for_pr(github, int(pull["number"]), head_sha)
+    return review_loop.author_for_pr(github, int(pull["number"]), head_sha, pull)
 
 
 def run_digest(*, dry_run: bool = False, since_override: str | None = None) -> None:

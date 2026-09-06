@@ -18,6 +18,14 @@ name: review-loop
 on:
   pull_request:
     types: [closed]
+  # A head move summons its own review round (summon-on-push below). It is a
+  # pull_request_TARGET event on purpose: a plain `pull_request` run executes
+  # the PR's own revision of this file, so a same-repository PR could rewrite
+  # a step to read CODEX_REVIEW_PAT or HIVE_BOT_TOKEN. pull_request_target runs
+  # the default branch's revision with the PR only as data; every step below
+  # still checks out the default branch and never executes PR-controlled code.
+  pull_request_target:
+    types: [synchronize]
   pull_request_review:
     types: [submitted]
   issue_comment:
@@ -56,11 +64,15 @@ on:
 # write disjoint GitHub state. Sweep and verdict-<pr> both publish wakes
 # for the same PR: the previous constant group serialised them, so dropping
 # that without a write guard lets the scan post a stale snapshot after the
-# event route has already published a newer verdict. `redeliver_standing_wake`
-# therefore re-fetches the standing verdict immediately before publication
-# and refuses unless it is still the latest at the head.
+# event route has already published a newer verdict. Every sweep-side
+# publication — nudge, substitute summon, exhaustion gate, wake redelivery —
+# therefore passes `verdict_state_held`, which re-fetches the head's verdict
+# immediately before publication and refuses unless the snapshot it was
+# computed from is still the latest at the head — compared by GitHub's own
+# record id, not by its whole-second timestamp (KRA-1368).
 #
 #   verdict-<pr>   pull_request_review, issue_comment -> wake-on-codex-result
+#   push-<pr>      pull_request_target (synchronize)  -> summon-on-push
 #   closure-<pr>   pull_request (closed)              -> announce-machine-merge,
 #                                                        belt-terminal
 #   sweep          schedule, workflow_dispatch        -> nudge, terminal-sweep,
@@ -69,17 +81,27 @@ on:
 # Same family and same PR still serialise, because that is the only place the
 # helper's check-then-post marker idempotency actually races. Losing a pending
 # `sweep` run is safe by construction and not by luck: the scheduled leg
-# re-enumerates every open PR from GitHub state, so the next run five minutes
-# later does the evicted run's work. That same enumeration
-# (`review_loop._scan_open_pull` -> `redeliver_standing_wake`) is the belt's
-# reconciliation leg for a verdict whose routing was dropped — it re-derives the
-# standing verdict from the reviews and comments at the head rather than from
-# event delivery. It is deliberately the only such leg (KRA-1325).
+# re-enumerates every open PR from GitHub state, so the next run does the
+# evicted run's work — "next" being whenever GitHub honours the schedule,
+# which under load is hours, not five minutes (see summon-on-push). That same
+# enumeration (`review_loop._scan_open_pull` -> `redeliver_standing_wake`) is
+# the belt's reconciliation leg for a verdict whose routing was dropped — it
+# re-derives the standing verdict from the reviews and comments at the head
+# rather than from event delivery. It is deliberately the only such leg
+# (KRA-1325). Losing a pending `push-<pr>` run is safe for the same reason
+# a lost sweep is: a third push evicts the second's pending run, the third
+# run summons at the latest head, and `refresh_pr_at_head` refuses to post
+# for a head that has already moved on. Push and sweep can both reach one PR;
+# the marker race there is the sweep-vs-verdict one, and its worst case is a
+# duplicate summon at the same head — attention-only, no round, because
+# rounds count distinct reviewed heads.
 concurrency:
   group: >-
     weave-review-loop-${{
     (github.event_name == 'pull_request_review' || github.event_name == 'issue_comment')
     && format('verdict-{0}', github.event.issue.number || github.event.pull_request.number)
+    || github.event_name == 'pull_request_target'
+    && format('push-{0}', github.event.pull_request.number)
     || github.event_name == 'pull_request'
     && format('closure-{0}', github.event.pull_request.number)
     || 'sweep' }}
@@ -168,6 +190,48 @@ jobs:
           LOGFIRE_TOKEN: ${{ secrets.LOGFIRE_TOKEN }}
         run: python3 .github/scripts/review_loop.py canary
 
+  summon-on-push:
+    name: Summon a reviewer at the moved head (routing only — not a test gate)
+    # The event twin of nudge-stalled-reviews. A repaired head needs its own
+    # round, and the scheduled scan is not a five-minute clock: GitHub delivers
+    # `*/5` as a multi-hour heartbeat under load (five firings in the fourteen
+    # hours to 2026-09-06T13:34Z on Skrates/sokrates), so a burn's next round
+    # waited for the clock, not for the push. This fires on the push. It posts
+    # through the same one summon site as the scan (`_scan_open_pull`), so the
+    # seat gate, exemption, round bound, hold and once-per-head coverage are
+    # identical; only the commit-age stall window is waived, because the head
+    # move is the evidence that window exists to wait for.
+    #
+    # pull_request_target, never pull_request: this job holds the summon PAT,
+    # and a pull_request run would execute the PR's own revision of this file
+    # (see the trigger block). Same-repository heads only, as cost control —
+    # the seat gate inside the helper skips a fork head regardless, and a
+    # fork burn keeps the hand summon (adopt-review-loop behaviour notes).
+    # Dependabot is excluded outright: its heads are never seat-authored, so
+    # the run would only ever pay for a client to skip them.
+    if: >-
+      github.event_name == 'pull_request_target' && github.event.action == 'synchronize'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && github.actor != 'dependabot[bot]'
+    runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","cx53"]' || '["ubuntu-latest"]') }}
+    steps:
+      - name: Checkout trusted review-loop helper
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Connected-account @codex review at the new head
+        env:
+          # Codex refuses summons authored by github-actions[bot]; same PAT as
+          # the scheduled nudge, same identity check inside the helper.
+          GITHUB_TOKEN: ${{ secrets.CODEX_REVIEW_PAT }}
+          # The meter may route this head to a substitute seat over Hive.
+          HIVE_BOT_TOKEN: ${{ secrets.HIVE_BOT_TOKEN }}
+          AI_USAGE_READ_TOKEN: ${{ secrets.AI_USAGE_READ_TOKEN }}
+          LOGFIRE_TOKEN: ${{ secrets.LOGFIRE_TOKEN }}
+        run: python3 .github/scripts/review_loop.py push
+
   nudge-stalled-reviews:
     name: Nudge stalled reviews (routing only — not a test gate)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
@@ -227,7 +291,7 @@ jobs:
     # declares above. belt-terminal-sweep is the completeness backstop for
     # exactly that case, and the span is keyed on the closure, so the two
     # paths cannot double-count a PR between them.
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
     runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","cx53"]' || '["ubuntu-latest"]') }}
     steps:
       - name: Checkout trusted review-loop helper
