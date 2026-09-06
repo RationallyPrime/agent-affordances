@@ -19,8 +19,26 @@ cd linear-reads && uv sync
 
 | Env var | Meaning |
 | --- | --- |
-| `LINEAR_API_KEY` | Personal API key (required) |
+| `LINEAR_API_KEY` | Personal API key; wins over any file |
+| `LINEAR_API_KEY_FILE` | Explicit path to a key file; a missing path is an error |
 | `LINEAR_TEAM` | Default team key for `issues` and `states` |
+
+With no env var the key is read from the seat's profile key file — the Weave
+`<profile>/secrets/<name>` convention — at the first of:
+
+1. `$CLAUDE_CONFIG_DIR/secrets/linear_api_key` (a Claude Code seat's pinned profile)
+2. `$CODEX_HOME/secrets/linear_api_key` (a Codex seat's)
+3. `~/.claude/secrets/linear_api_key` (an unpinned machine)
+
+The file holds the key alone, one line, **mode 600** — a file readable by
+group or world is refused, not used. Place it with:
+
+```sh
+install -d -m 700 ~/.claude/secrets
+umask 077 && pbpaste > ~/.claude/secrets/linear_api_key   # key on the clipboard
+```
+
+The error for a missing key names every path that was consulted.
 
 ## Commands
 
