@@ -86,7 +86,7 @@ def _expand_dir(absolute: Path, root: Path) -> list[str]:
     just wrote, and an empty ``complete`` would read as evidence of absence."""
     if _git(root, "rev-parse", "--is-inside-work-tree").strip() == "true":
         rel = absolute.relative_to(root).as_posix()
-        return _git_paths(
+        listed = _git_paths(
             root,
             "ls-files",
             "-z",
@@ -96,11 +96,21 @@ def _expand_dir(absolute: Path, root: Path) -> list[str]:
             "--",
             rel if rel != "." else ".",
         )
-    return [
-        str(f.relative_to(root))
-        for f in sorted(absolute.rglob("*"))
-        if f.is_file() and ".git" not in f.parts
-    ]
+    else:
+        listed = [
+            str(f.relative_to(root))
+            for f in sorted(absolute.rglob("*"))
+            if f.is_file() and ".git" not in f.parts
+        ]
+    # Git lists tracked symlinks as files. A link's bytes are its target's, and
+    # the target may live outside the root, so links are dropped here: an
+    # in-root target is listed on its own, an out-of-root one is out of scope.
+    return [rel for rel in listed if _plain_file_in_root(root / rel, root)]
+
+
+def _plain_file_in_root(path: Path, root: Path) -> bool:
+    """A regular file whose real location is under ``root`` — no link hops."""
+    return not path.is_symlink() and path.is_file() and path.resolve().is_relative_to(root)
 
 
 def _resolve_paths(paths: list[Path], root: Path) -> list[str]:
@@ -226,6 +236,11 @@ def _owned_slice(model: SliceResult, *, allow: list[str], root: Path) -> SliceRe
     widened = sorted({sp.path for sp in model.spans if sp.path not in allowed})
     if model.seam is not None and model.seam not in allowed:
         widened = sorted({*widened, model.seam})
+    widened += [
+        p
+        for p in sorted({sp.path for sp in model.spans} - set(widened))
+        if not _plain_file_in_root(root / p, root)
+    ]
     if widened:
         return SliceResult(
             status="refused",

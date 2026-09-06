@@ -213,3 +213,35 @@ def test_span_end_before_start_is_a_contract_breach() -> None:
 def test_extra_field_is_a_contract_breach() -> None:
     with pytest.raises(ValueError):
         SliceResult.model_validate({"status": "complete", "summary": "the repo does X"})
+
+
+def test_directory_expansion_drops_symlinks(fake_codex, tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    secret = tmp_path / "outside.txt"
+    secret.write_text("TOP SECRET\n")
+    (repo / "leak.txt").symlink_to(secret)
+    (repo / "alias.py").symlink_to(repo / "a.py")
+    subprocess.run(["git", "add", "leak.txt", "alias.py"], cwd=repo, check=True)
+    captured = tmp_path / "prompt.txt"
+    fake_codex(f'cat > "{captured}"\n' + _emit_last_message(_packet()))
+    result = _run(repo)
+    assert result.exit_code == 0, result.output
+    prompt = captured.read_text()
+    assert "leak.txt" not in prompt
+    assert "alias.py" not in prompt
+    assert sorted(_read_telemetry()[-1]["allowed_paths"]) == ["a.py", "b.py"]
+
+
+def test_render_refuses_a_span_that_became_a_symlink(fake_codex, tmp_path: Path) -> None:
+    """Even an allowlisted path is re-checked at render time: no link hops."""
+    repo = _repo(tmp_path)
+    secret = tmp_path / "outside.txt"
+    secret.write_text("TOP SECRET\n")
+    fake_codex(
+        _emit_last_message(_packet())
+        + f'rm "{repo / "b.py"}" && ln -s "{secret}" "{repo / "b.py"}"\n'
+    )
+    result = _run(repo, "--render")
+    assert result.exit_code == 5
+    assert "TOP SECRET" not in result.output
+    assert "b.py" in json.loads(result.output)["reason"]
