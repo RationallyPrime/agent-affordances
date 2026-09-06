@@ -28,10 +28,11 @@ from afford_spark.models import (
     EXIT_CODES,
     LocateResult,
     ResultStatus,
+    SliceResult,
     TransformResult,
     TriageResult,
 )
-from afford_spark.prompts import locate_prompt, transform_prompt, triage_prompt
+from afford_spark.prompts import locate_prompt, slice_prompt, transform_prompt, triage_prompt
 
 app = typer.Typer(no_args_is_help=True, help="Affordance CLIs for the Weave seats.")
 spark = typer.Typer(no_args_is_help=True, help="Semantic coreutils over Codex-Spark.")
@@ -40,7 +41,7 @@ app.add_typer(spark, name="spark")
 MAX_INLINE_BYTES = 360_000  # ~90k tokens: stays inside Spark's 128k window with headroom
 
 
-def _emit(result: LocateResult | TransformResult | TriageResult) -> None:
+def _emit(result: LocateResult | SliceResult | TransformResult | TriageResult) -> None:
     typer.echo(result.model_dump_json(indent=2))
     raise typer.Exit(EXIT_CODES[result.status])
 
@@ -85,7 +86,7 @@ def _expand_dir(absolute: Path, root: Path) -> list[str]:
     just wrote, and an empty ``complete`` would read as evidence of absence."""
     if _git(root, "rev-parse", "--is-inside-work-tree").strip() == "true":
         rel = absolute.relative_to(root).as_posix()
-        return _git_paths(
+        listed = _git_paths(
             root,
             "ls-files",
             "-z",
@@ -95,11 +96,21 @@ def _expand_dir(absolute: Path, root: Path) -> list[str]:
             "--",
             rel if rel != "." else ".",
         )
-    return [
-        str(f.relative_to(root))
-        for f in sorted(absolute.rglob("*"))
-        if f.is_file() and ".git" not in f.parts
-    ]
+    else:
+        listed = [
+            str(f.relative_to(root))
+            for f in sorted(absolute.rglob("*"))
+            if f.is_file() and ".git" not in f.parts
+        ]
+    # Git lists tracked symlinks as files. A link's bytes are its target's, and
+    # the target may live outside the root, so links are dropped here: an
+    # in-root target is listed on its own, an out-of-root one is out of scope.
+    return [rel for rel in listed if _plain_file_in_root(root / rel, root)]
+
+
+def _plain_file_in_root(path: Path, root: Path) -> bool:
+    """A regular file whose real location is under ``root`` — no link hops."""
+    return not path.is_symlink() and path.is_file() and path.resolve().is_relative_to(root)
 
 
 def _resolve_paths(paths: list[Path], root: Path) -> list[str]:
@@ -206,6 +217,116 @@ def locate(
         _die(str(exc))
     except Exception as exc:
         _die(f"locate failed: {exc}")
+    _emit(result)
+
+
+def _line_count(root: Path, rel: str) -> int:
+    return len((root / rel).read_bytes().splitlines())
+
+
+def _owned_slice(model: SliceResult, *, allow: list[str], root: Path) -> SliceResult:
+    """Audit every coordinate against the real files; the wrapper owns the packet.
+
+    A span outside the allowlist is a widened path set; a span past the end of
+    its file is a fabricated coordinate. Either one refuses the whole packet
+    rather than silently dropping the span, so a caller never reads a packet
+    the model partly invented.
+    """
+    allowed = set(allow)
+    widened = sorted({sp.path for sp in model.spans if sp.path not in allowed})
+    if model.seam is not None and model.seam not in allowed:
+        widened = sorted({*widened, model.seam})
+    widened += [
+        p
+        for p in sorted({sp.path for sp in model.spans} - set(widened))
+        if not _plain_file_in_root(root / p, root)
+    ]
+    if widened:
+        return SliceResult(
+            status="refused",
+            spans=model.spans,
+            unresolved=model.unresolved,
+            searched_paths=model.searched_paths,
+            reason=f"packet references paths outside the allowlist: {', '.join(widened)}",
+        )
+    lengths = {rel: _line_count(root, rel) for rel in {sp.path for sp in model.spans}}
+    invalid = [
+        f"{sp.path}:{sp.start_line}-{sp.end_line}"
+        for sp in model.spans
+        if sp.end_line > lengths[sp.path]
+    ]
+    if invalid:
+        return SliceResult(
+            status="refused",
+            seam=model.seam,
+            spans=model.spans,
+            unresolved=model.unresolved,
+            searched_paths=model.searched_paths,
+            reason=f"spans past end of file: {', '.join(invalid)}",
+        )
+    if model.status == "complete" and (model.seam is None or not model.spans):
+        return SliceResult(
+            status="incomplete",
+            seam=model.seam,
+            spans=model.spans,
+            unresolved=model.unresolved,
+            searched_paths=model.searched_paths,
+            reason="model claimed completion without a seam and at least one span",
+        )
+    return model
+
+
+def _render_slice(result: SliceResult, root: Path) -> str:
+    """Deterministic packet text: the real bytes of every audited span."""
+    lines = [f"# slice — seam: {result.seam}", ""]
+    for sp in result.spans:
+        body = (root / sp.path).read_text(errors="replace").splitlines()
+        excerpt = "\n".join(body[sp.start_line - 1 : sp.end_line])
+        lines += [
+            f"## {sp.path}:{sp.start_line}-{sp.end_line} [{sp.role}]",
+            f"why: {sp.why}",
+            "```",
+            excerpt,
+            "```",
+            "",
+        ]
+    if result.unresolved:
+        lines += ["## unresolved", *[f"- {u}" for u in result.unresolved], ""]
+    return "\n".join(lines)
+
+
+@spark.command()
+def slice(
+    task: Annotated[str, typer.Argument(help="The task the caller is about to perform.")],
+    paths: Annotated[list[Path], typer.Argument(help="Files or directories in scope.")],
+    root: Annotated[
+        Path | None, typer.Option("--root", help="Working root the paths live under.")
+    ] = None,
+    render: Annotated[
+        bool,
+        typer.Option("--render", help="Print the packet as text with the real span bytes."),
+    ] = False,
+) -> None:
+    """Smallest sufficient context packet: seam + spans + why, never a summary."""
+    root = (root or Path.cwd()).resolve()
+    files = _resolve_paths(paths, root)
+    try:
+        model = run_spark(
+            slice_prompt(task, files),
+            verb="slice",
+            workdir=root,
+            schema=SliceResult,
+            allowed_paths=files,
+            repo=root,
+        )
+    except SparkUnavailableError as exc:
+        _die(str(exc))
+    except Exception as exc:
+        _die(f"slice failed: {exc}")
+    result = _owned_slice(model, allow=files, root=root)
+    if render and result.status == "complete":
+        typer.echo(_render_slice(result, root))
+        raise typer.Exit(EXIT_CODES[result.status])
     _emit(result)
 
 

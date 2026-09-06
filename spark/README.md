@@ -8,11 +8,23 @@ memory, no delegation, no commits, no verdicts.
 uv sync && uv run afford spark --help
 ```
 
-First slice (of the nine-verb map in the SPEC):
+Verb status against the nine-verb map in the SPEC (2026-09-06):
+
+| Verb | State |
+|---|---|
+| `locate` | shipped — semantic grep, field-tested |
+| `transform` | shipped — bounded patch in an ephemeral worktree, allowlist audited |
+| `triage` | shipped — stdin filter over pytest / diff / findings / log |
+| `slice` | shipped — smallest sufficient context packet, coordinates audited |
+| `drift` `codemod` `falsify` `query` `claims` | not built; earned by the eval corpus, not assumed |
 
 ```bash
 # Semantic grep — records with spans, relationships, evidence
 afford spark locate "every path where an absent API response becomes a silent default" src/
+
+# Context packet for a task — owning seam + minimal spans + why each, never a summary
+afford spark slice "make name required in both functions" src/
+afford spark slice "..." src/ --render      # the packet as text, real bytes of every span
 
 # One bounded edit — patch out, live checkout untouched, allowlist enforced structurally
 afford spark transform "make name required in both functions" src/greet.py --root .
@@ -20,6 +32,13 @@ afford spark transform "make name required in both functions" src/greet.py --roo
 # Unix filter — noisy output in, relation map out
 pytest -q 2>&1 | afford spark triage --kind pytest
 ```
+
+`slice` returns a seam (the path that owns the behavior), spans with a role
+(`owner` · `producer` · `consumer` · `test` · `contract`) and a one-line
+loss statement, and `unresolved` for references outside the path set. The
+wrapper refuses the whole packet if any span names a path outside the
+allowlist or a line past the end of its file, and `--render` reads the bytes
+from disk, so the packet is never the model's paraphrase.
 
 Exit codes: `0` complete · `3` incomplete · `4` ambiguous · `5` refused ·
 `1` engine/pool failure (a throttled pool is a plain error, never a silent

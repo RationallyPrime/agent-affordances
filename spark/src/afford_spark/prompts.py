@@ -40,6 +40,35 @@ status "complete" is a valid answer.
 """
 
 
+def slice_prompt(task: str, paths: list[str]) -> str:
+    listed = "\n".join(f"- {p}" for p in paths)
+    return f"""{BOUNDARY}
+Operation: SLICE — the smallest sufficient context packet for a task.
+
+Task the caller is about to perform:
+{task}
+
+Paths in scope:
+{listed}
+
+Name the owning seam: the single path whose code owns the behavior the task
+is about (null only when status is not "complete"). Then return the minimal
+set of spans a reader must have in front of them to do the task correctly,
+each as path, start_line, end_line (1-indexed, from the actual file), a role
+("owner" — the seam itself; "producer" — writes the state or value involved;
+"consumer" — reads or depends on it; "test" — establishes current behavior;
+"contract" — a schema, type, doctrine rule or docstring the task must honor),
+and one short "why" naming what the reader loses without that span. Prefer
+fewer, tighter spans over wide ones; never include a span you cannot name a
+loss for. Do NOT summarize the repository or describe the files — the packet
+is coordinates and reasons only. List every symbol or path the packet depends
+on that is NOT in the listed paths under "unresolved" instead of guessing.
+Set searched_paths to the number of files you actually examined. Return
+status "ambiguous" with a reason when two different seams could own the task
+and the task text does not decide between them.
+"""
+
+
 def transform_prompt(rule: str, paths: list[str], base_sha: str) -> str:
     listed = "\n".join(f"- {p}" for p in paths)
     return f"""{BOUNDARY}
