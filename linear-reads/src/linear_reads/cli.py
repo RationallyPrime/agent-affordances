@@ -1,7 +1,9 @@
 """linear-reads: token-lean read-only Linear CLI for agents.
 
 Reads only; writes stay in the Linear MCP. Auth via the LINEAR_API_KEY env
-var; LINEAR_TEAM sets the default team for `issues` and `states`.
+var, else the profile key file `<profile>/secrets/linear_api_key` (see
+`client.resolve_api_key`); LINEAR_TEAM sets the default team for `issues`
+and `states`.
 """
 
 from __future__ import annotations

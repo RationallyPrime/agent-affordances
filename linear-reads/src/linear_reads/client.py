@@ -3,13 +3,24 @@
 from __future__ import annotations
 
 import os
+import stat
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import httpx
 
 API_URL = "https://api.linear.app/graphql"
 _MAX_PAGE = 100
+
+KEY_ENV = "LINEAR_API_KEY"
+KEY_FILE_ENV = "LINEAR_API_KEY_FILE"
+# The Weave profile-secrets convention: `<profile>/secrets/<name>`, owner-only.
+# The profile dir is whatever the seat's harness pins — CLAUDE_CONFIG_DIR for
+# Claude Code, CODEX_HOME for Codex — and `~/.claude` where nothing is pinned.
+KEY_FILE_RELATIVE = Path("secrets") / "linear_api_key"
+PROFILE_DIR_ENVS = ("CLAUDE_CONFIG_DIR", "CODEX_HOME")
+_LOOSE_MODE_BITS = stat.S_IRWXG | stat.S_IRWXO
 
 
 class LinearError(Exception):
@@ -28,15 +39,68 @@ class LinearAPIError(LinearError):
     pass
 
 
+def key_file_candidates(environ: Mapping[str, str], home: Path) -> list[Path]:
+    """Where a key file may live, most specific first, without duplicates."""
+    candidates: list[Path] = []
+    explicit = environ.get(KEY_FILE_ENV)
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+    for var in PROFILE_DIR_ENVS:
+        profile = environ.get(var)
+        if profile:
+            candidates.append(Path(profile).expanduser() / KEY_FILE_RELATIVE)
+    candidates.append(home / ".claude" / KEY_FILE_RELATIVE)
+    unique: list[Path] = []
+    for path in candidates:
+        if path not in unique:
+            unique.append(path)
+    return unique
+
+
+def resolve_api_key(
+    environ: Mapping[str, str] | None = None,
+    home: Path | None = None,
+) -> str:
+    """The API key from ``LINEAR_API_KEY``, else from the first key file found.
+
+    An explicit ``LINEAR_API_KEY_FILE`` that does not exist is an error, not a
+    fallthrough: a stated path that is wrong should say so. A key file readable
+    by group or world is refused rather than used — the file is a real secret
+    and 600 is the contract.
+    """
+    env = os.environ if environ is None else environ
+    key = env.get(KEY_ENV)
+    if key:
+        return key
+    home_dir = Path.home() if home is None else home
+    candidates = key_file_candidates(env, home_dir)
+    explicit = env.get(KEY_FILE_ENV)
+    for path in candidates:
+        if not path.is_file():
+            if explicit and path == Path(explicit).expanduser():
+                raise MissingAPIKeyError(f"{KEY_FILE_ENV}={path} does not exist")
+            continue
+        mode = path.stat().st_mode
+        if mode & _LOOSE_MODE_BITS:
+            raise MissingAPIKeyError(
+                f"{path} is {stat.filemode(mode)}; a Linear key file must be readable by its "
+                "owner only (chmod 600)"
+            )
+        key = path.read_text(encoding="utf-8").strip()
+        if not key:
+            raise MissingAPIKeyError(f"{path} is empty")
+        return key
+    looked = ", ".join(str(path) for path in candidates)
+    raise MissingAPIKeyError(f"{KEY_ENV} is not set and no key file exists (looked at: {looked})")
+
+
 class LinearClient:
     def __init__(
         self,
         api_key: str | None = None,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
-        key = api_key or os.environ.get("LINEAR_API_KEY")
-        if not key:
-            raise MissingAPIKeyError("LINEAR_API_KEY is not set")
+        key = api_key or resolve_api_key()
         self._http = httpx.Client(
             headers={"Authorization": key, "Content-Type": "application/json"},
             timeout=30.0,
