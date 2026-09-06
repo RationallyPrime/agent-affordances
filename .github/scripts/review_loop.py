@@ -599,6 +599,32 @@ CODEX_COMMENT_UNKNOWN = "unknown"
 # PR, and Hákon's word is retrospective (KRA-1083's digest). There is no label
 # to consult and no prospective word to wait for, so every wake states the one
 # regime rather than branching on a grant that no longer exists.
+# The scope test every reviewer and burner applies BEFORE a finding is written
+# or patched (Hákon's ruling, 2026-09-06, after sokrates#1186 turned a 20-line
+# reset script into an eleven-round rewrite by burning every cell the reviewer
+# produced). One constant, rendered at the top of the summon comment, the burn
+# wake, the substitute-review wake and the retrospective wake, so the test is
+# applied where the finding is born, not after it has cost a round.
+SCOPE_TEST = (
+    "Scope test — apply it before writing or patching any finding. Hold the "
+    "code to its purpose and use case: what is it for, who runs it, and where? "
+    "Ask of every defect: if it stays unpatched, does it surface the first time "
+    "this code runs — a script failing on its first invocation, a test "
+    "tripping, a request erroring — or does it only exist for an input, a "
+    "channel, a schedule or an adversary this product does not have yet? "
+    "Nothing here is live on a customer box and the product is still being "
+    "built. A defect that would announce itself on first execution is a "
+    "finding worth a round; one that needs a state, a source or a customer we "
+    "do not have is a ticket or noise, and patching it spends the Weave's time "
+    "for no value. Judge each finding by what it changes the next time this "
+    "code actually runs."
+)
+SCOPE_TEST_REVIEWER = f"{SCOPE_TEST} Raise only findings that pass this test."
+SCOPE_TEST_BURNER = (
+    f"{SCOPE_TEST} A finding that fails it is `noise` or `ticket`, never a burn; "
+    "say which in the disposition."
+)
+
 MERGE_REGIME = (
     "Merge authority: the composed boundary itself — this exact head "
     "review-closed, required checks green, no conflicts. No label and no "
@@ -3453,8 +3479,12 @@ def nudge_marker_pattern(head_sha: str) -> re.Pattern[str]:
 
 
 def nudge_comment_body(head_sha: str) -> str:
-    """Codex trigger plus an exact-head marker so force-pushes cannot reuse it."""
-    return f"@codex review\n{nudge_marker(head_sha, current_run_id())}"
+    """Codex trigger, the scope test it reviews under, and an exact-head marker
+    so force-pushes cannot reuse it."""
+    return (
+        f"@codex review\n\n{SCOPE_TEST_REVIEWER}\n\n"
+        f"{nudge_marker(head_sha, current_run_id())}"
+    )
 
 
 def redelivery_marker(head_sha: str, verdict_at: str) -> str:
@@ -3998,7 +4028,10 @@ def chunk_digest(
     used = len(prefix)
     for block in blocks:
         separator = 1 if current else 0
-        if current and used + separator + len(block) > budget:
+        # A block that does not fit beside what the page already holds starts
+        # the next page — including when the page holds only the header, so a
+        # long header never pushes the first block over the budget.
+        if used + separator + len(block) > budget:
             messages.append(prefix + "\n".join(current))
             continued = f"({label} continued — part {len(messages) + 1})\n\n"
             prefix = f"{envelope}\n\n{continued}" if envelope else continued
@@ -4059,6 +4092,7 @@ def build_burn_messages(
     header = (
         f"WAKE: {actor}\n\n"
         f"Burn seat `{actor}` — load skill `talos-burn` and burn these findings.\n\n"
+        f"{SCOPE_TEST_BURNER}\n\n"
         f"Review-loop hook: {verdict} {MERGE_REGIME}\n\n"
         f"PR: {pr_url}\n"
         f"Branch: `{branch}`\n"
@@ -4252,6 +4286,8 @@ def build_retrospective_messages(
         f"of {MAX_REVIEW_ROUNDS}, and burning did not close this PR. You are "
         "asked for a retrospective verdict. This wake carries no repair, "
         "re-review, or merge authority.\n\n"
+        f"{SCOPE_TEST} Test first whether the rounds were spent on findings "
+        "that fail it — scope, not code, is then the cause.\n\n"
         f"PR: {pr_url}\n"
         f"Branch: `{branch}`\n"
         f"Head: `{head_sha}`\n"
@@ -6869,6 +6905,7 @@ def substitute_review_wake_message(
         f"summon ({reason}). You hold this review round — load skill "
         "`code-review` and its Weave integration reference; "
         "they define this seat's review and delivery contract.\n\n"
+        f"{SCOPE_TEST_REVIEWER}\n\n"
         f"PR: {pr_url}\n"
         f"Repo: `{repository}`\n"
         f"Branch: `{branch}`\n"
