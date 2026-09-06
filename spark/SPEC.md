@@ -51,6 +51,11 @@ triage     structured compression of logs, diffs, and findings
 (`slice` is predicted to become the most valuable verb, `codemod` the coolest —
 but these three establish whether Spark deserves the rest.)
 
+Status 2026-09-06: the three are shipped and working. `slice` followed as the
+fourth verb — coordinate-audited by the wrapper (allowlist + end-of-file),
+`--render` emits the real span bytes. Remaining five verbs, the quota
+scavenger, and the eval corpus are unbuilt.
+
 ### Output contracts (primitive on the model side, typed on ours)
 
 `locate` returns records, not prose:
