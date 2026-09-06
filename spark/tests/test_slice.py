@@ -7,15 +7,19 @@ A widened path set or a span past end-of-file refuses the whole packet, and
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import stat
 import subprocess
+import tracemalloc
 from pathlib import Path
+from typing import Any
 
 import pytest
 from typer.testing import CliRunner
 
+from afford_spark import cli, protocol
 from afford_spark.cli import app
 from afford_spark.engine import _telemetry_path
 from afford_spark.models import SliceResult, Span
@@ -245,3 +249,425 @@ def test_render_refuses_a_span_that_became_a_symlink(fake_codex, tmp_path: Path)
     assert result.exit_code == 5
     assert "TOP SECRET" not in result.output
     assert "b.py" in json.loads(result.output)["reason"]
+
+
+def _submodule_repo(tmp_path: Path) -> Path:
+    """A superproject with a tracked submodule at ``sub``."""
+    inner = tmp_path / "inner"
+    inner.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=inner, check=True)
+    (inner / "lib.py").write_text("def lib():\n    return 2\n")
+    subprocess.run(["git", "add", "."], cwd=inner, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"],
+        cwd=inner,
+        check=True,
+    )
+    repo = _repo(tmp_path)
+    subprocess.run(
+        ["git", "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(inner), "sub"],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "sub"],
+        cwd=repo,
+        check=True,
+    )
+    return repo
+
+
+def test_submodule_only_path_set_is_a_usage_error(fake_codex, tmp_path: Path) -> None:
+    """`git ls-files` answers a submodule with the gitlink, which is a directory."""
+    repo = _submodule_repo(tmp_path)
+    fake_codex(_emit_last_message(_packet()))
+    result = runner.invoke(app, ["spark", "slice", "t", "sub", "--root", str(repo)])
+    assert result.exit_code == 2
+    assert "path set is empty" in result.output
+
+
+def test_submodule_gitlink_never_reaches_the_prompt(fake_codex, tmp_path: Path) -> None:
+    repo = _submodule_repo(tmp_path)
+    captured = tmp_path / "prompt.txt"
+    fake_codex(f'cat > "{captured}"\n' + _emit_last_message(_packet()))
+    assert _run(repo).exit_code == 0
+    assert "- sub\n" not in captured.read_text()
+
+
+def test_span_naming_a_submodule_gitlink_is_refused(fake_codex, tmp_path: Path) -> None:
+    """Never `read_bytes()` on a directory: the gitlink is outside the allowlist."""
+    repo = _submodule_repo(tmp_path)
+    fake_codex(
+        _emit_last_message(
+            _packet(
+                seam="sub",
+                spans=[
+                    {"path": "sub", "start_line": 1, "end_line": 1, "role": "owner", "why": "w"}
+                ],
+            )
+        )
+    )
+    result = _run(repo)
+    assert result.exit_code == 5
+    assert "sub" in json.loads(result.output)["reason"]
+
+
+def test_completion_without_an_owner_span_for_the_seam_is_incomplete(
+    fake_codex, tmp_path: Path
+) -> None:
+    """Consumers and tests around a seam whose own code is missing is not a packet."""
+    repo = _repo(tmp_path)
+    fake_codex(
+        _emit_last_message(
+            _packet(
+                spans=[
+                    {"path": "b.py", "start_line": 3, "end_line": 3, "role": "consumer", "why": "w"}
+                ]
+            )
+        )
+    )
+    result = _run(repo)
+    assert result.exit_code == 3
+    payload = json.loads(result.output)
+    assert payload["status"] == "incomplete"
+    assert payload["reason"] == "no owner span for the declared seam: a.py"
+
+
+def test_owner_span_belonging_to_another_path_is_incomplete(fake_codex, tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    fake_codex(
+        _emit_last_message(
+            _packet(
+                spans=[
+                    {"path": "b.py", "start_line": 1, "end_line": 1, "role": "owner", "why": "w"}
+                ]
+            )
+        )
+    )
+    result = _run(repo)
+    assert result.exit_code == 3
+    assert json.loads(result.output)["reason"] == "no owner span for the declared seam: a.py"
+
+
+def test_telemetry_records_the_wrapper_audited_status(fake_codex, tmp_path: Path) -> None:
+    """A packet the audit downgrades must not be logged with the model's claim."""
+    repo = _repo(tmp_path)
+    (repo / "c.py").write_text("x = 1\n")
+    fake_codex(
+        _emit_last_message(
+            _packet(
+                spans=[
+                    *_packet()["spans"],
+                    {"path": "c.py", "start_line": 1, "end_line": 1, "role": "test", "why": "w"},
+                ]
+            )
+        )
+    )
+    result = runner.invoke(app, ["spark", "slice", "t", "a.py", "b.py", "--root", str(repo)])
+    assert result.exit_code == 5
+    rec = _read_telemetry()[-1]
+    assert rec["status"] == "refused"
+    assert rec["transport"] == "oneshot"
+
+
+def test_render_refuses_a_span_it_cannot_reproduce(fake_codex, tmp_path: Path) -> None:
+    """Undecodable bytes refuse the packet — U+FFFD is not the file."""
+    repo = _repo(tmp_path)
+    (repo / "a.py").write_bytes(b"# caf\xe9 latin-1\ndef owner():\n    return 1\n")
+    subprocess.run(["git", "add", "a.py"], cwd=repo, check=True)
+    fake_codex(_emit_last_message(_packet()))
+    result = _run(repo, "--render")
+    assert result.exit_code == 5
+    assert "�" not in result.output
+    assert "a.py:1-2" in json.loads(result.output)["reason"]
+    assert _read_telemetry()[-1]["status"] == "refused"
+
+
+def test_render_preserves_crlf_line_endings(fake_codex, tmp_path: Path) -> None:
+    """`.output` is normalized by the test harness; the wire bytes are not."""
+    repo = _repo(tmp_path)
+    (repo / "a.py").write_bytes(b"def owner():\r\n    return 1\r\n")
+    subprocess.run(["git", "add", "a.py"], cwd=repo, check=True)
+    fake_codex(_emit_last_message(_packet()))
+    result = _run(repo, "--render")
+    assert result.exit_code == 0, result.output
+    assert b"def owner():\r\n    return 1" in result.stdout_bytes
+
+
+def test_render_fence_outlives_a_backtick_run_in_the_excerpt(fake_codex, tmp_path: Path) -> None:
+    """A `contract` span is routinely a docstring holding its own fenced block."""
+    repo = _repo(tmp_path)
+    (repo / "a.py").write_text('"""\n```\nfenced\n```\n"""\n')
+    subprocess.run(["git", "add", "a.py"], cwd=repo, check=True)
+    fake_codex(
+        _emit_last_message(
+            _packet(
+                spans=[
+                    {"path": "a.py", "start_line": 1, "end_line": 5, "role": "owner", "why": "w"}
+                ]
+            )
+        )
+    )
+    result = _run(repo, "--render")
+    assert result.exit_code == 0, result.output
+    tail = result.output[result.output.index("## a.py:1-5 [owner]") :].splitlines()
+    fence = tail[2]
+    assert set(fence) == {"`"} and len(fence) == 4, tail
+    closes = [i for i, line in enumerate(tail[3:], start=3) if line.rstrip() == fence]
+    assert closes[0] == 8, f"fence closed inside the excerpt at {closes}: {tail}"
+
+
+def test_a_one_line_span_does_not_load_the_whole_file(fake_codex, tmp_path: Path) -> None:
+    """Validation and render both stream: a tiny packet from a big log stays tiny."""
+    repo = _repo(tmp_path)
+    big = repo / "big.log"
+    with big.open("w") as fh:
+        for i in range(200_000):
+            fh.write(f"line {i} " + "x" * 60 + "\n")
+    subprocess.run(["git", "add", "big.log"], cwd=repo, check=True)
+    fake_codex(
+        _emit_last_message(
+            _packet(
+                spans=[
+                    {"path": "a.py", "start_line": 1, "end_line": 2, "role": "owner", "why": "w"},
+                    {
+                        "path": "big.log",
+                        "start_line": 5,
+                        "end_line": 5,
+                        "role": "producer",
+                        "why": "w",
+                    },
+                ]
+            )
+        )
+    )
+    tracemalloc.start()
+    result = _run(repo, "--render")
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert result.exit_code == 0, result.output
+    assert "line 4 " in result.output
+    assert peak < big.stat().st_size // 4, f"peak {peak} against a {big.stat().st_size}B file"
+
+
+def test_a_span_past_eof_in_a_big_file_is_still_refused(fake_codex, tmp_path: Path) -> None:
+    """The early-stopping count must not turn a short file into a long one."""
+    repo = _repo(tmp_path)
+    fake_codex(
+        _emit_last_message(
+            _packet(
+                spans=[
+                    {"path": "a.py", "start_line": 1, "end_line": 2, "role": "owner", "why": "w"},
+                    {
+                        "path": "b.py",
+                        "start_line": 3,
+                        "end_line": 99,
+                        "role": "consumer",
+                        "why": "w",
+                    },
+                ]
+            )
+        )
+    )
+    result = _run(repo)
+    assert result.exit_code == 5
+    assert "b.py:3-99" in json.loads(result.output)["reason"]
+
+
+def test_render_preserves_a_trailing_bare_cr(fake_codex, tmp_path: Path) -> None:
+    """A span whose last line ends in a bare ``\\r`` must not render as ``\\r\\n``.
+
+    The closing fence starts a new line off the span's own terminator; supplying
+    an LF for it instead rewrites the one line ending this render still claims.
+    """
+    repo = _repo(tmp_path)
+    (repo / "a.py").write_bytes(b"def owner():\r    return 1\r")
+    subprocess.run(["git", "add", "a.py"], cwd=repo, check=True)
+    fake_codex(_emit_last_message(_packet()))
+    result = _run(repo, "--render")
+    assert result.exit_code == 0, result.output
+    assert b"def owner():\r    return 1\r```" in result.stdout_bytes
+    assert b"return 1\r\n" not in result.stdout_bytes
+
+
+def test_render_supplies_a_newline_for_an_unterminated_last_line(
+    fake_codex, tmp_path: Path
+) -> None:
+    """The control for the bare-CR case: the fence still starts its own line."""
+    repo = _repo(tmp_path)
+    (repo / "a.py").write_bytes(b"def owner():\n    return 1")
+    subprocess.run(["git", "add", "a.py"], cwd=repo, check=True)
+    fake_codex(_emit_last_message(_packet()))
+    result = _run(repo, "--render")
+    assert result.exit_code == 0, result.output
+    assert b"    return 1\n```" in result.stdout_bytes
+
+
+def _lines_from_pieces(path: Path) -> list[bytes]:
+    """Whole lines, rejoined from the piece stream the way a consumer would.
+
+    Production code never assembles a line it has not been asked for, so the
+    grammar is checked here: this asserts the piece bytes *and* the ``ends_line``
+    flags, since only the flags decide where one line stops and the next begins.
+    """
+    out: list[bytes] = []
+    pieces: list[bytes] = []
+    for piece, ends_line in cli._iter_line_pieces(path):
+        pieces.append(piece)
+        if ends_line:
+            out.append(b"".join(pieces))
+            pieces = []
+    if pieces:
+        out.append(b"".join(pieces))
+    return out
+
+
+def test_the_line_reader_is_bytes_splitlines_at_every_chunk_boundary(tmp_path: Path) -> None:
+    """The one line grammar, checked against the stdlib it claims to reproduce.
+
+    Every string over ``{a, \\n, \\r}`` up to length 5, at read sizes that put a
+    boundary inside a CRLF. This is what licenses scanning only the new chunk.
+    """
+    f = tmp_path / "f"
+    original = cli._READ_CHUNK
+    try:
+        for chunk in (1, 2, 3, 5, 1 << 20):
+            cli._READ_CHUNK = chunk
+            for n in range(6):
+                for combo in itertools.product([b"a", b"\n", b"\r"], repeat=n):
+                    data = b"".join(combo)
+                    f.write_bytes(data)
+                    want = data.splitlines(keepends=True)
+                    assert _lines_from_pieces(f) == want, (chunk, data)
+                    for limit in range(1, 7):
+                        assert cli._count_lines_upto(f, limit) == min(len(want), limit), (
+                            chunk,
+                            data,
+                            limit,
+                        )
+    finally:
+        cli._READ_CHUNK = original
+
+
+def test_validating_a_span_in_a_single_line_file_does_not_hold_the_line(tmp_path: Path) -> None:
+    """A minified bundle is one line the size of the file.
+
+    Counting must neither re-split an accumulating prefix nor assemble a line no
+    caller will read; both are what a growing ``carry`` costs.
+    """
+    big = tmp_path / "bundle.js"
+    big.write_bytes(b"x" * (16 << 20))
+    tracemalloc.start()
+    counted = cli._count_lines_upto(big, 2)
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert counted == 1
+    assert peak < big.stat().st_size // 4, f"peak {peak} against a {big.stat().st_size}B file"
+
+
+def test_span_bytes_is_splitlines_slicing_at_every_chunk_boundary(tmp_path: Path) -> None:
+    """The cost guard's control: reading pieces must still cut spans exactly.
+
+    Every string over ``{a, \\n, \\r}`` up to length 4, at read sizes that put a
+    boundary inside a CRLF, against the stdlib slicing the spans are defined by.
+    Each span is read alone (its own end line is the deepest) and again in one
+    shared pass (where a shallower span must not be truncated by a deeper one).
+    """
+    root = tmp_path / "root"
+    root.mkdir()
+    f = root / "f"
+    bounds = [(s, e) for s in range(1, 6) for e in range(s, 6)]
+    original = cli._READ_CHUNK
+    try:
+        for chunk in (1, 2, 3, 1 << 20):
+            cli._READ_CHUNK = chunk
+            for n in range(5):
+                for combo in itertools.product([b"a", b"\n", b"\r"], repeat=n):
+                    data = b"".join(combo)
+                    f.write_bytes(data)
+                    lines = data.splitlines(keepends=True)
+                    want = [b"".join(lines[s - 1 : e]) for s, e in bounds]
+                    spans = [
+                        Span(path="f", start_line=s, end_line=e, role="owner", why="w")
+                        for s, e in bounds
+                    ]
+                    shared = cli._span_bytes(root, spans)
+                    assert [shared[i] for i in range(len(bounds))] == want, (chunk, data)
+                    for i, span in enumerate(spans):
+                        assert cli._span_bytes(root, [span]) == {0: want[i]}, (
+                            chunk,
+                            data,
+                            bounds[i],
+                        )
+    finally:
+        cli._READ_CHUNK = original
+
+
+def test_reading_a_span_does_not_assemble_the_lines_around_it(tmp_path: Path) -> None:
+    """A span costs its own bytes, not its neighbours'.
+
+    A minified line *before* the span is skipped a piece at a time, and the pass
+    ends on the deepest requested terminator, so the line *after* it is never
+    pulled. Both are lines a whole-line reader assembles only to discard.
+    """
+    huge = b"x" * (16 << 20)
+    big = tmp_path / "bundle.js"
+    big.write_bytes(b"head\n" + huge + b"\nwanted\n" + huge + b"\n")
+    span = Span(path="bundle.js", start_line=3, end_line=3, role="owner", why="w")
+    tracemalloc.start()
+    bodies = cli._span_bytes(tmp_path, [span])
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert bodies == {0: b"wanted\n"}
+    assert peak < len(huge) // 4, f"peak {peak} against a {len(huge)}B neighbouring line"
+
+
+def test_a_timeout_is_recorded_as_a_timeout(
+    fake_codex, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wrapper-owned telemetry classifies a timeout the way the engine does."""
+    repo = _repo(tmp_path)
+    fake_codex("cat > /dev/null; sleep 30\n")
+    real = cli.run_spark
+
+    def _short_timeout(*args: Any, **kwargs: Any) -> Any:
+        kwargs["timeout_s"] = 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "run_spark", _short_timeout)
+    result = _run(repo)
+    assert result.exit_code == 1
+    assert _read_telemetry()[-1]["status"] == "timeout"
+
+
+def test_a_malformed_response_still_carries_an_output_hash(fake_codex, tmp_path: Path) -> None:
+    """The only content-free correlator for a protocol failure is its hash."""
+    repo = _repo(tmp_path)
+    fake_codex(_emit_last_message({"status": "complete", "spans": "not a list"}))
+    result = _run(repo)
+    assert result.exit_code == 1
+    rec = _read_telemetry()[-1]
+    assert rec["status"] == "protocol_error"
+    assert rec["output_hash"] is not None
+
+
+def test_the_transport_is_probed_once_per_invocation(
+    fake_codex, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``auto`` opens a connection to the daemon socket to decide.
+
+    The wrapper record takes the engine's single selection; probing again just
+    to stamp it puts an extra empty frame on the daemon before every request.
+    """
+    repo = _repo(tmp_path)
+    monkeypatch.setenv("AFFORD_SPARK_TRANSPORT", "auto")
+    monkeypatch.setenv("AFFORD_SPARK_SOCKET", str(tmp_path / "no-such.sock"))
+    probes: list[Path] = []
+    monkeypatch.setattr(
+        protocol, "socket_is_connectable", lambda path: bool(probes.append(path)) and False
+    )
+    fake_codex(_emit_last_message(_packet()))
+    result = _run(repo)
+    assert result.exit_code == 0, result.output
+    assert len(probes) == 1, probes
+    assert _read_telemetry()[-1]["transport"] == "oneshot"

@@ -345,6 +345,50 @@ def test_telemetry_lands_under_throwaway_home(fake_codex, tmp_path: Path) -> Non
     assert str(tmp_path / "home") in str(_telemetry_path())
 
 
+def test_telemetry_records_a_codex_reported_deadline_as_a_timeout(
+    fake_codex, tmp_path: Path
+) -> None:
+    """The oneshot half of the same rule the daemon half keeps.
+
+    ``subprocess.TimeoutExpired`` is not the only way this transport runs out
+    of time: ``codex exec`` can print its own deadline and exit non-zero. One
+    predicate rules on both transports so ``status`` stays comparable across
+    ``transport`` — the reason the refusal axis was centralised first.
+    """
+    fake_codex('cat > /dev/null; echo "stream error: request timed out" >&2; exit 1\n')
+    with pytest.raises(SparkProtocolError) as caught:
+        run_spark("q", verb="locate", workdir=tmp_path, schema=LocateResult)
+    assert caught.value.status == "timeout"
+    assert _read_telemetry()[-1]["status"] == "timeout"
+
+
+def test_telemetry_records_an_ordinary_exec_failure_as_protocol(fake_codex, tmp_path: Path) -> None:
+    """Control arm: an exit-1 that reports no deadline keeps the default."""
+    fake_codex('cat > /dev/null; echo "error: sandbox denied write" >&2; exit 1\n')
+    with pytest.raises(SparkProtocolError) as caught:
+        run_spark("q", verb="locate", workdir=tmp_path, schema=LocateResult)
+    assert caught.value.status == "protocol_error"
+    assert _read_telemetry()[-1]["status"] == "protocol_error"
+
+
+def test_a_deadline_before_the_rendered_tail_is_still_a_deadline(
+    fake_codex, tmp_path: Path
+) -> None:
+    """Classify the whole report, not the 2000-char tail we render.
+
+    A chatty failure pushes its own first line out of the message the caller
+    reads; the verdict must not depend on where in stderr the deadline landed.
+    """
+    fake_codex(
+        'cat > /dev/null; echo "stream error: request timed out" >&2; '
+        'head -c 4000 /dev/zero | tr "\\0" "x" >&2; exit 1\n'
+    )
+    with pytest.raises(SparkProtocolError) as caught:
+        run_spark("q", verb="locate", workdir=tmp_path, schema=LocateResult)
+    assert "timed out" not in str(caught.value), "the tail must not carry the marker"
+    assert caught.value.status == "timeout"
+
+
 def test_telemetry_records_pool_refusal(fake_codex, tmp_path: Path) -> None:
     fake_codex('cat > /dev/null; echo "429 usage limit reached" >&2; exit 1\n')
     with pytest.raises(SparkUnavailableError, match="refused the call"):

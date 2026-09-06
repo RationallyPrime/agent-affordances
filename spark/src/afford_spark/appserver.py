@@ -19,7 +19,12 @@ from pathlib import Path
 from typing import Any
 
 from afford_spark.auth import classify_code, classify_refusal, refusal_message
-from afford_spark.engine import SPARK_MODEL, SparkProtocolError, SparkUnavailableError
+from afford_spark.engine import (
+    SPARK_MODEL,
+    SparkProtocolError,
+    SparkUnavailableError,
+    error_status,
+)
 
 # Methods tried in order; a method-not-found is not an auth failure.
 AUTH_METHODS = ("account/read", "account/rateLimits/read")
@@ -243,7 +248,9 @@ class CodexAppServer:
             message = waiter.get(timeout=max(0.05, timeout_s))
         except queue.Empty as exc:
             self._pending.pop(ident, None)
-            raise SparkProtocolError(f"codex app-server {method} timed out") from exc
+            raise SparkProtocolError(
+                f"codex app-server {method} timed out", status="timeout"
+            ) from exc
         if message.get("error"):
             raise _rpc_error(method, message["error"])
         result = message.get("result")
@@ -268,11 +275,13 @@ class CodexAppServer:
             self._raise_if_dead()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise SparkProtocolError(f"timed out waiting for {method}")
+                raise SparkProtocolError(f"timed out waiting for {method}", status="timeout")
             try:
                 message = self._events.get(timeout=remaining)
             except queue.Empty as exc:
-                raise SparkProtocolError(f"timed out waiting for {method}") from exc
+                raise SparkProtocolError(
+                    f"timed out waiting for {method}", status="timeout"
+                ) from exc
             if message.get("method") != method:
                 continue
             if (turn_id or thread_id) and not (
@@ -489,6 +498,14 @@ def _agent_text(turn: dict[str, Any]) -> str | None:
 
 
 def _rpc_error(method: str, error: object) -> SparkProtocolError | SparkUnavailableError:
+    """Rule on a server-reported error once, on both axes, from the raw report.
+
+    A refusal outranks a deadline: a pool that says "rate limit; the request
+    timed out" is terminal with a named remedy, and that is what the caller
+    needs to hear. Anything else carries the deadline verdict as ``status``,
+    because a local queue expiry is not the only way this call runs out of
+    time — the app-server can report the deadline itself.
+    """
     if isinstance(error, dict):
         message = str(error.get("message", error))
         code = error.get("code")
@@ -496,11 +513,12 @@ def _rpc_error(method: str, error: object) -> SparkProtocolError | SparkUnavaila
         kind = classify_code(code) or classify_refusal(message)
         if kind is not None:
             return SparkUnavailableError(refusal_message(kind), kind=kind)
-        return SparkProtocolError(text)
-    kind = classify_refusal(str(error))
+        return SparkProtocolError(text, status=error_status(message))
+    message = str(error)
+    kind = classify_refusal(message)
     if kind is not None:
         return SparkUnavailableError(refusal_message(kind), kind=kind)
-    return SparkProtocolError(f"codex {method} error: {error}")
+    return SparkProtocolError(f"codex {method} error: {message}", status=error_status(message))
 
 
 def _is_missing_method(text: str) -> bool:

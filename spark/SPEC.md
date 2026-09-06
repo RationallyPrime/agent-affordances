@@ -52,9 +52,10 @@ triage     structured compression of logs, diffs, and findings
 but these three establish whether Spark deserves the rest.)
 
 Status 2026-09-06: the three are shipped and working. `slice` followed as the
-fourth verb — coordinate-audited by the wrapper (allowlist + end-of-file),
-`--render` emits the real span bytes. Remaining five verbs, the quota
-scavenger, and the eval corpus are unbuilt.
+fourth verb — coordinate-audited by the wrapper (allowlist, end-of-file, and
+an `owner` span at the declared seam), `--render` emits the real span bytes
+losslessly or refuses. Remaining five verbs, the quota scavenger, and the eval
+corpus are unbuilt.
 
 ### Output contracts (primitive on the model side, typed on ours)
 
@@ -142,8 +143,10 @@ Spark never touches a seat's live checkout.
   input hash, model, pool (`spark`), latency, output hash, changed files
   (wrapper-audited on `transform`; null otherwise), result state, subsequent
   verification outcome (always null this slice — a later correlator fills it),
-  `transport` (`oneshot` | `daemon`). A few hundred calls tell us empirically
-  which verbs Spark deserves.
+  `transport` (`oneshot` | `daemon`). Resolving `auto` is a connect to the
+  daemon socket, so it happens **once** per invocation: a verb whose wrapper
+  owns the record takes the engine's selection rather than probing again to
+  stamp it. A few hundred calls tell us empirically which verbs Spark deserves.
 
 ## Warm daemon (`afford-sparkd`) — second slice
 
@@ -173,7 +176,11 @@ second slice keeps the wrapper contract and amortizes boot:
   when the number is a count, because a refusal that falls through is retried
   against a metered pool while a false refusal is loud and terminal. The
   daemon's wire kind is the classifier's typed verdict, never re-derived from
-  the message text.
+  the message text. The deadline axis is ruled on the same way and in the same
+  place: the local queue wait is not the only way a call runs out of time, so
+  a deadline the app-server *reports* — as a JSON-RPC error, or on `codex
+  exec`'s stderr — is classified by the raiser and carried as `timeout`. A
+  refusal outranks a deadline, being terminal with a named remedy.
 - A warm call is five JSON-RPC round trips against the held app-server, all
   inside the serial lock: `account/read` (re-check so mid-life expiry fails
   loud before a turn is spent) + `thread/start` + `turn/start` +
