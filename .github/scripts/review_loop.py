@@ -594,6 +594,26 @@ DEFAULT_BURN_ACTOR = "talos"
 # repository fills.  One constant so the wake and the chase that follows it
 # cannot address different seats.
 RETROSPECTIVE_ACTOR = "theoros"
+# ...and yet the SEAT is a cast (Hákon's ruling, 2026-09-07): for the
+# thirteen-lanes crunch Theoros's exhaustion testimony is on hold, so
+# ``REVIEW_RETROSPECTIVE_ACTOR`` names the seat (default: the constant above)
+# or one of ``RETROSPECTIVE_HOLD_VALUES`` to post the gate and wake nobody.
+RETROSPECTIVE_ACTOR_ENV = "REVIEW_RETROSPECTIVE_ACTOR"
+RETROSPECTIVE_HOLD_VALUES = frozenset({"none", "held", "off"})
+# The burn cast became a roster the same day (Talos dry for a day while the
+# belt kept minting to it): ``REVIEW_BURN_ROSTER`` lists, in preference
+# order, every seat that may burn, and the usage meter casts the first one
+# whose pool reads available (the vendored seat-router below).  Unset, the
+# single ``REVIEW_BURN_ACTOR`` cast stands, byte for byte.
+BURN_ROSTER_ENV = "REVIEW_BURN_ROSTER"
+BURN_THRESHOLD_ENV = "REVIEW_BURN_THRESHOLD"
+SEAT_USAGE_PROFILES_ENV = "REVIEW_SEAT_USAGE_PROFILES"
+# A burn wake carries the edge's per-delivery effort overlay (hive#49): a
+# PR label ``effort:<tier>`` wins, else ``REVIEW_BURN_EFFORT``; the tier
+# vocabulary is the union of the provider ladders and the edge clamps.
+BURN_EFFORT_ENV = "REVIEW_BURN_EFFORT"
+EFFORT_LABEL_PREFIX = "effort:"
+WAKE_EFFORT_TIERS = ("low", "medium", "high", "xhigh", "max", "ultra")
 FINDING_IDENTITY_MAX = 96
 _IDENTITY_NOISE = re.compile(
     r"</?sub>|!\[[^\]]*\]\([^)]*\)|\[P[123]-[A-Za-z]+\]|\*{1,2}|_{1,2}"
@@ -3787,6 +3807,15 @@ def exhaustion_gate(
         "3. close or defer the PR.\n\n"
         "A later merge still requires an exact-head clean review, green required "
         "checks, no conflicts, and separate merge authority."
+        + (
+            ""
+            if retrospective_actor() is not None
+            else (
+                f"\n\nRetrospective: held — `{RETROSPECTIVE_ACTOR_ENV}` names no seat "
+                "(Hákon's ruling, 2026-09-07: no exhaustion testimony during the "
+                "thirteen-lanes crunch). The gate stands on its own; nobody is woken."
+            )
+        )
     )
 
 
@@ -4128,6 +4157,8 @@ def build_burn_messages(
     review_round: int,
     history: Sequence[Mapping[str, Any]] | None = None,
     substitute: Mapping[str, Any] | None = None,
+    cast: tuple[str, str] | None = None,
+    effort: str | None = None,
 ) -> list[str]:
     if substitute is None:
         counts = severity_counts(findings)
@@ -4156,10 +4187,15 @@ def build_burn_messages(
         if history
         else "## Finding digest\n"
     )
-    actor = burn_actor()
+    actor, cast_note = cast if cast is not None else (burn_actor(), "")
+    # The bare `Effort:` line is the edge's exact grammar (hive#49); it sits
+    # directly under the envelope so no digest line can be mistaken for it.
+    effort_line = f"Effort: {effort}\n" if effort else ""
+    cast_paragraph = f"{cast_note}\n" if cast_note else ""
     header = (
-        f"WAKE: {actor}\n\n"
+        f"WAKE: {actor}\n{effort_line}\n"
         f"Burn seat `{actor}` — load skill `talos-burn` and burn these findings.\n\n"
+        f"{cast_paragraph}"
         f"{SCOPE_TEST_BURNER}\n\n"
         f"Review-loop hook: {verdict} {MERGE_REGIME}\n\n"
         f"PR: {pr_url}\n"
@@ -4345,10 +4381,12 @@ def build_retrospective_messages(
     author_actor: str,
     review_round: int,
     substitute: Mapping[str, Any] | None = None,
+    actor: str | None = None,
 ) -> list[str]:
-    """Ask Theoros why burning could not close this PR, and what generalises."""
+    """Ask the retrospective seat why burning could not close this PR, and what generalises."""
+    seat = actor or RETROSPECTIVE_ACTOR
     header = (
-        f"WAKE: {RETROSPECTIVE_ACTOR}\n\n"
+        f"WAKE: {seat}\n\n"
         "Review-loop hook: the bounded automatic loop is exhausted — "
         f"{review_round} reviewed head(s) consumed against an automatic bound "
         f"of {MAX_REVIEW_ROUNDS}, and burning did not close this PR. You are "
@@ -4497,6 +4535,24 @@ def publish_exhaustion_retrospective(
     asked, and the chase leg dates its window from it, so a receipt written
     for a wake nobody received would hound a seat that owes nothing.
     """
+    actor = retrospective_actor()
+    if actor is None:
+        # The hold (Hákon, 2026-09-07): the gate stands on its own and nobody
+        # is asked, so no receipt is written and no chase can ever start.
+        print(
+            f"retrospective held for {repository}#{pr_number} (head={head_sha}): "
+            f"{RETROSPECTIVE_ACTOR_ENV} names no seat; the gate stands, nobody is woken"
+        )
+        belt().event(
+            "belt.retrospective.held",
+            **{
+                "logfire.msg": f"#{pr_number} retrospective held",
+                "pull_request": pr_number,
+                "head_sha": head_sha,
+                "rounds_consumed": len(history),
+            },
+        )
+        return
     post_threaded_messages(
         slack,
         build_retrospective_messages(
@@ -4513,6 +4569,7 @@ def publish_exhaustion_retrospective(
             author_actor=author_actor,
             review_round=review_round,
             substitute=substitute,
+            actor=actor,
         ),
         github=github,
         repository=repository,
@@ -4521,7 +4578,7 @@ def publish_exhaustion_retrospective(
         decision="exhaustion_retrospective",
     )
     print(
-        f"woke {RETROSPECTIVE_ACTOR} for {repository}#{pr_number} retrospective "
+        f"woke {actor} for {repository}#{pr_number} retrospective "
         f"(rounds={len(history)})"
     )
     # Once per head, however many times the wake is re-sent.  The retry
@@ -4540,7 +4597,7 @@ def publish_exhaustion_retrospective(
         return
     github.post(
         f"issues/{pr_number}/comments",
-        {"body": retrospective_wake_receipt_body(head_sha, RETROSPECTIVE_ACTOR)},
+        {"body": retrospective_wake_receipt_body(head_sha, actor)},
     )
 
 
@@ -4913,6 +4970,7 @@ def route_review(event: Mapping[str, Any] | None = None) -> None:
         latest_results=latest_result_by_head(result_events),
         issue_comments=conversation_comments,
     )
+    cast = burn_cast()
     messages = build_burn_messages(
         findings=findings,
         review_state=review_state,
@@ -4926,6 +4984,8 @@ def route_review(event: Mapping[str, Any] | None = None) -> None:
         author_actor=author_actor,
         review_round=review_round,
         history=history,
+        cast=cast,
+        effort=burn_effort(pr_labels(pr_state)),
     )
     belt_verdict(
         pr_number=pr_number,
@@ -4962,7 +5022,7 @@ def route_review(event: Mapping[str, Any] | None = None) -> None:
         chunks=len(messages),
     ):
         print(
-            f"woke {burn_actor()} for {repository}#{pr_number} "
+            f"woke {cast[0]} for {repository}#{pr_number} "
             f"(findings={len(findings)}, author={author_actor}, "
             f"messages={len(messages)})"
         )
@@ -5515,6 +5575,7 @@ def route_substitute_verdict(event: Mapping[str, Any]) -> None:
             ),
             issue_comments=[*conversation_comments, comment],
         )
+        cast = burn_cast()
         messages = build_burn_messages(
             findings=[],
             review_state=f"substitute-findings:{verdict['actor']}",
@@ -5533,6 +5594,8 @@ def route_substitute_verdict(event: Mapping[str, Any]) -> None:
                 "counts": verdict["counts"],
                 "body": str(comment.get("body") or ""),
             },
+            cast=cast,
+            effort=burn_effort(pr_labels(pr_state)),
         )
         counts = verdict["counts"]
         belt_verdict(
@@ -5573,7 +5636,7 @@ def route_substitute_verdict(event: Mapping[str, Any]) -> None:
             chunks=len(messages),
         ):
             print(
-                f"woke {burn_actor()} for {repository}#{pr_number} "
+                f"woke {cast[0]} for {repository}#{pr_number} "
                 f"(substitute findings by {verdict['actor']}, "
                 f"counts={verdict['counts']}, messages={len(messages)})"
             )
@@ -5912,6 +5975,7 @@ def retrospective_chase_wake_message(
     head_sha: str,
     requested_at: datetime,
     pr_state: str = "open",
+    actor: str = RETROSPECTIVE_ACTOR,
 ) -> str:
     """Re-ask for a requested retrospective that never reached the PR.
 
@@ -5937,7 +6001,7 @@ def retrospective_chase_wake_message(
         )
     )
     return (
-        f"WAKE: {RETROSPECTIVE_ACTOR}\n\n"
+        f"WAKE: {actor}\n\n"
         "Review-loop hook: an exhaustion retrospective was requested from you "
         f"at `{stamp}` and no verdict has reached the PR. This is a "
         "redelivery of that one request, not a second one: it carries no "
@@ -5960,7 +6024,9 @@ def retrospective_chase_wake_message(
     )
 
 
-def retrospective_chase_comment_body(head_sha: str, attempt: int) -> str:
+def retrospective_chase_comment_body(
+    head_sha: str, attempt: int, actor: str = RETROSPECTIVE_ACTOR
+) -> str:
     """The durable record of one chase; attempt ``RETROSPECTIVE_CHASE_ATTEMPTS`` names the gap.
 
     The last attempt is deliberately the loud one (R-3): a retrospective that
@@ -5972,7 +6038,7 @@ def retrospective_chase_comment_body(head_sha: str, attempt: int) -> str:
     if attempt < RETROSPECTIVE_CHASE_ATTEMPTS:
         return (
             "Review-loop: the exhaustion retrospective requested for head "
-            f"`{head_sha}` has not been posted here; `{RETROSPECTIVE_ACTOR}` "
+            f"`{head_sha}` has not been posted here; `{actor}` "
             f"was re-woken once (attempt {attempt} of "
             f"{RETROSPECTIVE_CHASE_ATTEMPTS}). Attention only — no review "
             "round, no repair authority, no merge authority.\n"
@@ -5980,7 +6046,7 @@ def retrospective_chase_comment_body(head_sha: str, attempt: int) -> str:
         )
     return (
         "## Exhaustion retrospective not delivered\n\n"
-        f"The review loop asked `{RETROSPECTIVE_ACTOR}` for a structural "
+        f"The review loop asked `{actor}` for a structural "
         f"retrospective on head `{head_sha}` and re-asked once. No verdict "
         "carrying the retrospective marker has reached this PR, so the "
         "testimony behind this PR's exhaustion is unrecorded on the evidence "
@@ -6041,6 +6107,11 @@ def chase_undelivered_retrospective(
     It never gates, repairs, re-reviews, merges, or summons a reviewer
     (KRA-1029's charter); it asks only whether the verdict was delivered.
     """
+    actor = retrospective_actor()
+    if actor is None:
+        # Held: no testimony is owed, so a receipt from before the hold is not
+        # chased either — chasing would hound a seat the ruling excused.
+        return 0
     if retrospective_delivered(comments, head_sha):
         return 0
     requested_at = retrospective_requested_at(comments, head_sha)
@@ -6176,11 +6247,12 @@ def chase_undelivered_retrospective(
                 head_sha=head_sha,
                 requested_at=requested_at,
                 pr_state=pr_state,
+                actor=actor,
             )
         )
     github.post(
         f"issues/{pr_number}/comments",
-        {"body": retrospective_chase_comment_body(head_sha, attempt)},
+        {"body": retrospective_chase_comment_body(head_sha, attempt, actor)},
     )
     print(
         f"chased undelivered retrospective for {repository}#{pr_number} "
@@ -6195,7 +6267,7 @@ def chase_undelivered_retrospective(
             ),
             "pull_request": pr_number,
             "head_sha": head_sha,
-            "retrospective_actor": RETROSPECTIVE_ACTOR,
+            "retrospective_actor": actor,
             "attempt": attempt,
             "max_attempts": RETROSPECTIVE_CHASE_ATTEMPTS,
             "pull_request_state": pr_state,
@@ -6600,6 +6672,8 @@ def redeliver_standing_wake(
             findings=findings,
             review_state=review_state,
             substitute=substitute_payload,
+            cast=burn_cast(),
+            effort=burn_effort(pr_labels(pull_request)),
             pr_url=pr_url,
             branch=branch,
             head_sha=head_sha,
@@ -6684,18 +6758,17 @@ def redeliver_standing_wake(
     return True
 
 
-def usage_meter_reading() -> dict[str, Any] | None:
-    """Read the Codex pool from the AI-usage aggregator; ``None`` means absent.
+def usage_snapshot() -> Mapping[str, Any] | None:
+    """One ``GET /v3/usage`` against the AI-usage aggregator; ``None`` means absent.
 
-    The meter is advisory routing input, never a gate: ANY failure — unset
-    env, network, non-2xx, unparseable body, unknown pool — collapses to
-    ``None`` and the caller behaves exactly as it did before the meter
-    existed.  A dead meter must not add a way for the belt to hang.  The
-    bearer token is used and never returned, logged, or embedded in output.
+    The fetch primitive under every meter read (the Codex find-half meter and
+    the burn cast).  Advisory: unset env, network, non-2xx and an unparseable
+    body all collapse to ``None`` and the caller behaves as if no meter
+    existed.  The bearer token is used and never returned, logged or
+    embedded in output.
     """
     base_url = os.environ.get("AI_USAGE_URL", "").strip().rstrip("/")
     token = os.environ.get("AI_USAGE_READ_TOKEN", "").strip()
-    pool_name = os.environ.get("AI_USAGE_CODEX_POOL", "").strip()
     if not base_url or not token:
         return None
     request = urllib.request.Request(
@@ -6712,7 +6785,23 @@ def usage_meter_reading() -> dict[str, Any] | None:
             payload = json.loads(response.read().decode("utf-8"))
     except Exception:  # noqa: BLE001 - advisory meter: every failure is "absent".
         return None
-    pools = payload.get("pools") if isinstance(payload, Mapping) else None
+    return payload if isinstance(payload, Mapping) else None
+
+
+def usage_meter_reading() -> dict[str, Any] | None:
+    """Read the Codex pool from the AI-usage aggregator; ``None`` means absent.
+
+    The meter is advisory routing input, never a gate: ANY failure — unset
+    env, network, non-2xx, unparseable body, unknown pool — collapses to
+    ``None`` and the caller behaves exactly as it did before the meter
+    existed.  A dead meter must not add a way for the belt to hang.  The
+    bearer token is used and never returned, logged, or embedded in output.
+    """
+    pool_name = os.environ.get("AI_USAGE_CODEX_POOL", "").strip()
+    payload = usage_snapshot()
+    if payload is None:
+        return None
+    pools = payload.get("pools")
     if not isinstance(pools, Sequence):
         return None
     # Schema-3 pool selection: the pool `id` is an opaque identity digest, so
@@ -6761,6 +6850,189 @@ def codex_threshold() -> float:
     return value
 
 
+# --- seat-router (vendored) ------------------------------------------------
+# One fold, two callers: the review loop casts its burn seat with it and the
+# Linear dispatcher casts a ticket's default seat with it.  Both scripts are
+# single-file deployables, so the block is vendored verbatim into each;
+# tests/test_seat_router_vendored.py fails the moment the two copies differ.
+#
+# The input is the AI-usage aggregator's schema-3 ``/v3/usage`` snapshot.  A
+# seat is joined to a pool through the pool's observed profiles: the profile
+# id the collector publishes is ``<seat>-<edge>`` (``gnomon-cx53``,
+# ``talos-cx43``, ``fable-laptop``), so the join is ``id == seat`` or
+# ``id.startswith(seat + "-")``; a seat whose collector names its profile
+# differently is declared once as ``seat=profile-id`` in the override map.
+# A seat no profile matches is *unknown*, never available and never
+# excluded — unobserved is not the same evidence as exhausted (Talos, 2026-09-07:
+# a burn seat that was dry for a day while the belt kept minting to it).
+SEAT_AVAILABILITY_THRESHOLD_DEFAULT = 0.9
+_SEAT_PROFILE_STATE_RANK = {"current": 0, "recent": 1, "stale": 2}
+
+
+def seat_usage_profiles(raw: str) -> dict[str, str]:
+    """``seat=profile-id,seat2=profile-id2`` → ``{seat: profile-id}``.
+
+    Malformed entries (no ``=``, empty side) are dropped; the map is advisory
+    routing input and a typo must not raise inside a wake leg.
+    """
+    profiles: dict[str, str] = {}
+    for entry in raw.split(","):
+        seat, separator, profile_id = entry.strip().partition("=")
+        seat = seat.strip().lower()
+        profile_id = profile_id.strip()
+        if separator and seat and profile_id:
+            profiles[seat] = profile_id
+    return profiles
+
+
+def _seat_matches_profile(
+    seat: str, profile: Mapping[str, Any], override: str | None
+) -> bool:
+    profile_id = str(profile.get("id") or "")
+    if override is not None:
+        return profile_id == override
+    label = str(profile.get("label") or "").strip().lower()
+    return profile_id == seat or profile_id.startswith(f"{seat}-") or label == seat
+
+
+def _pool_peak_window(pool: Mapping[str, Any]) -> tuple[float | None, str | None]:
+    """The most constrained window of a pool: ``(utilization, resets_at)``."""
+    utilization: float | None = None
+    resets_at: str | None = None
+    windows = pool.get("windows")
+    if not isinstance(windows, Sequence):
+        return None, None
+    for window in windows:
+        if not isinstance(window, Mapping):
+            continue
+        value = window.get("utilization")
+        if not isinstance(value, (int, float)) or not 0 <= float(value) <= 1:
+            continue
+        if utilization is None or float(value) > utilization:
+            utilization = float(value)
+            resets = window.get("resets_at")
+            resets_at = str(resets) if resets else None
+    return utilization, resets_at
+
+
+def seat_availability(
+    snapshot: Mapping[str, Any] | None,
+    roster: Sequence[str],
+    *,
+    threshold: float = SEAT_AVAILABILITY_THRESHOLD_DEFAULT,
+    profiles: Mapping[str, str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Per roster seat: ``state`` ∈ available|exhausted|unavailable|unknown.
+
+    ``available``: the joined pool reports ``status == "ok"``, its observing
+    profile is not ``stale``, and the peak window sits under ``threshold``.
+    ``exhausted``: the peak window is at or over ``threshold`` (``resets_at``
+    says when it clears).  ``unavailable``: the pool's status is anything but
+    ``ok`` (``auth_expired``, ``billing_unavailable``, ``error``, ``stale``) or
+    the profile is stale.  ``unknown``: no profile in the snapshot joins the
+    seat.  ``detail`` is a one-clause human reading for the wake (R-3).
+    """
+    override = dict(profiles or {})
+    states: dict[str, dict[str, Any]] = {
+        seat: {
+            "state": "unknown",
+            "utilization": None,
+            "resets_at": None,
+            "detail": "usage unobserved",
+        }
+        for seat in roster
+    }
+    pools = snapshot.get("pools") if isinstance(snapshot, Mapping) else None
+    if not isinstance(pools, Sequence):
+        return states
+    best_rank: dict[str, int] = {}
+    for pool in pools:
+        if not isinstance(pool, Mapping):
+            continue
+        pool_profiles = pool.get("profiles")
+        if not isinstance(pool_profiles, Sequence):
+            continue
+        status = str(pool.get("status") or "unknown")
+        utilization, resets_at = _pool_peak_window(pool)
+        for profile in pool_profiles:
+            if not isinstance(profile, Mapping):
+                continue
+            profile_state = str(profile.get("state") or "current")
+            rank = _SEAT_PROFILE_STATE_RANK.get(profile_state, 3)
+            for seat in roster:
+                if not _seat_matches_profile(seat, profile, override.get(seat)):
+                    continue
+                if seat in best_rank and best_rank[seat] <= rank:
+                    continue
+                best_rank[seat] = rank
+                if status != "ok":
+                    reading = {"state": "unavailable", "detail": status}
+                elif profile_state == "stale":
+                    reading = {"state": "unavailable", "detail": "profile stale"}
+                elif utilization is None:
+                    reading = {"state": "unknown", "detail": "no usage window"}
+                elif utilization >= threshold:
+                    reading = {
+                        "state": "exhausted",
+                        "detail": f"exhausted {utilization:.2f}"
+                        + (f" (resets {resets_at})" if resets_at else ""),
+                    }
+                else:
+                    reading = {"state": "available", "detail": f"ok {utilization:.2f}"}
+                states[seat] = {
+                    **reading,
+                    "utilization": utilization,
+                    "resets_at": resets_at,
+                }
+    return states
+
+
+def cast_seat(
+    roster: Sequence[str],
+    snapshot: Mapping[str, Any] | None,
+    *,
+    cast: str,
+    threshold: float = SEAT_AVAILABILITY_THRESHOLD_DEFAULT,
+    profiles: Mapping[str, str] | None = None,
+) -> tuple[str, str]:
+    """``(actor, note)``: the first roster seat the meter reads as available.
+
+    A roster of at most one seat, or an absent snapshot, is the pre-meter
+    behaviour: the cast seat, no note.  Otherwise roster order is preference:
+    the first ``available`` seat wins; with none, the first ``unknown`` seat
+    (unobserved beats exhausted); with none of those either, the cast seat —
+    named as a fallback, so a wake to a seat the meter could not clear is
+    visibly the meter's failure, not its choice.  The note is the R-3
+    publication of the reading and ends in a newline; an empty note means the
+    meter did not speak.
+    """
+    ordered = [
+        seat for seat in dict.fromkeys(seat.strip().lower() for seat in roster) if seat
+    ]
+    if len(ordered) <= 1 or snapshot is None:
+        return cast, ""
+    states = seat_availability(
+        snapshot, ordered, threshold=threshold, profiles=profiles
+    )
+    reading = " · ".join(f"{seat} {states[seat]['detail']}" for seat in ordered)
+    for seat in ordered:
+        if states[seat]["state"] == "available":
+            return seat, f"Cast by the meter: {reading} → {seat}.\n"
+    for seat in ordered:
+        if states[seat]["state"] == "unknown":
+            return (
+                seat,
+                f"Cast by the meter: {reading} → {seat} (unobserved; no seat reads available).\n",
+            )
+    return cast, (
+        f"Cast by the meter: {reading} → every roster seat is exhausted or "
+        f"unavailable; falling back to the cast seat {cast}.\n"
+    )
+
+
+# --- end seat-router (vendored) --------------------------------------------
+
+
 def normalize_substitute_actor(raw: str) -> str | None:
     """Map a configured actor onto the verdict-marker grammar, or ``None``.
 
@@ -6805,6 +7077,126 @@ def burn_actor() -> str:
             "unroutable burn seat"
         )
     return actor
+
+
+def retrospective_actor() -> str | None:
+    """The seat the exhaustion gate wakes, or ``None`` while the hook is held.
+
+    Unset names the charter seat (``RETROSPECTIVE_ACTOR``).  A hold value
+    posts the human gate and wakes nobody — Hákon's ruling of 2026-09-07 for
+    the thirteen-lanes crunch.  Anything else is a seat name under the same
+    grammar the other two casts use, refused here rather than dead-lettered.
+    """
+    raw = os.environ.get(RETROSPECTIVE_ACTOR_ENV, "").strip()
+    if not raw:
+        return RETROSPECTIVE_ACTOR
+    if raw.lower() in RETROSPECTIVE_HOLD_VALUES:
+        return None
+    actor = normalize_substitute_actor(raw)
+    if actor is None:
+        raise ValueError(
+            f"{RETROSPECTIVE_ACTOR_ENV}={raw!r} is outside the actor grammar "
+            "[a-z0-9-]+ after normalization and is not a hold value "
+            f"({'|'.join(sorted(RETROSPECTIVE_HOLD_VALUES))}); refusing to "
+            "wake an unroutable retrospective seat"
+        )
+    return actor
+
+
+def burn_roster() -> tuple[str, ...]:
+    """``REVIEW_BURN_ROSTER`` in preference order; empty when unset.
+
+    Each name goes through the actor grammar; an unroutable name is refused
+    for the same reason ``burn_actor`` refuses one.
+    """
+    seats: list[str] = []
+    for part in os.environ.get(BURN_ROSTER_ENV, "").split(","):
+        if not part.strip():
+            continue
+        actor = normalize_substitute_actor(part)
+        if actor is None:
+            raise ValueError(
+                f"{BURN_ROSTER_ENV} entry {part!r} is outside the actor grammar "
+                "[a-z0-9-]+ after normalization; refusing an unroutable roster"
+            )
+        if actor not in seats:
+            seats.append(actor)
+    return tuple(seats)
+
+
+def burn_threshold() -> float:
+    raw = os.environ.get(BURN_THRESHOLD_ENV, "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return SEAT_AVAILABILITY_THRESHOLD_DEFAULT
+    if not 0 < value <= 1:
+        return SEAT_AVAILABILITY_THRESHOLD_DEFAULT
+    return value
+
+
+def burn_cast() -> tuple[str, str]:
+    """``(actor, note)`` for the next burn wake: the roster read by the meter.
+
+    No roster, or no meter, is the static cast with an empty note — the
+    wake is byte-identical to the pre-roster belt.
+    """
+    cast = burn_actor()
+    roster = burn_roster()
+    if len(roster) <= 1:
+        return cast, ""
+    return cast_seat(
+        roster,
+        usage_snapshot(),
+        cast=cast,
+        threshold=burn_threshold(),
+        profiles=seat_usage_profiles(os.environ.get(SEAT_USAGE_PROFILES_ENV, "")),
+    )
+
+
+def pr_labels(pull_request: Mapping[str, Any] | None) -> list[str]:
+    """Label names on a PR object; tolerant of the list shape and of ``None``."""
+    if not isinstance(pull_request, Mapping):
+        return []
+    labels = pull_request.get("labels")
+    if not isinstance(labels, Sequence):
+        return []
+    return [
+        str(label.get("name") or "")
+        for label in labels
+        if isinstance(label, Mapping) and label.get("name")
+    ]
+
+
+def burn_effort(labels: Sequence[str]) -> str | None:
+    """The ``Effort:`` tier a burn wake carries, or ``None`` for no overlay.
+
+    Exactly one valid ``effort:<tier>`` PR label wins; two distinct tiers are
+    a human ambiguity and yield no overlay (named on stdout, never guessed).
+    With no label, ``REVIEW_BURN_EFFORT`` applies when it names a tier.
+    """
+    requested = sorted(
+        {
+            name[len(EFFORT_LABEL_PREFIX) :].strip().lower()
+            for name in labels
+            if name.lower().startswith(EFFORT_LABEL_PREFIX)
+        }
+    )
+    valid = [tier for tier in requested if tier in WAKE_EFFORT_TIERS]
+    if len(valid) > 1:
+        print(f"effort labels ambiguous ({', '.join(valid)}); no overlay applied")
+        return None
+    if len(valid) == 1:
+        return valid[0]
+    raw = os.environ.get(BURN_EFFORT_ENV, "").strip().lower()
+    if not raw:
+        return None
+    if raw not in WAKE_EFFORT_TIERS:
+        print(
+            f"{BURN_EFFORT_ENV}={raw!r} is not a tier ({'|'.join(WAKE_EFFORT_TIERS)}); ignored"
+        )
+        return None
+    return raw
 
 
 def quota_refusal_is_latest_codex_signal(
