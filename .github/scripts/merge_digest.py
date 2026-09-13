@@ -27,7 +27,7 @@ account in front of him while a revert is still one command.
 The gate half of every entry is read through ``review_loop`` — the same
 resolution the review-loop hook publishes.  Two audit trails that can disagree
 are worse than one, so this file contains no second implementation of exact-head
-verdict resolution, finding counts, or round numbering.
+verdict resolution, finding counts, round numbering, or exhaustion.
 
 Standard library only, like its sibling: the cx53 self-hosted runners have a
 deliberately small tool surface.
@@ -534,18 +534,10 @@ def gate_report(
     burned = sum(
         row["counts"]["total"] for row in history if row["head"] != merged_head
     )
-    # The merged head is checked explicitly: a fourth unreviewed head merged by
-    # human override never appears in ``history`` (it has no Codex result
-    # event), yet its exhaustion marker is precisely the gate fact to report.
-    marker_heads = {row["head"] for row in history} | (
-        {merged_head} if merged_head else set()
-    )
-    exhausted = any(
-        review_loop.marker_comment_exists(
-            issue_comments, review_loop.exhaustion_marker(head)
-        )
-        for head in marker_heads
-    )
+    # Same predicate as ``pr_belt_summary``: any trusted marker the helper
+    # still recognises (legacy form, or a versioned marker under an earlier
+    # round bound). Regenerating today's writer form here is a second reader.
+    exhausted = review_loop.exhaustion_gate_recorded(issue_comments)
     return {
         "merged_head": merged_head,
         "rounds": len(history),
