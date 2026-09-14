@@ -52,6 +52,7 @@ linear-reads issues                   # sweep, defaults to $LINEAR_TEAM
 linear-reads issues --state started --assignee me --updated-since 7d
 linear-reads issues --label bug --project "Wake router" --query dedupe --limit 20
 linear-reads comments KRA-123
+linear-reads relations KRA-123 --open-only   # one line per live blocker
 linear-reads teams / states / labels / projects / users   # metadata lookups
 ```
 
@@ -59,6 +60,14 @@ Filters combine with AND. `--assignee me` uses the API key's identity.
 `--updated-since` accepts `30m`, `12h`, `7d`, `2w`, or an ISO date.
 `issue --comments` follows the complete comment connection; the standalone
 `comments` command uses its explicit `--limit` (default 50).
+
+`relations` prints one line per relation — columns `kind, id, state, title`,
+`kind` one of `blocked-by, blocks, related, duplicate-of, duplicate`, in that
+order. Both relation connections are followed to completion. `--open-only`
+drops relations whose workflow-state *type* is `completed` or `canceled`
+(Duplicate is a canceled state), so renamed closed states stay closed and "is
+anything still blocking this?" costs one line per live blocker instead of a
+full MCP payload.
 
 ## Output
 

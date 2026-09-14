@@ -314,6 +314,132 @@ def test_comments_jsonl(runner, fake_linear) -> None:
     }
 
 
+# --- relations ---
+
+
+def relations_responder(
+    relations: list[list[dict[str, Any]]], inverse: list[list[dict[str, Any]]]
+) -> Any:
+    """Serve each relation connection as its own cursor-paginated page list."""
+
+    def respond(payload: dict[str, Any]) -> dict[str, Any]:
+        is_inverse = "inverseRelations(" in payload["query"]
+        connection, pages = (
+            ("inverseRelations", inverse) if is_inverse else ("relations", relations)
+        )
+        after = payload["variables"].get("after")
+        index = 0 if after is None else int(after.rsplit("-", 1)[1])
+        has_next = index + 1 < len(pages)
+        cursor = f"{connection}-{index + 1}" if has_next else None
+        return {
+            "data": {
+                "issue": {
+                    connection: {
+                        "nodes": pages[index],
+                        "pageInfo": {"hasNextPage": has_next, "endCursor": cursor},
+                    }
+                }
+            }
+        }
+
+    return respond
+
+
+def relation(kind: str, identifier: str, title: str, state: str, state_type: str) -> dict[str, Any]:
+    ref = {"identifier": identifier, "title": title, "state": {"name": state, "type": state_type}}
+    return {"type": kind, "relatedIssue": ref}
+
+
+def inverse_relation(
+    kind: str, identifier: str, title: str, state: str, state_type: str
+) -> dict[str, Any]:
+    ref = {"identifier": identifier, "title": title, "state": {"name": state, "type": state_type}}
+    return {"type": kind, "issue": ref}
+
+
+def test_relations_orders_and_labels_kinds(runner, fake_linear) -> None:
+    relations = [
+        relation("related", "KRA-5", "Sibling", "Todo", "unstarted"),
+        relation("blocks", "KRA-6", "Downstream", "Todo", "unstarted"),
+        relation("duplicate", "KRA-7", "Dupe", "Duplicate", "canceled"),
+    ]
+    inverse = [
+        inverse_relation("blocks", "KRA-4", "Blocker", "In Progress", "started"),
+        inverse_relation("duplicate", "KRA-8", "Original", "Done", "completed"),
+    ]
+    fake = fake_linear(relations_responder([relations], [inverse]))
+    result = runner.invoke(app, ["relations", "KRA-9", "--format", "table"])
+    assert result.exit_code == 0
+    lines = result.output.splitlines()
+    assert lines == [
+        "blocked-by    KRA-4  In Progress  Blocker",
+        "blocks        KRA-6  Todo         Downstream",
+        "related       KRA-5  Todo         Sibling",
+        "duplicate-of  KRA-7  Duplicate    Dupe",
+        "duplicate     KRA-8  Done         Original",
+        "5 relations",
+    ]
+    assert "relatedIssue" in fake.requests[0]["query"]
+    assert "inverseRelations(" in fake.requests[1]["query"]
+
+
+def test_relations_open_only_filters_on_state_type_not_name(runner, fake_linear) -> None:
+    relations = [
+        relation("blocks", "KRA-2", "Renamed done", "Resolved", "completed"),
+        relation("related", "KRA-5", "Named like closed", "Done", "started"),
+    ]
+    inverse = [
+        inverse_relation("blocks", "KRA-1", "Live blocker", "In Progress", "started"),
+        inverse_relation("blocks", "KRA-3", "Renamed canceled", "Won't Fix", "canceled"),
+    ]
+    fake_linear(relations_responder([relations], [inverse]))
+    result = runner.invoke(app, ["relations", "KRA-9", "--open-only"])
+    assert result.exit_code == 0
+    rows = [json.loads(line) for line in result.output.splitlines()]
+    assert rows == [
+        {"kind": "blocked-by", "id": "KRA-1", "state": "In Progress", "title": "Live blocker"},
+        {"kind": "related", "id": "KRA-5", "state": "Done", "title": "Named like closed"},
+    ]
+
+
+def test_relations_follows_both_connections_independently(runner, fake_linear) -> None:
+    relations = [
+        [relation("blocks", "KRA-2", "Page one", "Todo", "unstarted")],
+        [relation("blocks", "KRA-3", "Page two", "Todo", "unstarted")],
+    ]
+    inverse = [
+        [inverse_relation("blocks", "KRA-4", "Inverse one", "Todo", "unstarted")],
+        [inverse_relation("blocks", "KRA-5", "Inverse two", "Todo", "unstarted")],
+        [inverse_relation("blocks", "KRA-6", "Inverse three", "Todo", "unstarted")],
+    ]
+    fake = fake_linear(relations_responder(relations, inverse))
+    result = runner.invoke(app, ["relations", "KRA-9"])
+    assert result.exit_code == 0
+    ids = [json.loads(line)["id"] for line in result.output.splitlines()]
+    assert ids == ["KRA-4", "KRA-5", "KRA-6", "KRA-2", "KRA-3"]
+    assert [request["variables"]["after"] for request in fake.requests] == [
+        None,
+        "relations-1",
+        None,
+        "inverseRelations-1",
+        "inverseRelations-2",
+    ]
+
+
+def test_relations_issue_not_found(runner, fake_linear) -> None:
+    fake_linear(lambda payload: {"data": {"issue": None}})
+    result = runner.invoke(app, ["relations", "KRA-999"])
+    assert result.exit_code == 2
+    assert "not found" in result.stderr
+
+
+def test_relations_none_prints_zero_footer(runner, fake_linear) -> None:
+    fake_linear(relations_responder([[]], [[]]))
+    result = runner.invoke(app, ["relations", "KRA-9", "--format", "table"])
+    assert result.exit_code == 0
+    assert result.output.splitlines() == ["0 relations"]
+
+
 # --- metadata ---
 
 

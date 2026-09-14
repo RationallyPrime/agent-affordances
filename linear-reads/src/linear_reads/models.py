@@ -53,6 +53,29 @@ class PageInfo(_Node):
     end_cursor: str | None = None
 
 
+class RelatedIssueRef(_Node):
+    identifier: str | None = None
+    title: str | None = None
+    state: WorkflowState | None = None
+
+    def flat(self) -> dict[str, Any]:
+        return {
+            "id": self.identifier,
+            "state": self.state.name if self.state else None,
+            "title": self.title,
+        }
+
+
+class Relation(_Node):
+    type: str | None = None
+    related_issue: RelatedIssueRef | None = None
+
+
+class InverseRelation(_Node):
+    type: str | None = None
+    issue: RelatedIssueRef | None = None
+
+
 class Issue(_Node):
     identifier: str | None = None
     id: str | None = None

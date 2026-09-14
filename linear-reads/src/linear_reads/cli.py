@@ -17,7 +17,7 @@ import typer
 
 from . import queries
 from .client import LinearClient, LinearError
-from .models import Comment, Issue
+from .models import Comment, InverseRelation, Issue, RelatedIssueRef, Relation
 from .render import (
     OutputFormat,
     compact_json,
@@ -34,6 +34,15 @@ app = typer.Typer(
 
 DEFAULT_LIST_FIELDS = "id,state,assignee,title"
 DEFAULT_ISSUE_FIELDS = "id,title,state,assignee,labels"
+
+# relation.type -> row kind, distinguished by which side of the edge the
+# queried issue sits on (relations = subject, inverseRelations = object).
+RELATION_KIND = {"blocks": "blocks", "duplicate": "duplicate-of", "related": "related"}
+INVERSE_RELATION_KIND = {"blocks": "blocked-by", "duplicate": "duplicate", "related": "related"}
+RELATION_KIND_ORDER = ("blocked-by", "blocks", "related", "duplicate-of", "duplicate")
+# Workflow-state *types* are Linear's fixed categories; names are team-editable
+# ("Resolved", "Won't Fix"). Linear's Duplicate state is of type canceled.
+CLOSED_STATE_TYPES = {"completed", "canceled"}
 
 FormatOpt = Annotated[
     OutputFormat | None,
@@ -221,6 +230,61 @@ def comments(
         typer.echo(render_comments_text(rows) if rows else "0 comments")
     else:
         _echo(render_rows(rows, fmt))
+
+
+@app.command()
+def relations(
+    identifier: Annotated[str, typer.Argument(help="Issue id, e.g. KRA-123")],
+    open_only: Annotated[
+        bool,
+        typer.Option(
+            "--open-only", help="Drop relations whose state type is completed or canceled"
+        ),
+    ] = False,
+    format: FormatOpt = None,
+) -> None:
+    """List an issue's relations: blocked-by, blocks, related, duplicates."""
+    try:
+        client = _make_client()
+        try:
+            relation_nodes = client.paginate(
+                queries.relations_query(), {"id": identifier}, "issue.relations", None
+            )
+            inverse_nodes = client.paginate(
+                queries.inverse_relations_query(),
+                {"id": identifier},
+                "issue.inverseRelations",
+                None,
+            )
+        finally:
+            client.close()
+    except LinearError as exc:
+        raise _fail(str(exc)) from exc
+
+    edges: list[tuple[str, RelatedIssueRef]] = []
+    for raw in relation_nodes:
+        relation = Relation.model_validate(raw)
+        kind = RELATION_KIND.get(relation.type or "")
+        if kind is not None and relation.related_issue is not None:
+            edges.append((kind, relation.related_issue))
+    for raw in inverse_nodes:
+        inverse = InverseRelation.model_validate(raw)
+        kind = INVERSE_RELATION_KIND.get(inverse.type or "")
+        if kind is not None and inverse.issue is not None:
+            edges.append((kind, inverse.issue))
+
+    if open_only:
+        edges = [
+            (kind, ref)
+            for kind, ref in edges
+            if ref.state is None or ref.state.type not in CLOSED_STATE_TYPES
+        ]
+
+    rows = [{"kind": kind, **ref.flat()} for kind, ref in edges]
+    order = {kind: index for index, kind in enumerate(RELATION_KIND_ORDER)}
+    rows.sort(key=lambda row: order.get(row["kind"], len(order)))
+
+    _echo(render_rows(rows, _resolve_format(format), footer=f"{len(rows)} relations"))
 
 
 def _run_meta(
