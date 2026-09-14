@@ -47,6 +47,7 @@ ISSUE_FIELDS: dict[str, FieldSpec] = {
 }
 
 COMMENT_SELECTION = "createdAt user { displayName } body"
+RELATED_ISSUE_SELECTION = "identifier title state { name }"
 PAGE_INFO = "pageInfo { hasNextPage endCursor }"
 
 TEAMS_QUERY = (
@@ -106,4 +107,13 @@ def comments_query() -> str:
         "query($id: String!, $first: Int!, $after: String) "
         "{ issue(id: $id) { comments(first: $first, after: $after) "
         f"{{ nodes {{ {COMMENT_SELECTION} }} {PAGE_INFO} }} }} }}"
+    )
+
+
+def relations_query() -> str:
+    return (
+        "query($id: String!) { issue(id: $id) { "
+        f"relations {{ nodes {{ type relatedIssue {{ {RELATED_ISSUE_SELECTION} }} }} }} "
+        f"inverseRelations {{ nodes {{ type issue {{ {RELATED_ISSUE_SELECTION} }} }} }} "
+        "} }"
     )

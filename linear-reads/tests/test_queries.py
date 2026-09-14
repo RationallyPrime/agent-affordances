@@ -43,6 +43,17 @@ def test_comments_query_shape() -> None:
     assert "user { displayName }" in document
 
 
+def test_relations_query_shape() -> None:
+    document = queries.relations_query()
+    assert "issue(id: $id)" in document
+    assert "relations { nodes { type relatedIssue { identifier title state { name } } } }" in (
+        document
+    )
+    assert "inverseRelations { nodes { type issue { identifier title state { name } } } }" in (
+        document
+    )
+
+
 @pytest.mark.parametrize(
     "document,connection",
     [
