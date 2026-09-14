@@ -43,15 +43,24 @@ def test_comments_query_shape() -> None:
     assert "user { displayName }" in document
 
 
-def test_relations_query_shape() -> None:
-    document = queries.relations_query()
+@pytest.mark.parametrize(
+    "document,connection,counterpart",
+    [
+        (queries.relations_query(), "relations", "relatedIssue"),
+        (queries.inverse_relations_query(), "inverseRelations", "issue"),
+    ],
+)
+def test_relation_queries_are_cursor_paginated_one_connection_each(
+    document: str, connection: str, counterpart: str
+) -> None:
     assert "issue(id: $id)" in document
-    assert "relations { nodes { type relatedIssue { identifier title state { name } } } }" in (
-        document
-    )
-    assert "inverseRelations { nodes { type issue { identifier title state { name } } } }" in (
-        document
-    )
+    assert "$first: Int!" in document
+    assert "$after: String" in document
+    assert f"{connection}(first: $first, after: $after)" in document
+    assert f"type {counterpart} {{ identifier title state {{ name type }} }}" in document
+    assert "pageInfo { hasNextPage endCursor }" in document
+    other = "inverseRelations(" if connection == "relations" else " relations("
+    assert other not in document
 
 
 @pytest.mark.parametrize(

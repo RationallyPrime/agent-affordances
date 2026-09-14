@@ -42,9 +42,11 @@ Filters combine with AND. `--assignee me` uses the API key's identity.
 
 `relations` prints one line per relation — columns `kind, id, state, title`,
 `kind` one of `blocked-by, blocks, related, duplicate-of, duplicate`, in that
-order. `--open-only` drops relations whose state is Done, Canceled, Cancelled
-or Duplicate, so "is anything still blocking this?" costs one line per live
-blocker instead of a full MCP payload.
+order. Both relation connections are followed to completion. `--open-only`
+drops relations whose workflow-state *type* is `completed` or `canceled`
+(Duplicate is a canceled state), so renamed closed states stay closed and "is
+anything still blocking this?" costs one line per live blocker instead of a
+full MCP payload.
 
 ## Output
 
