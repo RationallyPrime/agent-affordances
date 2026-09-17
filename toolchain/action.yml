@@ -21,7 +21,8 @@ runs:
     # (`<runner>/_work/_tool`) and stable across that runner's jobs, so the
     # collision is structurally impossible while the cache still hits. On a
     # hosted runner it is one constant path in a single-job VM, so nothing
-    # fragments there.
+    # fragments there. Every runner supplies it; an unset value fails the step
+    # rather than falling back to a path other runner services would share.
     #
     # The dir is in the cache key because @actions/cache stores these absolute
     # paths verbatim (`tar -xf … -P`): two runners sharing one key would restore
@@ -36,7 +37,8 @@ runs:
       env:
         TOOLS: ${{ inputs.tools }}
       run: |
-        dir="${RUNNER_TOOL_CACHE:-$HOME/.local/share}/weave-toolchain"
+        : "${RUNNER_TOOL_CACHE:?the runner supplies this; refusing to fall back to a path other runner services share}"
+        dir="$RUNNER_TOOL_CACHE/weave-toolchain"
         {
           printf 'dir=%s\n' "$dir"
           printf 'prefix=toolchain-%s\n' \
