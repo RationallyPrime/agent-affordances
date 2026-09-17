@@ -1,8 +1,7 @@
 # The one CI tool-version pin for every repo that uses ./action.yml. A caller
-# picks the versions by pinning this action to a commit; nothing else in a
-# caller names a tool version for these tools. The action loads this file as
-# mise's global config, so a caller's own mise.toml naming the same tool takes
-# precedence over it.
+# picks the versions by pinning this action to a commit. The action resolves
+# this file from its own directory and puts the tools' install directories on
+# PATH, so a caller's project mise.toml does not change what CI runs.
 [tools]
 uv = "0.12.1"
 just = "1.55.1"
