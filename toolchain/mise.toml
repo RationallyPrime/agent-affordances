@@ -1,0 +1,11 @@
+# The one CI tool-version pin for every repo that uses ./action.yml. A caller
+# picks the versions by pinning this action to a commit. The action resolves
+# this file from its own directory and puts the tools' install directories on
+# PATH, so a caller's project mise.toml does not change what CI runs.
+[tools]
+uv = "0.12.1"
+just = "1.55.1"
+ruff = "0.16.1"
+ty = "0.0.63"
+cue = "0.17.1"
+bun = "1.3.14"

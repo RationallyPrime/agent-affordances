@@ -13,16 +13,13 @@ jobs:
         working-directory: linear-reads
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: ./toolchain
         with:
-          enable-cache: false
+          tools: uv ruff ty
       - run: uv sync
-      # PINS in lockstep with weave-doctrine's mise.toml (private, unreadable
-      # from GitHub-hosted runners). Public repos run GitHub-hosted so fork
-      # PRs never execute on Weave metal; the pins stay.
-      - run: uvx ruff@0.16.1 format --check .
-      - run: uvx ruff@0.16.1 check .
-      - run: uvx ty@0.0.63 check
+      - run: ruff format --check .
+      - run: ruff check .
+      - run: ty check
       - run: uv run pytest -q
 
   spark:
@@ -32,12 +29,11 @@ jobs:
         working-directory: spark
     steps:
       - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: ./toolchain
         with:
-          enable-cache: false
-      # Same pins as linear-reads, same lockstep note above.
+          tools: uv ruff ty
       - run: uv sync
-      - run: uvx ruff@0.16.1 format --check .
-      - run: uvx ruff@0.16.1 check .
-      - run: uvx ty@0.0.63 check
+      - run: ruff format --check .
+      - run: ruff check .
+      - run: ty check
       - run: uv run pytest -q

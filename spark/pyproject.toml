@@ -14,8 +14,8 @@ afford = "afford_spark.cli:app"
 afford-sparkd = "afford_spark.daemon:main"
 
 [dependency-groups]
-# ruff/ty are deliberately not dev deps: the Weave-wide version authority is
-# weave-doctrine's mise.toml (bare binaries on PATH via mise shims).
+# ruff/ty are deliberately not dev deps: CI takes their versions from
+# toolchain/mise.toml (bare binaries on PATH via mise shims).
 dev = [
     "pytest>=8.3",
 ]
