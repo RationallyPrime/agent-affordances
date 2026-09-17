@@ -9,19 +9,55 @@ inputs:
 runs:
   using: composite
   steps:
-    # The cache key hashes only config files inside the workspace, so the pin
-    # file and the requested tools go in the prefix. shasum ships on Linux and
-    # macOS runners; sha256sum does not ship on macOS.
+    # Two outputs, computed together because the cache key depends on the dir.
+    #
+    # `dir` is mise's data directory: the mise executable (`<dir>/bin/mise`),
+    # its tool installs, downloads and shims. mise-action's default is
+    # `$HOME/.local/share/mise`, which several runner services registered under
+    # ONE user share — so one runner's cache restore extracts over the mise
+    # executable another runner is running, and that runner's next spawn dies
+    # with `spawn ETXTBSY` (Skrates/sokrates job 105390290402, immediately after
+    # "mise cache restored from key"). `RUNNER_TOOL_CACHE` is per runner service
+    # (`<runner>/_work/_tool`) and stable across that runner's jobs, so the
+    # collision is structurally impossible while the cache still hits. On a
+    # hosted runner it is one constant path in a single-job VM, so nothing
+    # fragments there. Every runner supplies it; an unset value fails the step
+    # rather than falling back to a path other runner services would share.
+    #
+    # The dir is in the cache key because @actions/cache stores these absolute
+    # paths verbatim (`tar -xf … -P`): two runners sharing one key would restore
+    # an archive carrying the OTHER runner's path and write straight back into
+    # the directory this isolation exists to separate.
+    #
+    # The cache key otherwise hashes only config files inside the workspace, so
+    # the pin file and the requested tools go in the prefix too. shasum ships on
+    # Linux and macOS runners; sha256sum does not ship on macOS.
     - id: pin
       shell: bash
       env:
         TOOLS: ${{ inputs.tools }}
-      run: echo "prefix=toolchain-$({ cat "$GITHUB_ACTION_PATH/mise.toml"; printf '%s' "$TOOLS"; } | shasum -a 256 | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      run: |
+        : "${RUNNER_TOOL_CACHE:?the runner supplies this; refusing to fall back to a path other runner services share}"
+        dir="$RUNNER_TOOL_CACHE/weave-toolchain"
+        {
+          printf 'dir=%s\n' "$dir"
+          printf 'prefix=toolchain-%s\n' \
+            "$({ cat "$GITHUB_ACTION_PATH/mise.toml"; printf '%s' "$TOOLS"; printf '%s' "$dir"; } |
+                shasum -a 256 | cut -c1-16)"
+        } >> "$GITHUB_OUTPUT"
 
     # mise runs in this action's directory, where no caller config is on the
     # lookup path. Without shims, its env export adds the pinned install
     # directories to PATH, so a caller's mise.toml cannot re-resolve them.
+    #
+    # MISE_DATA_DIR is set as step env rather than exported job-wide: the action
+    # resolves its own download/cache path from it (`miseDir()`), and the mise
+    # process it spawns reads the same variable for installs, so one declaration
+    # isolates the executable and the tools. A caller that runs mise itself
+    # later in the job keeps its own data dir.
     - uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+      env:
+        MISE_DATA_DIR: ${{ steps.pin.outputs.dir }}
       with:
         version: 2026.8.2
         working_directory: ${{ github.action_path }}
