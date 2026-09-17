@@ -10,10 +10,13 @@ runs:
   using: composite
   steps:
     # The cache key hashes only config files inside the workspace, so the pin
-    # file's own hash goes in the prefix.
+    # file and the requested tools go in the prefix. shasum ships on Linux and
+    # macOS runners; sha256sum does not ship on macOS.
     - id: pin
       shell: bash
-      run: echo "prefix=toolchain-$(sha256sum "$GITHUB_ACTION_PATH/mise.toml" | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      env:
+        TOOLS: ${{ inputs.tools }}
+      run: echo "prefix=toolchain-$({ cat "$GITHUB_ACTION_PATH/mise.toml"; printf '%s' "$TOOLS"; } | shasum -a 256 | cut -c1-16)" >> "$GITHUB_OUTPUT"
 
     # mise runs in this action's directory, where no caller config is on the
     # lookup path. Without shims, its env export adds the pinned install
